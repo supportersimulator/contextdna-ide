@@ -233,8 +233,17 @@ class LearningStore:
             results = self._backend.get_recent(limit)
             _bump("recent.ok")
             return results
-        except Exception:
-            _bump("recent.fail")
+        except Exception as exc:
+            # ZSF: every failure observable. Round-3 storage-invariant-check
+            # found limit>=200 silently returned [] when the backend threw —
+            # exception detail was being swallowed. Now logged + counted
+            # by limit-bucket so /health can surface the threshold.
+            bucket = "huge" if limit >= 200 else ("large" if limit >= 50 else "small")
+            _bump(f"recent.fail.{bucket}")
+            logger.warning(
+                "LearningStore.get_recent(limit=%d) failed: %s: %s",
+                limit, type(exc).__name__, exc,
+            )
             return []
 
     def get_by_session(self, session_id: str) -> List[Dict[str, Any]]:

@@ -1,0 +1,73 @@
+--- a/scripts/bootstrap-verify.sh
++++ b/scripts/bootstrap-verify.sh
+@@ -68,6 +68,7 @@
+ STEP1_CLONED=0          # Step 1: git clone succeeded
+ STEP2_ENV_OK=0          # Step 2: .env materialised + required vars present
+ STEP3_COMPOSE_UP=0      # Step 3: docker compose up issued without error
++STEP3_5_STORAGE_INV=0   # Step 3.5: STORAGE_BACKEND toggle invariance verified
+ STEP4_HEALTHY=0         # Step 4: every container reported "healthy"
+ STEP5_WEBHOOK_OK=0      # Step 5: webhook probe returned a valid 9-section payload
+ STEP6_TEARDOWN=0        # Step 6: optional teardown ran cleanly
+@@ -138,6 +139,7 @@
+   STEP1_CLONED       ${STEP1_CLONED}
+   STEP2_ENV_OK       ${STEP2_ENV_OK}
+   STEP3_COMPOSE_UP   ${STEP3_COMPOSE_UP}
++  STEP3_5_STORAGE_INV ${STEP3_5_STORAGE_INV}
+   STEP4_HEALTHY      ${STEP4_HEALTHY}
+   STEP5_WEBHOOK_OK   ${STEP5_WEBHOOK_OK}
+   STEP6_TEARDOWN     ${STEP6_TEARDOWN}
+@@ -343,6 +345,46 @@
+ fi
+ 
+ # ============================================================================
++# STEP 3.5 — STORAGE_BACKEND_TOGGLE invariant check
++# ----------------------------------------------------------------------------
++# Compose is up, but containers aren't necessarily "healthy" yet (that's
++# step 4). The storage invariant only needs the local SQLite/Postgres mirror
++# to be reachable — it does NOT depend on the helper agent's /consult
++# endpoint, so we run it here BEFORE step 4 to fail fast if the toggle
++# semantics are broken.
++#
++# Script lives in the OSS repo's migrate4/rollback/ tree; the mothership
++# pins it as a submodule at contextdna-ide-oss/. If the file is missing we
++# log + skip (the mothership may pre-date this submodule pin) — ZSF means
++# the skip is observable, not silent.
++# ============================================================================
++t0=$(date +%s)
++STORAGE_INV_SCRIPT="${TARGET}/contextdna-ide-oss/migrate4/rollback/storage-invariant-check.sh"
++
++if [[ -x "$STORAGE_INV_SCRIPT" ]]; then
++    INV_JSON="${TARGET}/.storage-invariant-last.json"
++    if "$STORAGE_INV_SCRIPT" \
++            --backends "sqlite,auto" \
++            --threshold 0 \
++            --window-ms 100 \
++            --retries 3 \
++            --output-json "$INV_JSON" \
++            --no-rollback >&2; then
++        STEP3_5_STORAGE_INV=1
++        log 3.5 ok "$(( $(date +%s) - t0 ))" \
++            "STORAGE_BACKEND_TOGGLE invariant verified (snapshot=$INV_JSON)"
++    else
++        # Hard-fail: a broken toggle = the Operational Invariance Promise
++        # is itself broken. We let storage-rollback.sh be invoked manually
++        # (--no-rollback above) because bootstrap-verify is supposed to be
++        # observation-only — it never mutates host state.
++        fatal 3.5 "STORAGE_BACKEND_TOGGLE invariant FAILED — see $INV_JSON"
++    fi
++else
++    log 3.5 info 0 "storage-invariant-check.sh not present at $STORAGE_INV_SCRIPT — skipping (counter recorded)"
++fi
++
++# ============================================================================
+ # STEP 4 — wait for all containers to become "healthy"
+ # ============================================================================
+ t0=$(date +%s)
+@@ -478,6 +520,7 @@
+   compose file:      ${COMPOSE_FILE}
+   webhook layers:    ${LAYER_KEYS}
+   teardown:          $([[ $DO_TEARDOWN -eq 1 ]] && echo "yes" || echo "no (stack still running)")
++  storage invariant: $([[ $STEP3_5_STORAGE_INV -eq 1 ]] && echo "verified" || echo "skipped/absent")
+ ------------------------------------------------------------
+   Operational Invariance Promise — confirmed for ${PROFILE} profile.
+   Clone -> compose up -> healthy -> webhook serves payload.

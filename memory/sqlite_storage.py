@@ -113,6 +113,13 @@ class SQLiteStorage:
         self.db_path = Path(db_path) if db_path else get_db_path()
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
 
+        # Thread-safety lock: sqlite3 with check_same_thread=False is NOT safe
+        # for concurrent writes from multiple threads — cursor state corrupts.
+        # All public methods that touch self.conn must hold self._lock.
+        # Fix verified by storage_fuzz_harness (Round 3): without this lock,
+        # concurrent promote() calls silently lose writes.
+        self._lock = threading.RLock()
+
         try:
             self.conn = sqlite3.connect(
                 str(self.db_path),
@@ -384,6 +391,22 @@ class SQLiteStorage:
     # -- public CRUD ----------------------------------------------------- #
 
     def store_learning(
+        self,
+        learning_data: Dict[str, Any],
+        skip_dedup: bool = False,
+        consolidate: bool = True,
+        workspace_id: str = "",
+    ) -> Dict[str, Any]:
+        # Thread-safety: concurrent store_learning calls were silently losing
+        # writes (fuzz harness Round 3 found this). Single-connection sqlite3
+        # is NOT thread-safe even with check_same_thread=False — cursor state
+        # corrupts. RLock serializes the full method to keep writes ordered.
+        with self._lock:
+            return self._store_learning_locked(
+                learning_data, skip_dedup, consolidate, workspace_id
+            )
+
+    def _store_learning_locked(
         self,
         learning_data: Dict[str, Any],
         skip_dedup: bool = False,
