@@ -13,6 +13,24 @@ That is the *Operational Invariance Promise*. This document is its litmus test. 
 
 ---
 
+## TL;DR — Most reproducible path (Nix)
+
+If you want *byte-identical* setup today and 6 years from now, use Nix. Every dependency pinned by hash, every service declared, full system rollback. See [`nix/README.md`](nix/README.md) for the full walkthrough. Three commands on a fresh Mac:
+
+```bash
+curl --proto '=https' --tlsv1.2 -sSf -L https://install.determinate.systems/nix | sh -s -- install
+git clone git@github.com:supportersimulator/contextdna-ide.git && cd contextdna-ide
+nix run .#restore -- /Volumes/USB/contextdna-recovery-*.age
+```
+
+That's it. Enter the passphrase. ~10 minutes later: `BOOTSTRAP-VERIFIED`.
+
+To go further and have your entire macOS declaratively managed (launchd services for NATS + backup schedule + everything) from one flake:
+
+```bash
+nix run nix-darwin/master -- switch --flake .#mothership
+```
+
 ## TL;DR — One-command onboarding
 
 If this is your first time, run the interactive installer. It walks through every step below, generates the age keypair, configures your backup bucket, writes the offline-recovery card, and schedules daily/weekly backups — in about ten minutes:
