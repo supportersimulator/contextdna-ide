@@ -52,6 +52,39 @@ Probe mode just reports — useful as a quarterly drill or after any environment
 bash scripts/configure-services.sh --probe
 ```
 
+### Install + wire the Claude Code ecosystem
+
+After services are configured, run the ecosystem configurator. It probes + installs + configures the Claude Code plugins and CLIs that ContextDNA depends on, each one opt-in:
+
+```bash
+bash scripts/configure-ecosystem.sh
+```
+
+Handles:
+
+- **Claude Code CLI** — verifies it's installed; offers `npm install -g @anthropic-ai/claude-code` if missing
+- **Multi-Fleet** — clones `supportersimulator/multi-fleet`, `pip install -e .`, registers the Claude Code plugin, writes `MULTIFLEET_NODE_ID` + `NATS_URL` to `.env`, optionally installs the fleet-daemon launchd plist
+- **3-Surgeons** — installs the Claude Code plugin from `supportersimulator/3-surgeons-marketplace`, optionally clones the standalone repo + installs the `3s` CLI, generates a starter `~/.3surgeons/config.yaml` that points the Neurologist at your local LLM and the Cardiologist at whichever provider `configure-services.sh` got working
+- **Superpowers** — installs the plugin from `obra/superpowers` (override the marketplace if you use a fork)
+- **.mcp.json wiring** — validates that the 7 MCP servers (multifleet, synaptic, projectdna, contextdna-engine, contextdna-webhook, race-theater, evidence-stream, event-bridge) are registered, and that their Python files parse cleanly
+
+Probe mode (no install attempts):
+
+```bash
+bash scripts/configure-ecosystem.sh --probe
+```
+
+The full first-time-setup flow on a fresh laptop becomes:
+
+```bash
+bash scripts/setup-mothership.sh        # bootstrap + backup schedule
+bash scripts/configure-services.sh      # LLM providers + local LLM + NATS + Docker
+bash scripts/configure-ecosystem.sh     # Multi-Fleet + 3-Surgeons + Superpowers + MCP
+bash scripts/seal-recovery-bundle.sh    # encrypt everything to a thumb-drive bundle
+```
+
+The seal bundle now includes **the ecosystem configs too** — `~/.claude/settings.json`, `~/.3surgeons/config.yaml`, `.mcp.json`, `.multifleet/config.json`, all `io.contextdna.*` launchd plists, and the list of installed Claude Code plugins. So when you unseal on a fresh laptop in 6 months, `AUTO-RESTORE.sh` restores all of that AND runs `configure-ecosystem.sh` to reinstall any plugins that need it.
+
 ### Single-file recovery for disaster scenarios
 
 After running the installer, seal every secret into one passphrase-encrypted `.age` file you can save to a thumb drive:

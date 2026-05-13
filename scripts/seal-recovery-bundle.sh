@@ -89,7 +89,7 @@ _step "Step 1/4  Collecting secrets"
 STAGE="$(mktemp -d -t ctxdna-seal.XXXXXX)" || _fail "mktemp failed"
 trap 'rm -rf "$STAGE"' EXIT
 
-mkdir -p "$STAGE/secrets" "$STAGE/repo" "$STAGE/aws" "$STAGE/ssh"
+mkdir -p "$STAGE/secrets" "$STAGE/repo" "$STAGE/aws" "$STAGE/ssh" "$STAGE/ecosystem"
 
 # .env (the master config)
 if [ -f "$REPO_ROOT/.env" ]; then
@@ -155,6 +155,44 @@ else
     _info "without them, you'll need to re-issue SSH keys + add to GitHub on the recovery machine"
 fi
 
+# Ecosystem configs — Claude Code, 3-Surgeons, Multi-Fleet, MCP wiring
+if [ -f "$HOME/.claude/settings.json" ]; then
+    cp "$HOME/.claude/settings.json" "$STAGE/ecosystem/claude-settings.json"
+    chmod 600 "$STAGE/ecosystem/claude-settings.json"
+    _ok "~/.claude/settings.json captured"
+fi
+if [ -f "$HOME/.claude/CLAUDE.md" ]; then
+    cp "$HOME/.claude/CLAUDE.md" "$STAGE/ecosystem/claude-CLAUDE.md"
+    _ok "~/.claude/CLAUDE.md captured (user instructions)"
+fi
+if [ -f "$HOME/.3surgeons/config.yaml" ]; then
+    cp "$HOME/.3surgeons/config.yaml" "$STAGE/ecosystem/3surgeons-config.yaml"
+    chmod 600 "$STAGE/ecosystem/3surgeons-config.yaml"
+    _ok "~/.3surgeons/config.yaml captured"
+fi
+if [ -f "$REPO_ROOT/.mcp.json" ]; then
+    cp "$REPO_ROOT/.mcp.json" "$STAGE/ecosystem/mcp.json"
+    _ok ".mcp.json snapshot captured"
+fi
+if [ -f "$REPO_ROOT/.multifleet/config.json" ]; then
+    cp "$REPO_ROOT/.multifleet/config.json" "$STAGE/ecosystem/multifleet-config.json"
+    _ok ".multifleet/config.json captured"
+fi
+# Snapshot the list of installed Claude Code plugins (names only, useful for re-install)
+if command -v claude >/dev/null 2>&1; then
+    claude plugin list 2>/dev/null > "$STAGE/ecosystem/claude-plugins-installed.txt" || true
+    [ -s "$STAGE/ecosystem/claude-plugins-installed.txt" ] && _ok "Claude Code plugin list captured ($(wc -l < "$STAGE/ecosystem/claude-plugins-installed.txt" | tr -d ' ') entries)"
+fi
+# launchd plists (so model + daemon configs survive)
+if [ "$(uname -s)" = "Darwin" ]; then
+    mkdir -p "$STAGE/ecosystem/launchd"
+    for plist in ~/Library/LaunchAgents/io.contextdna.*.plist ~/Library/LaunchAgents/com.contextdna.*.plist; do
+        [ -f "$plist" ] && cp "$plist" "$STAGE/ecosystem/launchd/"
+    done
+    plist_count=$(ls "$STAGE/ecosystem/launchd/" 2>/dev/null | wc -l | tr -d ' ')
+    [ "$plist_count" -gt 0 ] && _ok "$plist_count launchd plist(s) captured"
+fi
+
 # Repo identity (so restore knows which repo to clone)
 GIT_REMOTE="$(cd "$REPO_ROOT" && git remote get-url origin 2>/dev/null || echo "git@github.com:supportersimulator/contextdna-ide.git")"
 GIT_COMMIT="$(cd "$REPO_ROOT" && git rev-parse HEAD 2>/dev/null || echo "unknown")"
@@ -172,11 +210,18 @@ cat > "$STAGE/manifest.json" <<EOF
   "git_remote":     "$GIT_REMOTE",
   "git_commit":     "$GIT_COMMIT",
   "contents": {
-    "env":         $( [ -f "$STAGE/repo/.env" ] && echo true || echo false ),
-    "age_key":     $( [ -f "$STAGE/secrets/contextdna-backup.age.key" ] && echo true || echo false ),
-    "aws_creds":   $( [ -f "$STAGE/aws/credentials" ] && echo true || echo false ),
-    "keychain":    $( [ -f "$STAGE/secrets/keychain-contextdna.txt" ] && echo true || echo false ),
-    "ssh_keys":    $( ls "$STAGE/ssh/" 2>/dev/null | grep -q . && echo true || echo false )
+    "env":             $( [ -f "$STAGE/repo/.env" ] && echo true || echo false ),
+    "age_key":         $( [ -f "$STAGE/secrets/contextdna-backup.age.key" ] && echo true || echo false ),
+    "aws_creds":       $( [ -f "$STAGE/aws/credentials" ] && echo true || echo false ),
+    "keychain":        $( [ -f "$STAGE/secrets/keychain-contextdna.txt" ] && echo true || echo false ),
+    "ssh_keys":        $( ls "$STAGE/ssh/" 2>/dev/null | grep -q . && echo true || echo false ),
+    "claude_settings": $( [ -f "$STAGE/ecosystem/claude-settings.json" ] && echo true || echo false ),
+    "claude_md":       $( [ -f "$STAGE/ecosystem/claude-CLAUDE.md" ] && echo true || echo false ),
+    "3surgeons_cfg":   $( [ -f "$STAGE/ecosystem/3surgeons-config.yaml" ] && echo true || echo false ),
+    "mcp_json":        $( [ -f "$STAGE/ecosystem/mcp.json" ] && echo true || echo false ),
+    "multifleet_cfg":  $( [ -f "$STAGE/ecosystem/multifleet-config.json" ] && echo true || echo false ),
+    "claude_plugins":  $( [ -f "$STAGE/ecosystem/claude-plugins-installed.txt" ] && echo true || echo false ),
+    "launchd_plists":  $( ls "$STAGE/ecosystem/launchd/" 2>/dev/null | grep -q . && echo true || echo false )
   }
 }
 EOF
@@ -279,6 +324,51 @@ if [ -d "$BUNDLE_DIR/ssh" ] && ls "$BUNDLE_DIR/ssh"/* >/dev/null 2>&1; then
     done
 fi
 
+# 5b. Ecosystem configs (Claude Code settings, 3-Surgeons config, launchd plists)
+if [ -d "$BUNDLE_DIR/ecosystem" ]; then
+    if [ -f "$BUNDLE_DIR/ecosystem/claude-settings.json" ]; then
+        mkdir -p "$HOME/.claude"
+        cp "$BUNDLE_DIR/ecosystem/claude-settings.json" "$HOME/.claude/settings.json"
+        chmod 600 "$HOME/.claude/settings.json"
+        _ok "~/.claude/settings.json restored"
+    fi
+    if [ -f "$BUNDLE_DIR/ecosystem/claude-CLAUDE.md" ]; then
+        cp "$BUNDLE_DIR/ecosystem/claude-CLAUDE.md" "$HOME/.claude/CLAUDE.md"
+        _ok "~/.claude/CLAUDE.md restored (user instructions)"
+    fi
+    if [ -f "$BUNDLE_DIR/ecosystem/3surgeons-config.yaml" ]; then
+        mkdir -p "$HOME/.3surgeons"; chmod 700 "$HOME/.3surgeons"
+        cp "$BUNDLE_DIR/ecosystem/3surgeons-config.yaml" "$HOME/.3surgeons/config.yaml"
+        chmod 600 "$HOME/.3surgeons/config.yaml"
+        _ok "~/.3surgeons/config.yaml restored"
+    fi
+    if [ -f "$BUNDLE_DIR/ecosystem/mcp.json" ] && [ ! -f "$REPO_DIR/.mcp.json" ]; then
+        cp "$BUNDLE_DIR/ecosystem/mcp.json" "$REPO_DIR/.mcp.json"
+        _ok ".mcp.json restored to repo"
+    fi
+    if [ -f "$BUNDLE_DIR/ecosystem/multifleet-config.json" ]; then
+        mkdir -p "$REPO_DIR/.multifleet"
+        cp "$BUNDLE_DIR/ecosystem/multifleet-config.json" "$REPO_DIR/.multifleet/config.json"
+        _ok ".multifleet/config.json restored"
+    fi
+    if [ -d "$BUNDLE_DIR/ecosystem/launchd" ] && [ "$(uname -s)" = "Darwin" ]; then
+        mkdir -p "$HOME/Library/LaunchAgents"
+        for plist in "$BUNDLE_DIR/ecosystem/launchd"/*.plist; do
+            [ -f "$plist" ] || continue
+            name="$(basename "$plist")"
+            cp "$plist" "$HOME/Library/LaunchAgents/$name"
+            launchctl unload "$HOME/Library/LaunchAgents/$name" 2>/dev/null || true
+            launchctl load -w "$HOME/Library/LaunchAgents/$name" 2>/dev/null \
+                && _ok "launchd: $name loaded" \
+                || _warn "launchd: $name load failed"
+        done
+    fi
+    if [ -f "$BUNDLE_DIR/ecosystem/claude-plugins-installed.txt" ]; then
+        _ok "Claude Code plugin list available (will be reinstalled by configure-ecosystem.sh):"
+        sed 's/^/      /' "$BUNDLE_DIR/ecosystem/claude-plugins-installed.txt"
+    fi
+fi
+
 # 6. Probe + reconfigure services (this is the big one — handles rotated
 #    API keys, different LLM providers, IP changes, missing optional services)
 _step "Probing services + reconfiguring anything that's changed"
@@ -289,6 +379,17 @@ if [ -x "$REPO_DIR/scripts/configure-services.sh" ]; then
     read -r -p "  Run full interactive configurator now (recommended)? [Y/n]: " ans
     if [[ ! "$ans" =~ ^[Nn] ]]; then
         bash "$REPO_DIR/scripts/configure-services.sh" || _warn "configure-services had issues — re-run manually"
+    fi
+fi
+
+# 6b. Ecosystem tools (Multi-Fleet, 3-Surgeons, Superpowers, MCP wiring)
+_step "Probing + installing ecosystem tools"
+if [ -x "$REPO_DIR/scripts/configure-ecosystem.sh" ]; then
+    bash "$REPO_DIR/scripts/configure-ecosystem.sh" --probe 2>&1 | tail -30
+    echo ""
+    read -r -p "  Run full ecosystem configurator (install missing plugins)? [Y/n]: " ans
+    if [[ ! "$ans" =~ ^[Nn] ]]; then
+        bash "$REPO_DIR/scripts/configure-ecosystem.sh" || _warn "configure-ecosystem had issues — re-run manually"
     fi
 fi
 
