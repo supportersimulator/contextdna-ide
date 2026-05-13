@@ -29,6 +29,26 @@ The installer is **idempotent** — safe to re-run anytime. To audit your setup 
 bash scripts/setup-mothership.sh --check
 ```
 
+### Single-file recovery for disaster scenarios
+
+After running the installer, seal every secret into one passphrase-encrypted `.age` file you can save to a thumb drive:
+
+```bash
+bash scripts/seal-recovery-bundle.sh
+```
+
+This produces `~/Desktop/contextdna-recovery-YYYYMMDD-<host>.age` + a printable README. Copy both to a thumb drive, save your passphrase to 1Password, delete the Desktop copies. The bundle contains your `.env`, age private key, AWS credentials, macOS Keychain entries, and an embedded `AUTO-RESTORE.sh` — everything needed to bring back the mothership on a fresh laptop with zero manual configuration.
+
+To recover on a brand-new machine 6 months from now:
+
+```bash
+brew install age git
+git clone git@github.com:supportersimulator/contextdna-ide.git
+cd contextdna-ide
+bash scripts/unseal-recovery-bundle.sh /Volumes/USB/contextdna-recovery-*.age
+# Enter passphrase. Wait ~10 minutes. BOOTSTRAP-VERIFIED prints. Done.
+```
+
 The rest of this document is the manual recipe behind the installer. Read it if you want to understand what each step does, or if `setup-mothership.sh` can't do something automatically on your platform.
 
 ---
