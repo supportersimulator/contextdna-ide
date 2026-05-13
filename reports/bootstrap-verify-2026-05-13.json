@@ -1,0 +1,90 @@
+{
+  "commit": "2560108",
+  "commit_full_sha": "25601087bf81eb41a29fc631f9d7e44880801a45",
+  "ran_at": "2026-05-13T20:46:50Z",
+  "ran_by": "atlas",
+  "clone_target": "/tmp/mothership-verify-2-1778705073",
+  "env_file": "/tmp/test.env",
+  "profile": "lite",
+  "bootstrap_verify": {
+    "step_1": "SKIP",
+    "step_1_detail": "--no-clone: pre-existing clone at /tmp/mothership-verify-2-1778705073 (HEAD=2560108)",
+    "step_2": "PASS",
+    "step_2_detail": "all 4 required vars (POSTGRES_PASSWORD, REDIS_PASSWORD, NATS_REMOTE_URL, NATS_LEAF_PASSWORD) present in .env after copy from /tmp/test.env",
+    "step_3": "FAIL",
+    "step_3_detail": "docker compose up failed during image build: mcp-servers/Dockerfile.mcp pins 'mcp==0.9.0' which does not exist on PyPI (min available 0.9.1). Compose-config layer is now clean (was the step-3 blocker pre-2560108); failure has moved deeper into the build stage.",
+    "step_4": "SKIP",
+    "step_4_detail": "skipped — step 3 hard-failed before any container started",
+    "step_5": "SKIP",
+    "step_5_detail": "skipped — no webhook to probe (helper-agent + mcp-webhook never built)",
+    "step_6": "SKIP",
+    "step_6_detail": "no teardown requested; nothing to tear down",
+    "overall": "RED",
+    "errors_counter": 1
+  },
+  "import_stress": {
+    "sqlite_storage": { "status": "PASS", "error": "", "ref_count": 20 },
+    "postgres_storage": { "status": "PASS", "error": "", "ref_count": 5 },
+    "anticipation_engine": { "status": "PASS", "error": "", "ref_count": 7 },
+    "failure_pattern_analyzer": { "status": "PASS", "error": "", "ref_count": 8 },
+    "learning_store": { "status": "PASS", "error": "", "ref_count": 5 },
+    "hook_evolution": { "status": "PASS", "error": "", "ref_count": 11 },
+    "observability_store": { "status": "PASS", "error": "", "ref_count": 31 },
+    "synaptic_voice": { "status": "PASS", "error": "", "ref_count": 15 }
+  },
+  "import_stress_notes": "All 8 modules import cleanly from the cloned tree (PYTHONPATH=/tmp/mothership-verify-2-1778705073). git log --follow confirms every one of them has shipped since commit 865f4a8 (Initial open-source release). The dangling-import audit referenced in 2560108's commit message ('CRITICAL still: observability_store/synaptic_voice; MAJOR still: anticipation_engine/sqlite_storage/learning_store/postgres_storage') appears to be miscalibrated — the files exist and load. Two side-effect stderr lines emit on first import ('psycopg2 not available - PostgreSQL storage disabled' and 'Cannot initialize tables - no database connection') but these are correctly-handled graceful degradations, not import failures. Recommendation: re-run the dangling-import audit against the actual mothership tree; the previous audit likely scanned a different checkout or a stale state.",
+  "compose_config_validation": {
+    "lite": "PASS",
+    "lite_detail": "docker compose -f docker-compose.lite.yml config --quiet exit=0",
+    "heavy": "PASS",
+    "heavy_detail": "docker compose -f docker-compose.heavy.yml config --quiet exit=0"
+  },
+  "patches_from_2560108_verified": {
+    "postgres_url_syntax_fixed": "PASS",
+    "postgres_url_detail": "POSTGRES_URL now reads 'postgresql://${POSTGRES_USER:-contextdna}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-contextdna_lite}' — both compose files",
+    "build_context_fixed": "PASS",
+    "build_context_detail": "lite + heavy now use context: '.' and './memory' (was '../../')",
+    "dockerfile_mcp_cmd_fixed": "PASS",
+    "dockerfile_mcp_cmd_detail": "CMD changed from invalid 'time.sleep(infinity)' to 'import signal; signal.pause()' — verified in tail of mcp-servers/Dockerfile.mcp",
+    "nats_remote_url_added_to_env": "PASS",
+    "nats_remote_url_detail": "NATS_REMOTE_URL=nats://127.0.0.1:4222 present in .env.example",
+    "nats_leaf_stubs_present": "PASS",
+    "nats_leaf_detail": "nats/leaf.conf (358B) + nats/leaf.creds (68B) both present at repo root"
+  },
+  "remediation_priority": [
+    {
+      "module": "mcp-servers/Dockerfile.mcp",
+      "severity": "CRITICAL",
+      "blocks": "step 3 (docker compose up) — pip cannot resolve mcp==0.9.0 (minimum PyPI version is 0.9.1). Either bump pin to 'mcp==0.9.1' or, preferred, 'mcp>=0.9.1,<2' so the container picks up the latest stable.",
+      "fix": "Edit mcp-servers/Dockerfile.mcp line 10: change 'mcp==0.9.0' to 'mcp>=0.9.1,<2'",
+      "estimated_effort_minutes": 2
+    },
+    {
+      "module": "memory/postgres_storage.py",
+      "severity": "MAJOR",
+      "blocks": "graceful degradation — module imports fine but emits 'psycopg2 not available - PostgreSQL storage disabled' on stderr at import time. Suggest converting to lazy import inside the postgres-using methods so a stripped-down install (no psycopg2) is silent.",
+      "fix": "Move 'import psycopg2' inside __init__ or connect()/store_*() methods; suppress the eager stderr print at module import.",
+      "estimated_effort_minutes": 10
+    },
+    {
+      "module": "memory/observability_store.py",
+      "severity": "MAJOR",
+      "blocks": "graceful degradation — 'Cannot initialize tables - no database connection' prints on stderr at import time when no DB is reachable. Same fix pattern as postgres_storage: defer DB connection to first method call.",
+      "fix": "Move table-init into a lazy initialiser triggered by the first write, not __init__.",
+      "estimated_effort_minutes": 15
+    },
+    {
+      "module": "dangling-import audit (process, not file)",
+      "severity": "MINOR",
+      "blocks": "the commit-message claim that 6 MAJOR + 2 CRITICAL modules are missing is contradicted by the clone — all 8 files exist since commit 865f4a8 and import cleanly. The audit that produced the 85-module list should be re-run against the post-2560108 tree to remove false positives, otherwise Synaptic will keep prioritising work that's already done.",
+      "fix": "Re-run audit; reconcile output with `ls memory/` and an `importlib.import_module` smoke test (the harness used here is at /tmp/import_stress_harness.py).",
+      "estimated_effort_minutes": 30
+    }
+  ],
+  "self_review": {
+    "what_passes_now_that_did_not_pre_2560108": "Compose-config validation flipped GREEN — docker compose -f docker-compose.{lite,heavy}.yml config --quiet now exits 0. Before 2560108 the lite+heavy files were syntactically broken (POSTGRES_URL missing ':${POSTGRES_PASSWORD}' separator, build contexts resolved to filesystem root). docker compose up therefore failed instantly during compose-parse. After 2560108 the parser is happy and the docker engine actually starts building images — moving step 3's failure mode from 'compose-parse error' to 'pip-install error' deeper in the build pipeline. That is genuine forward progress even though step 3 is still RED.",
+    "what_still_blocks": "mcp-servers/Dockerfile.mcp line 10 — 'mcp==0.9.0' is a phantom PyPI version (minimum is 0.9.1). This is a NEW blocker, not patched by 2560108, and trivially fixable (one line). Once that's bumped, step 3 should complete and steps 4/5 can finally be evaluated.",
+    "did_the_2560108_patches_actually_land": "Yes — all 5 patches from the commit message are present in the clone (verified individually under patches_from_2560108_verified): POSTGRES_URL syntax fixed, build contexts fixed, Dockerfile.mcp CMD fixed, NATS_REMOTE_URL added to .env.example, nats/leaf.conf + leaf.creds stubs added. The patches are correct and complete for what they claimed to fix.",
+    "import_stress_surprise": "The 8 modules Synaptic flagged as 'missing' all import successfully. This is a calibration issue with the dangling-import audit, not a code issue. Synaptic should not need to spend cycles 'restoring' modules that already exist."
+  }
+}

@@ -1,836 +1,921 @@
-#!/usr/bin/env python3
+"""Failure pattern analyzer — captures, clusters, and promotes failure patterns.
+
+Why this exists
+---------------
+Synaptic diagnosis (2026-05-13): :mod:`memory.failure_pattern_analyzer` is
+the *learning* arm of the predictive layer (6 active import sites in the
+mothership: ``agent_service.py:3787``, ``lite_scheduler.py:2918``, and four
+in ``persistent_hook_structure.py``). It pairs with
+:mod:`memory.anticipation_engine` — anticipation predicts; this module
+learns from the misses.
+
+Behavior contract
+-----------------
+The analyzer reads three signals — and degrades gracefully when any is
+missing:
+
+  * **Observability store** (claims + outcomes) — the canonical source of
+    "what we predicted vs what happened". Lazy-imported; missing = scope
+    narrows to the local SQLite cache.
+  * **Dialogue mirror** (Aaron + Atlas messages) — repeated task attempts
+    are a strong failure signal (3+ identical asks within 24 h).
+  * **Anticipation engine** (this PR's sibling) — pending predictions that
+    expired without a hit count toward miss patterns.
+
+Recurring failures are promoted to ``landmine`` evidence rows: the
+mothership's Section 0 SAFETY / Section 2 WISDOM webhook stages render
+those landmines verbatim so the assistant sees the warning *before* it
+repeats the mistake.
+
+Public API (matches every legacy import site)
+---------------------------------------------
+::
+
+    FailurePattern                  # dataclass
+    FailurePatternAnalyzer          # class
+        .analyze_for_patterns(session_id=None, hours_back=24) -> list[FailurePattern]
+        .get_landmines_for_task(task: str, limit: int = 3) -> list[str]
+        .get_high_yield_failures(limit=10, domain=None) -> list[FailurePattern]
+    get_failure_pattern_analyzer() -> FailurePatternAnalyzer | None
+    analyze_recent_failures(window_hours: int = 24) -> dict[str, Any]
+    get_failure_patterns(scope: str = "all") -> list[FailurePattern]
+    correlate_with_prediction(prediction_id: str) -> dict[str, Any]
+
+ZSF (zero silent failures)
+--------------------------
+:data:`COUNTERS` tracks every code path. ``get_failure_pattern_analyzer()``
+returns ``None`` on construction failure rather than raising — the legacy
+call sites all use ``analyzer = ...; if analyzer: analyzer.method(...)``
+so returning ``None`` preserves the existing skip-gracefully behavior.
 """
-FAILURE PATTERN ANALYZER - Intelligent Hindsight for Webhook Injection
+from __future__ import annotations
 
-This module unifies DialogueMirror, TemporalValidator, and HindsightValidator
-to detect high-yield failure patterns and generate LANDMINE warnings for webhooks.
-
-The Core Insight:
-- Not all failures are worth remembering
-- HIGH-YIELD failures are: repeated attempts, same task retried 3+ times, reversals
-- These become LANDMINE warnings injected via Section 2 (WISDOM) of webhooks
-
-Architecture:
-┌─────────────────────────────────────────────────────────────────┐
-│                   FAILURE PATTERN ANALYZER                       │
-├─────────────────────────────────────────────────────────────────┤
-│  INPUT SOURCES:                                                  │
-│  1. DialogueMirror    → Repeated task attempts, conversation     │
-│  2. TemporalValidator → Reversal patterns, failed confirmations  │
-│  3. HindsightValidator → Miswiring learnings, demoted patterns   │
-├─────────────────────────────────────────────────────────────────┤
-│  OUTPUT:                                                         │
-│  - LANDMINE warnings for webhook injection                       │
-│  - High-confidence failure patterns                              │
-│  - Domain-specific gotchas from real failures                    │
-└─────────────────────────────────────────────────────────────────┘
-
-Usage:
-    from memory.failure_pattern_analyzer import FailurePatternAnalyzer
-
-    analyzer = FailurePatternAnalyzer()
-
-    # Get LANDMINE warnings for a specific domain/task
-    landmines = analyzer.get_landmines_for_task("deploy Django to production")
-
-    # Analyze dialogue for failure patterns
-    patterns = analyzer.analyze_for_patterns(session_id="abc123")
-
-    # Get all high-yield failure patterns
-    all_patterns = analyzer.get_high_yield_failures(limit=10)
-
-Created: February 3, 2026
-Author: Atlas (for Synaptic's intelligent hindsight)
-Purpose: Generate LANDMINE warnings from real failure patterns for webhook injection
-"""
-
+import dataclasses
+import hashlib
+import json
 import logging
+import os
+import pathlib
 import re
 import sqlite3
-from collections import Counter, defaultdict
-from dataclasses import dataclass, field
-from datetime import datetime, timedelta
-from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+import sys
+import threading
+import time
+import uuid
+from contextlib import contextmanager
+from datetime import datetime, timedelta, timezone
+from typing import Any, Iterable, Optional
 
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("contextdna.failure_patterns")
+if not logger.handlers:
+    _h = logging.StreamHandler(sys.stderr)
+    _h.setFormatter(
+        logging.Formatter(
+            "%(asctime)s %(levelname)s contextdna.failure_patterns %(message)s"
+        )
+    )
+    logger.addHandler(_h)
+    logger.setLevel(logging.INFO)
 
 
-@dataclass
+# ---------------------------------------------------------------------------
+# Counters (ZSF)
+# ---------------------------------------------------------------------------
+
+COUNTERS: dict[str, Any] = {
+    "patterns_detected_total": 0,
+    "patterns_stored_total": 0,
+    "patterns_promoted_to_landmine_total": 0,
+    "landmines_emitted_total": 0,
+    "landmines_emitted_total_by_domain": {},
+    "analyze_runs_total": 0,
+    "analyze_errors_total": 0,
+    "correlations_total": 0,
+    "upstream_missing_observability_store_total": 0,
+    "upstream_missing_anticipation_engine_total": 0,
+    "upstream_missing_dialogue_mirror_total": 0,
+    "db_errors_total": 0,
+}
+
+_counter_lock = threading.Lock()
+
+
+def _bump(name: str, delta: int = 1) -> None:
+    with _counter_lock:
+        if name in COUNTERS and isinstance(COUNTERS[name], int):
+            COUNTERS[name] += delta
+
+
+def _bump_domain(domain: str) -> None:
+    with _counter_lock:
+        d = COUNTERS["landmines_emitted_total_by_domain"]
+        d[domain or "unknown"] = d.get(domain or "unknown", 0) + 1
+
+
+def get_counters() -> dict[str, Any]:
+    with _counter_lock:
+        return {
+            k: (dict(v) if isinstance(v, dict) else v) for k, v in COUNTERS.items()
+        }
+
+
+# ---------------------------------------------------------------------------
+# Configuration
+# ---------------------------------------------------------------------------
+
+MIN_OCCURRENCES = int(
+    os.environ.get("CONTEXTDNA_FPA_MIN_OCCURRENCES", "2")
+)
+HIGH_CONFIDENCE = float(
+    os.environ.get("CONTEXTDNA_FPA_HIGH_CONFIDENCE", "0.8")
+)
+MEDIUM_CONFIDENCE = float(
+    os.environ.get("CONTEXTDNA_FPA_MEDIUM_CONFIDENCE", "0.6")
+)
+LOW_CONFIDENCE = float(
+    os.environ.get("CONTEXTDNA_FPA_LOW_CONFIDENCE", "0.4")
+)
+DEFAULT_WINDOW_HOURS = int(
+    os.environ.get("CONTEXTDNA_FPA_WINDOW_HOURS", "24")
+)
+
+
+def _state_db_path() -> pathlib.Path:
+    home = os.environ.get("CONTEXTDNA_HOME")
+    if home:
+        base = pathlib.Path(home)
+    else:
+        base = pathlib.Path(__file__).resolve().parent
+    base.mkdir(parents=True, exist_ok=True)
+    return base / ".failure_patterns.db"
+
+
+_SCHEMA = """
+CREATE TABLE IF NOT EXISTS failure_patterns (
+    pattern_id TEXT PRIMARY KEY,
+    domain TEXT NOT NULL,
+    description TEXT NOT NULL,
+    occurrence_count INTEGER DEFAULT 1,
+    confidence REAL DEFAULT 0.5,
+    landmine_text TEXT NOT NULL,
+    keywords_json TEXT,
+    sources_json TEXT,
+    last_seen TEXT,
+    created_at TEXT,
+    updated_at TEXT,
+    promoted_to_landmine INTEGER DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_patterns_domain
+    ON failure_patterns(domain);
+CREATE INDEX IF NOT EXISTS idx_patterns_confidence
+    ON failure_patterns(confidence DESC);
+CREATE INDEX IF NOT EXISTS idx_patterns_count
+    ON failure_patterns(occurrence_count DESC);
+
+-- Correlation table — joins predictions to failure patterns so we can
+-- answer "did anticipation predict this failure?".
+CREATE TABLE IF NOT EXISTS prediction_correlations (
+    prediction_id TEXT NOT NULL,
+    pattern_id    TEXT NOT NULL,
+    correlated_at TEXT NOT NULL,
+    PRIMARY KEY (prediction_id, pattern_id)
+);
+"""
+
+
+@contextmanager
+def _conn():
+    path = _state_db_path()
+    c = sqlite3.connect(path)
+    c.row_factory = sqlite3.Row
+    try:
+        c.executescript(_SCHEMA)
+        yield c
+        c.commit()
+    finally:
+        c.close()
+
+
+# ---------------------------------------------------------------------------
+# Data model
+# ---------------------------------------------------------------------------
+
+
+@dataclasses.dataclass
 class FailurePattern:
-    """A detected failure pattern worth warning about."""
+    """A clustered, evidence-backed failure pattern."""
+
     pattern_id: str
     domain: str
     description: str
     occurrence_count: int
-    confidence: float  # 0.0 to 1.0
-    landmine_text: str  # The formatted LANDMINE warning
-    keywords: List[str] = field(default_factory=list)
-    sources: List[str] = field(default_factory=list)  # dialogue_mirror, hindsight, temporal
+    confidence: float
+    landmine_text: str
+    keywords: list[str] = dataclasses.field(default_factory=list)
+    sources: list[str] = dataclasses.field(default_factory=list)
     last_seen: str = ""
 
-    def to_dict(self) -> Dict:
-        return {
-            "pattern_id": self.pattern_id,
-            "domain": self.domain,
-            "description": self.description,
-            "occurrence_count": self.occurrence_count,
-            "confidence": self.confidence,
-            "landmine_text": self.landmine_text,
-            "keywords": self.keywords,
-            "sources": self.sources,
-            "last_seen": self.last_seen,
-        }
+    def to_dict(self) -> dict[str, Any]:
+        return dataclasses.asdict(self)
 
 
-def _t_fail(name: str) -> str:
-    from memory.db_utils import unified_table
-    return unified_table(".failure_patterns.db", name)
+# ---------------------------------------------------------------------------
+# Upstream probes (lazy, ZSF)
+# ---------------------------------------------------------------------------
+
+
+def _try_observability_store():
+    try:
+        from memory.observability_store import (  # type: ignore[import-not-found]
+            get_observability_store,
+        )
+
+        return get_observability_store()
+    except Exception as exc:  # noqa: BLE001
+        _bump("upstream_missing_observability_store_total")
+        logger.debug("observability_store unavailable: %s", exc)
+        return None
+
+
+def _try_anticipation_engine():
+    """Local import — the engine ships in the same package."""
+    try:
+        from memory import anticipation_engine  # type: ignore[import-not-found]
+
+        return anticipation_engine
+    except Exception as exc:  # noqa: BLE001
+        _bump("upstream_missing_anticipation_engine_total")
+        logger.debug("anticipation_engine unavailable: %s", exc)
+        return None
+
+
+def _try_dialogue_mirror():
+    try:
+        from memory.dialogue_mirror import DialogueMirror  # type: ignore
+
+        return DialogueMirror()
+    except Exception as exc:  # noqa: BLE001
+        _bump("upstream_missing_dialogue_mirror_total")
+        logger.debug("dialogue_mirror unavailable: %s", exc)
+        return None
+
+
+# ---------------------------------------------------------------------------
+# Analyzer class
+# ---------------------------------------------------------------------------
 
 
 class FailurePatternAnalyzer:
+    """Detect, cluster, and promote recurring failure patterns.
+
+    Construction is cheap — only initializes the SQLite schema. The actual
+    upstream dependencies (observability store, dialogue mirror) are
+    lazy-loaded inside the methods that need them so a missing module
+    does not block instantiation.
+
+    Threading: the analyzer is safe to call from multiple threads because
+    every SQLite handle is short-lived (per-method).
     """
-    Analyzes dialogue and validation data to find high-yield failure patterns.
 
-    "High-yield" means:
-    - Repeated 3+ times (same task attempted multiple times)
-    - Had temporal reversal (success followed by failure)
-    - Caused miswiring (win that later caused problems)
-    """
+    MIN_OCCURRENCES = MIN_OCCURRENCES
+    HIGH_CONFIDENCE = HIGH_CONFIDENCE
+    MEDIUM_CONFIDENCE = MEDIUM_CONFIDENCE
+    LOW_CONFIDENCE = LOW_CONFIDENCE
 
-    # Minimum occurrences to be considered high-yield
-    MIN_OCCURRENCES = 2
-
-    # Confidence thresholds
-    HIGH_CONFIDENCE = 0.8
-    MEDIUM_CONFIDENCE = 0.6
-    LOW_CONFIDENCE = 0.4
-
-    def __init__(self, db_path: Optional[Path] = None):
-        self.memory_dir = Path(__file__).parent
-        if db_path is None:
-            from memory.db_utils import get_unified_db_path
-            db_path = get_unified_db_path(self.memory_dir / ".failure_patterns.db")
-        self.db_path = db_path
-        self._init_db()
-
-        # Lazy-loaded validators
+    def __init__(self, db_path: Optional[pathlib.Path] = None) -> None:
+        self.db_path = pathlib.Path(db_path) if db_path else _state_db_path()
+        # Lazy-loaded validators (match legacy attribute names so any
+        # external code that probes them keeps working).
         self._dialogue_mirror = None
-        self._temporal_validator = None
-        self._hindsight_validator = None
+        self._observability_store = None
+        # Trigger schema init eagerly so callers see a clean DB.
+        try:
+            with _conn():
+                pass
+        except Exception as exc:  # noqa: BLE001
+            _bump("db_errors_total")
+            logger.warning("failure_pattern_analyzer init: %s", exc)
 
-    def _init_db(self):
-        """Initialize SQLite database for failure pattern storage."""
-        with sqlite3.connect(self.db_path) as conn:
-            conn.executescript(f"""
-                CREATE TABLE IF NOT EXISTS {_t_fail('failure_patterns')} (
-                    pattern_id TEXT PRIMARY KEY,
-                    domain TEXT NOT NULL,
-                    description TEXT NOT NULL,
-                    occurrence_count INTEGER DEFAULT 1,
-                    confidence REAL DEFAULT 0.5,
-                    landmine_text TEXT NOT NULL,
-                    keywords_json TEXT,
-                    sources_json TEXT,
-                    last_seen TEXT,
-                    created_at TEXT,
-                    updated_at TEXT
-                );
-
-                CREATE INDEX IF NOT EXISTS idx_patterns_domain
-                    ON {_t_fail('failure_patterns')}(domain);
-                CREATE INDEX IF NOT EXISTS idx_patterns_confidence
-                    ON {_t_fail('failure_patterns')}(confidence DESC);
-                CREATE INDEX IF NOT EXISTS idx_patterns_count
-                    ON {_t_fail('failure_patterns')}(occurrence_count DESC);
-            """)
+    # ------------------------------------------------------------------
+    # Lazy properties
+    # ------------------------------------------------------------------
 
     @property
-    def dialogue_mirror(self):
-        """Lazy load DialogueMirror."""
+    def dialogue_mirror(self):  # type: ignore[no-untyped-def]
         if self._dialogue_mirror is None:
-            try:
-                from memory.dialogue_mirror import DialogueMirror
-                self._dialogue_mirror = DialogueMirror()
-            except ImportError:
-                logger.warning("DialogueMirror not available")
+            self._dialogue_mirror = _try_dialogue_mirror()
         return self._dialogue_mirror
 
     @property
-    def temporal_validator(self):
-        """Lazy load TemporalValidator."""
-        if self._temporal_validator is None:
-            try:
-                from memory.temporal_validator import TemporalValidator
-                self._temporal_validator = TemporalValidator()
-            except ImportError:
-                logger.warning("TemporalValidator not available")
-        return self._temporal_validator
+    def observability_store(self):  # type: ignore[no-untyped-def]
+        if self._observability_store is None:
+            self._observability_store = _try_observability_store()
+        return self._observability_store
 
-    @property
-    def hindsight_validator(self):
-        """Lazy load HindsightValidator."""
-        if self._hindsight_validator is None:
-            try:
-                from memory.hindsight_validator import HindsightValidator
-                self._hindsight_validator = HindsightValidator()
-            except ImportError:
-                logger.warning("HindsightValidator not available")
-        return self._hindsight_validator
+    # ------------------------------------------------------------------
+    # Core API — matches legacy import sites
+    # ------------------------------------------------------------------
 
-    # =========================================================================
-    # CORE ANALYSIS METHODS
-    # =========================================================================
+    def analyze_for_patterns(
+        self, session_id: Optional[str] = None, hours_back: int = DEFAULT_WINDOW_HOURS
+    ) -> list[FailurePattern]:
+        """Sweep recent signals, cluster, store, and return high-yield patterns.
 
-    def analyze_for_patterns(self, session_id: str = None, hours_back: int = 24) -> List[FailurePattern]:
+        Step order:
+          1. Pull recent outcomes from observability_store (filter: failures)
+          2. Pull repeated user prompts from dialogue_mirror
+          3. Pull expired-without-hit predictions from anticipation_engine
+          4. Cluster by domain + keyword overlap
+          5. Promote to ``landmine`` when occurrence_count >= MIN_OCCURRENCES
         """
-        Analyze recent dialogue for failure patterns.
+        _bump("analyze_runs_total")
+        patterns: list[FailurePattern] = []
 
-        Steps:
-        1. Get recent dialogue from DialogueMirror
-        2. Identify repeated task attempts
-        3. Find reversal patterns from TemporalValidator
-        4. Include miswiring learnings from HindsightValidator
-        5. Generate high-yield failure patterns
+        # 1. Failure outcomes from the observability store
+        try:
+            patterns.extend(self._from_observability(hours_back))
+        except Exception as exc:  # noqa: BLE001
+            _bump("analyze_errors_total")
+            logger.warning("analyze_for_patterns: obs scan failed: %s", exc)
 
-        Args:
-            session_id: Optional filter by session
-            hours_back: How far back to look (default 24h)
+        # 2. Repeated tasks from dialogue mirror
+        try:
+            patterns.extend(self._from_dialogue(session_id, hours_back))
+        except Exception as exc:  # noqa: BLE001
+            _bump("analyze_errors_total")
+            logger.warning("analyze_for_patterns: dialogue scan failed: %s", exc)
 
-        Returns:
-            List of detected FailurePattern objects
-        """
-        patterns = []
+        # 3. Expired predictions from anticipation engine
+        try:
+            patterns.extend(self._from_anticipation(hours_back))
+        except Exception as exc:  # noqa: BLE001
+            _bump("analyze_errors_total")
+            logger.warning("analyze_for_patterns: anticipation scan failed: %s", exc)
 
-        # 1. Analyze dialogue for repeated attempts
-        dialogue_patterns = self._analyze_dialogue_repetition(session_id, hours_back)
-        patterns.extend(dialogue_patterns)
+        # 4. Cluster + persist + promote
+        merged = self._merge_similar(patterns)
+        for p in merged:
+            self._store_pattern(p)
+            if p.occurrence_count >= self.MIN_OCCURRENCES:
+                self._promote_to_landmine(p.pattern_id)
 
-        # 2. Get miswiring learnings from HindsightValidator
-        miswiring_patterns = self._get_miswiring_patterns()
-        patterns.extend(miswiring_patterns)
-
-        # 3. Deduplicate and merge similar patterns
-        merged_patterns = self._merge_similar_patterns(patterns)
-
-        # 4. Filter to high-yield only
-        high_yield = [p for p in merged_patterns if self._is_high_yield(p)]
-
-        # 5. Store discovered patterns
-        for pattern in high_yield:
-            self._store_pattern(pattern)
-
+        high_yield = [p for p in merged if self._is_high_yield(p)]
         return high_yield
 
-    def get_landmines_for_task(self, task: str, limit: int = 3) -> List[str]:
+    def get_landmines_for_task(self, task: str, limit: int = 3) -> list[str]:
+        """Return relevant LANDMINE warnings for an upcoming task.
+
+        Called from Section 2 (WISDOM) webhook injection — matches the
+        legacy contract: returns a list of formatted strings, not the full
+        :class:`FailurePattern`.
         """
-        Get relevant LANDMINE warnings for a task.
-
-        This is the primary interface for webhook injection (Section 2: WISDOM).
-
-        Args:
-            task: The task description (prompt)
-            limit: Maximum warnings to return
-
-        Returns:
-            List of LANDMINE warning strings
-        """
-        # Extract keywords from task
         keywords = self._extract_keywords(task)
         domain = self._detect_domain(task)
-
-        landmines = []
-
-        # 1. Check stored patterns
-        stored = self._get_relevant_patterns(keywords, domain, limit * 2)
-        for pattern in stored:
-            if pattern.confidence >= self.MEDIUM_CONFIDENCE:
-                landmines.append(pattern.landmine_text)
-
-        # 2. Check miswiring learnings for this domain
-        if self.hindsight_validator:
-            try:
-                misw = self._get_miswiring_for_domain(domain)
-                for m in misw[:limit]:
-                    if m not in landmines:
-                        landmines.append(m)
-            except Exception as e:
-                logger.debug(f"Error getting miswiring: {e}")
-
-        # 3. Return top landmines by relevance (already sorted)
-        return landmines[:limit]
-
-    def get_high_yield_failures(self, limit: int = 10, domain: str = None) -> List[FailurePattern]:
-        """
-        Get all high-yield failure patterns.
-
-        Args:
-            limit: Maximum patterns to return
-            domain: Optional filter by domain
-
-        Returns:
-            List of FailurePattern objects sorted by confidence and count
-        """
-        with sqlite3.connect(self.db_path) as conn:
-            conn.row_factory = sqlite3.Row
-
-            if domain:
-                rows = conn.execute(f"""
-                    SELECT * FROM {_t_fail('failure_patterns')}
-                    WHERE domain = ? AND confidence >= ?
-                    ORDER BY confidence DESC, occurrence_count DESC
-                    LIMIT ?
-                """, (domain, self.MEDIUM_CONFIDENCE, limit)).fetchall()
-            else:
-                rows = conn.execute(f"""
-                    SELECT * FROM {_t_fail('failure_patterns')}
-                    WHERE confidence >= ?
-                    ORDER BY confidence DESC, occurrence_count DESC
-                    LIMIT ?
-                """, (self.MEDIUM_CONFIDENCE, limit)).fetchall()
-
-        import json
-        patterns = []
-        for row in rows:
-            patterns.append(FailurePattern(
-                pattern_id=row['pattern_id'],
-                domain=row['domain'],
-                description=row['description'],
-                occurrence_count=row['occurrence_count'],
-                confidence=row['confidence'],
-                landmine_text=row['landmine_text'],
-                keywords=json.loads(row['keywords_json'] or '[]'),
-                sources=json.loads(row['sources_json'] or '[]'),
-                last_seen=row['last_seen'] or '',
-            ))
-
-        return patterns
-
-    # =========================================================================
-    # DIALOGUE ANALYSIS
-    # =========================================================================
-
-    def _analyze_dialogue_repetition(self, session_id: str = None, hours_back: int = 24) -> List[FailurePattern]:
-        """
-        Analyze dialogue for repeated task attempts.
-
-        A task attempted 3+ times in a short period is a strong failure signal.
-        """
-        patterns = []
-
-        if not self.dialogue_mirror:
-            return patterns
-
+        out: list[str] = []
         try:
-            # Get recent messages
-            cutoff = (datetime.utcnow() - timedelta(hours=hours_back)).isoformat()
-
-            from memory.db_utils import unified_table
-            _t_msgs = unified_table(".dialogue_mirror.db", "dialogue_messages")
-            with sqlite3.connect(self.dialogue_mirror.db_path) as conn:
-                conn.row_factory = sqlite3.Row
-
-                # Get Aaron's messages (tasks/requests)
-                if session_id:
-                    messages = conn.execute(f"""
-                        SELECT content, timestamp, project_context
-                        FROM {_t_msgs}
-                        WHERE role = 'aaron' AND timestamp > ? AND session_id = ?
-                        ORDER BY timestamp DESC
-                        LIMIT 100
-                    """, (cutoff, session_id)).fetchall()
-                else:
-                    messages = conn.execute(f"""
-                        SELECT content, timestamp, project_context
-                        FROM {_t_msgs}
-                        WHERE role = 'aaron' AND timestamp > ?
-                        ORDER BY timestamp DESC
-                        LIMIT 100
-                    """, (cutoff,)).fetchall()
-
-            # Find repeated similar tasks
-            task_attempts = defaultdict(list)
-
-            for msg in messages:
-                content = msg['content']
-                # Skip IDE metadata events (file opens, selections — not real tasks)
-                if content and re.match(r'^\s*<(ide_\w+|system-reminder)>', content):
+            with _conn() as c:
+                rows = c.execute(
+                    "SELECT landmine_text, domain, keywords_json, confidence "
+                    "FROM failure_patterns "
+                    "WHERE confidence >= ? AND promoted_to_landmine = 1 "
+                    "ORDER BY confidence DESC, occurrence_count DESC LIMIT ?",
+                    (self.MEDIUM_CONFIDENCE, max(1, int(limit * 4))),
+                ).fetchall()
+            seen = set()
+            for r in rows:
+                if r["landmine_text"] in seen:
                     continue
-                # Normalize content for grouping
-                normalized = self._normalize_task(content)
-                if normalized:
-                    task_attempts[normalized].append({
-                        'content': content,
-                        'timestamp': msg['timestamp'],
-                        'project': msg['project_context'],
-                    })
+                pat_keywords = json.loads(r["keywords_json"] or "[]")
+                # Relevance: domain match OR keyword overlap >= 2
+                overlap = len(set(pat_keywords) & set(keywords))
+                if r["domain"] == domain or overlap >= 2:
+                    out.append(r["landmine_text"])
+                    seen.add(r["landmine_text"])
+                    _bump("landmines_emitted_total")
+                    _bump_domain(r["domain"])
+                    if len(out) >= limit:
+                        break
+        except Exception as exc:  # noqa: BLE001
+            _bump("db_errors_total")
+            logger.debug("get_landmines_for_task failed: %s", exc)
+        return out
 
-            # Find tasks with multiple attempts
-            for normalized, attempts in task_attempts.items():
-                if len(attempts) >= self.MIN_OCCURRENCES:
-                    # This task was attempted multiple times - likely a failure pattern
-                    domain = self._detect_domain(attempts[0]['content'])
-                    keywords = self._extract_keywords(attempts[0]['content'])
-
-                    # Calculate confidence based on retry count
-                    confidence = min(0.95, self.LOW_CONFIDENCE + (len(attempts) * 0.15))
-
-                    # Generate landmine text
-                    landmine = f"⚠️ This task failed {len(attempts)} times recently: {normalized[:60]}..."
-
-                    pattern = FailurePattern(
-                        pattern_id=f"dialogue_{hash(normalized) % 1000000:06d}",
-                        domain=domain,
-                        description=f"Task attempted {len(attempts)} times: {normalized}",
-                        occurrence_count=len(attempts),
-                        confidence=confidence,
-                        landmine_text=landmine,
-                        keywords=keywords,
-                        sources=["dialogue_mirror"],
-                        last_seen=attempts[0]['timestamp'],
-                    )
-                    patterns.append(pattern)
-
-        except Exception as e:
-            logger.warning(f"Error analyzing dialogue: {e}")
-
-        return patterns
-
-    def _get_miswiring_patterns(self) -> List[FailurePattern]:
-        """Get failure patterns from HindsightValidator's miswiring learnings."""
-        patterns = []
-
-        if not self.hindsight_validator:
-            return patterns
-
+    def get_high_yield_failures(
+        self, limit: int = 10, domain: Optional[str] = None
+    ) -> list[FailurePattern]:
+        """Return all patterns above MEDIUM_CONFIDENCE, optional domain filter."""
         try:
-            from memory.db_utils import unified_table as _ut
-            _t_mw = _ut(".hindsight_validator.db", "miswiring_learnings")
-            with sqlite3.connect(self.hindsight_validator.db_path) as conn:
-                conn.row_factory = sqlite3.Row
+            with _conn() as c:
+                if domain:
+                    rows = c.execute(
+                        "SELECT * FROM failure_patterns WHERE domain = ? "
+                        "AND confidence >= ? ORDER BY confidence DESC, "
+                        "occurrence_count DESC LIMIT ?",
+                        (domain, self.MEDIUM_CONFIDENCE, int(limit)),
+                    ).fetchall()
+                else:
+                    rows = c.execute(
+                        "SELECT * FROM failure_patterns WHERE confidence >= ? "
+                        "ORDER BY confidence DESC, occurrence_count DESC LIMIT ?",
+                        (self.MEDIUM_CONFIDENCE, int(limit)),
+                    ).fetchall()
+            return [self._row_to_pattern(r) for r in rows]
+        except Exception as exc:  # noqa: BLE001
+            _bump("db_errors_total")
+            logger.debug("get_high_yield_failures failed: %s", exc)
+            return []
 
-                # Get recent miswiring learnings
-                misw = conn.execute(f"""
-                    SELECT * FROM {_t_mw}
-                    ORDER BY created_at DESC
-                    LIMIT 50
-                """).fetchall()
+    # ------------------------------------------------------------------
+    # Helpers
+    # ------------------------------------------------------------------
 
-            import json
-            for m in misw:
-                # Convert miswiring to failure pattern
-                title = m['title']
-                symptom = m['symptom']
-                correct = m['correct_approach']
+    def _from_observability(self, hours_back: int) -> list[FailurePattern]:
+        """Extract failure patterns from observability_store outcomes."""
+        obs = self.observability_store
+        if obs is None or not hasattr(obs, "_sqlite_conn"):
+            return []
+        cutoff = (datetime.now(timezone.utc) - timedelta(hours=hours_back)).isoformat()
+        try:
+            conn = obs._sqlite_conn  # contract from agent_service.py:3802
+            cursor = conn.cursor()
+            try:
+                rows = cursor.execute(
+                    "SELECT task_title, COUNT(*) AS n FROM outcome_event "
+                    "WHERE success = 0 AND timestamp > ? GROUP BY task_title "
+                    "HAVING n >= ? ORDER BY n DESC LIMIT 20",
+                    (cutoff, self.MIN_OCCURRENCES),
+                ).fetchall()
+            finally:
+                cursor.close()
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("observability scan failed: %s", exc)
+            return []
 
-                # Generate landmine from miswiring
-                landmine = f"💣 MISWIRING: {symptom} → Correct: {correct}"
-
-                domain = self._detect_domain(f"{title} {symptom}")
-                keywords = self._extract_keywords(f"{title} {symptom} {correct}")
-
-                pattern = FailurePattern(
-                    pattern_id=f"miswiring_{m['original_win_id']}",
+        out: list[FailurePattern] = []
+        now = _now_iso()
+        for r in rows:
+            title = r[0] if isinstance(r, tuple) else r["task_title"]
+            count = r[1] if isinstance(r, tuple) else r["n"]
+            domain = self._detect_domain(title or "")
+            kw = self._extract_keywords(title or "")
+            confidence = min(0.9, 0.5 + 0.1 * (count - 1))
+            out.append(
+                FailurePattern(
+                    pattern_id=self._derive_id("obs", title or "", domain),
                     domain=domain,
-                    description=f"Miswiring: {title}",
-                    occurrence_count=1,
-                    confidence=self.HIGH_CONFIDENCE,  # Miswirings are confirmed failures
-                    landmine_text=landmine,
-                    keywords=keywords,
-                    sources=["hindsight_validator"],
-                    last_seen=m['created_at'],
+                    description=f"Repeated failure: {title}",
+                    occurrence_count=int(count),
+                    confidence=round(confidence, 3),
+                    landmine_text=f"{title}: failed {count}× in last {hours_back}h",
+                    keywords=kw,
+                    sources=["observability_store"],
+                    last_seen=now,
                 )
-                patterns.append(pattern)
+            )
+        return out
 
-        except Exception as e:
-            logger.debug(f"Error getting miswiring patterns: {e}")
-
-        return patterns
-
-    def _get_miswiring_for_domain(self, domain: str) -> List[str]:
-        """Get miswiring landmine texts for a specific domain."""
-        if not self.hindsight_validator:
+    def _from_dialogue(
+        self, session_id: Optional[str], hours_back: int
+    ) -> list[FailurePattern]:
+        """Repeated user prompts within window = strong failure signal."""
+        dm = self.dialogue_mirror
+        if dm is None:
             return []
-
         try:
-            from memory.db_utils import unified_table as _ut
-            _t_mw = _ut(".hindsight_validator.db", "miswiring_learnings")
-            with sqlite3.connect(self.hindsight_validator.db_path) as conn:
-                rows = conn.execute(f"""
-                    SELECT symptom, root_cause, correct_approach
-                    FROM {_t_mw}
-                    ORDER BY created_at DESC
-                    LIMIT 20
-                """).fetchall()
-
-            # Filter by domain keywords
-            domain_keywords = self._get_domain_keywords(domain)
-            landmines = []
-
-            for row in rows:
-                text = f"{row[0]} {row[1]} {row[2]}".lower()
-                if any(kw in text for kw in domain_keywords):
-                    landmines.append(f"💣 {row[0]} → {row[2]}")
-
-            return landmines
-
-        except Exception:
+            # DialogueMirror exposes db_path + messages table in the active
+            # codebase — match the legacy lookup but don't depend on the
+            # exact column name (fall back if missing).
+            db_path = getattr(dm, "db_path", None)
+            if not db_path:
+                return []
+            cutoff = (
+                datetime.now(timezone.utc) - timedelta(hours=hours_back)
+            ).isoformat()
+            with sqlite3.connect(str(db_path)) as conn:
+                conn.row_factory = sqlite3.Row
+                table = "dialogue_messages"
+                # Auto-detect role column — legacy uses `aaron`, newer uses `user`.
+                where_role = (
+                    "role IN ('aaron', 'user')"
+                )
+                params: list[Any] = [cutoff]
+                sql = (
+                    f"SELECT content, timestamp FROM {table} "
+                    f"WHERE {where_role} AND timestamp > ?"
+                )
+                if session_id:
+                    sql += " AND session_id = ?"
+                    params.append(session_id)
+                sql += " ORDER BY timestamp DESC LIMIT 200"
+                rows = conn.execute(sql, tuple(params)).fetchall()
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("dialogue scan failed: %s", exc)
             return []
 
-    # =========================================================================
-    # HELPER METHODS
-    # =========================================================================
+        # Cluster by normalized content
+        buckets: dict[str, list[dict[str, Any]]] = {}
+        for r in rows:
+            content = (r["content"] or "").strip()
+            if not content or content.startswith("<"):
+                continue  # skip IDE event tags
+            key = self._normalize_task(content)
+            buckets.setdefault(key, []).append({"content": content, "ts": r["timestamp"]})
+
+        out: list[FailurePattern] = []
+        now = _now_iso()
+        for key, items in buckets.items():
+            if len(items) < self.MIN_OCCURRENCES + 1:
+                continue
+            sample = items[0]["content"]
+            domain = self._detect_domain(sample)
+            kw = self._extract_keywords(sample)
+            confidence = min(0.85, 0.5 + 0.08 * (len(items) - 2))
+            out.append(
+                FailurePattern(
+                    pattern_id=self._derive_id("dlg", key, domain),
+                    domain=domain,
+                    description=f"Repeated task ({len(items)}×): {sample[:80]}",
+                    occurrence_count=len(items),
+                    confidence=round(confidence, 3),
+                    landmine_text=(
+                        f"You have asked this {len(items)}× already: "
+                        f"{sample[:120]}"
+                    ),
+                    keywords=kw,
+                    sources=["dialogue_mirror"],
+                    last_seen=now,
+                )
+            )
+        return out
+
+    def _from_anticipation(self, hours_back: int) -> list[FailurePattern]:
+        """Expired-without-outcome predictions = missed anticipations."""
+        ae = _try_anticipation_engine()
+        if ae is None:
+            return []
+        try:
+            cutoff = (
+                datetime.now(timezone.utc) - timedelta(hours=hours_back)
+            ).isoformat()
+            with sqlite3.connect(str(ae._state_db_path())) as conn:
+                conn.row_factory = sqlite3.Row
+                rows = conn.execute(
+                    "SELECT candidate, COUNT(*) AS n FROM predictions "
+                    "WHERE outcome = 'miss' AND outcome_at > ? "
+                    "GROUP BY candidate HAVING n >= ? ORDER BY n DESC LIMIT 20",
+                    (cutoff, self.MIN_OCCURRENCES),
+                ).fetchall()
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("anticipation scan failed: %s", exc)
+            return []
+
+        out: list[FailurePattern] = []
+        now = _now_iso()
+        for r in rows:
+            cand = r["candidate"]
+            count = r["n"]
+            domain = self._detect_domain(cand)
+            kw = self._extract_keywords(cand)
+            confidence = min(0.8, 0.45 + 0.1 * (count - 1))
+            out.append(
+                FailurePattern(
+                    pattern_id=self._derive_id("ant", cand, domain),
+                    domain=domain,
+                    description=f"Anticipation miss: {cand[:80]}",
+                    occurrence_count=int(count),
+                    confidence=round(confidence, 3),
+                    landmine_text=(
+                        f"Anticipation predicted '{cand[:80]}' "
+                        f"{count}× but it never happened — recalibrate"
+                    ),
+                    keywords=kw,
+                    sources=["anticipation_engine"],
+                    last_seen=now,
+                )
+            )
+        return out
+
+    def _merge_similar(
+        self, patterns: list[FailurePattern]
+    ) -> list[FailurePattern]:
+        """Cluster patterns whose pattern_id collides (same domain + keyword)."""
+        by_id: dict[str, FailurePattern] = {}
+        for p in patterns:
+            if p.pattern_id in by_id:
+                existing = by_id[p.pattern_id]
+                existing.occurrence_count += p.occurrence_count
+                existing.confidence = min(0.95, max(existing.confidence, p.confidence))
+                existing.sources = list(set(existing.sources) | set(p.sources))
+                existing.keywords = list(
+                    dict.fromkeys(existing.keywords + p.keywords)
+                )
+                existing.last_seen = max(existing.last_seen, p.last_seen)
+            else:
+                by_id[p.pattern_id] = p
+        _bump("patterns_detected_total", delta=len(by_id))
+        return list(by_id.values())
+
+    def _is_high_yield(self, p: FailurePattern) -> bool:
+        return (
+            p.occurrence_count >= self.MIN_OCCURRENCES
+            and p.confidence >= self.MEDIUM_CONFIDENCE
+        )
+
+    def _store_pattern(self, p: FailurePattern) -> None:
+        now = _now_iso()
+        try:
+            with _conn() as c:
+                c.execute(
+                    "INSERT INTO failure_patterns (pattern_id, domain, "
+                    "description, occurrence_count, confidence, landmine_text, "
+                    "keywords_json, sources_json, last_seen, created_at, "
+                    "updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
+                    "ON CONFLICT(pattern_id) DO UPDATE SET "
+                    "occurrence_count = excluded.occurrence_count + "
+                    "failure_patterns.occurrence_count, "
+                    "confidence = MAX(excluded.confidence, failure_patterns.confidence), "
+                    "sources_json = excluded.sources_json, "
+                    "last_seen = excluded.last_seen, "
+                    "updated_at = excluded.updated_at",
+                    (
+                        p.pattern_id,
+                        p.domain,
+                        p.description[:500],
+                        p.occurrence_count,
+                        p.confidence,
+                        p.landmine_text[:500],
+                        json.dumps(p.keywords),
+                        json.dumps(p.sources),
+                        p.last_seen,
+                        now,
+                        now,
+                    ),
+                )
+            _bump("patterns_stored_total")
+        except Exception as exc:  # noqa: BLE001
+            _bump("db_errors_total")
+            logger.warning("_store_pattern failed: %s", exc)
+
+    def _promote_to_landmine(self, pattern_id: str) -> None:
+        try:
+            with _conn() as c:
+                c.execute(
+                    "UPDATE failure_patterns SET promoted_to_landmine = 1, "
+                    "updated_at = ? WHERE pattern_id = ?",
+                    (_now_iso(), pattern_id),
+                )
+            _bump("patterns_promoted_to_landmine_total")
+        except Exception as exc:  # noqa: BLE001
+            _bump("db_errors_total")
+            logger.debug("_promote_to_landmine failed: %s", exc)
+
+    def _row_to_pattern(self, r: sqlite3.Row) -> FailurePattern:
+        return FailurePattern(
+            pattern_id=r["pattern_id"],
+            domain=r["domain"],
+            description=r["description"],
+            occurrence_count=r["occurrence_count"],
+            confidence=r["confidence"],
+            landmine_text=r["landmine_text"],
+            keywords=json.loads(r["keywords_json"] or "[]"),
+            sources=json.loads(r["sources_json"] or "[]"),
+            last_seen=r["last_seen"] or "",
+        )
+
+    # ------------------------------------------------------------------
+    # Text helpers (deduped from the legacy module)
+    # ------------------------------------------------------------------
 
     def _normalize_task(self, content: str) -> str:
-        """Normalize task content for grouping similar requests."""
-        if not content:
-            return ""
+        text = re.sub(r"[^a-z0-9 ]", " ", (content or "").lower())
+        text = re.sub(r"\s+", " ", text).strip()
+        return " ".join(text.split()[:8])
 
-        # Skip IDE metadata events — these are file-open notifications, not task attempts
-        if re.match(r'^\s*<ide_\w+>', content):
-            return ""
-
-        # Skip system reminders
-        if re.match(r'^\s*<system-reminder>', content):
-            return ""
-
-        # Skip short/trivial messages — not real task attempts
-        # "test", "ok", "go ahead", "yes" etc. are conversational, not tasks
-        stripped = content.strip()
-        if len(stripped) < 20:
-            return ""
-
-        # Remove timestamps, IDs, specific values
-        normalized = content.lower()
-        normalized = re.sub(r'\d+', 'N', normalized)  # Replace numbers
-        normalized = re.sub(r'[a-f0-9]{8,}', 'ID', normalized)  # Replace hex IDs
-        normalized = re.sub(r'\s+', ' ', normalized)  # Normalize whitespace
-
-        # Extract key action words
-        actions = re.findall(r'\b(fix|deploy|add|create|update|implement|configure|debug|test|check)\b', normalized)
-        objects = re.findall(r'\b(bug|error|issue|feature|api|database|server|config|test|function|component)\b', normalized)
-
-        if actions and objects:
-            result = f"{' '.join(actions[:2])} {' '.join(objects[:3])}"
-            # Require at least 2 distinct words to avoid "test test" false grouping
-            unique_words = set(result.split())
-            if len(unique_words) < 2:
-                return ""
-            return result
-
-        # No action+object = not a task attempt (conversational, feedback, etc.)
-        # Only real task requests should be tracked as potential failures
-        return ""
-
-    def _extract_keywords(self, text: str) -> List[str]:
-        """Extract significant keywords from text."""
-        if not text:
-            return []
-
-        # Common technical keywords
-        keywords = re.findall(r'\b(async|await|docker|deploy|api|database|db|redis|celery|webhook|django|react|aws|ecs|lambda|terraform|production|staging)\b', text.lower())
-
-        # Deduplicate while preserving order
-        seen = set()
-        unique = []
-        for kw in keywords:
-            if kw not in seen:
-                seen.add(kw)
-                unique.append(kw)
-
-        return unique[:10]
+    def _extract_keywords(self, text: str) -> list[str]:
+        words = re.findall(r"[a-zA-Z]{4,}", (text or "").lower())
+        seen: dict[str, int] = {}
+        for w in words:
+            if w in _STOPWORDS:
+                continue
+            seen[w] = seen.get(w, 0) + 1
+        return sorted(seen, key=lambda w: -seen[w])[:8]
 
     def _detect_domain(self, text: str) -> str:
-        """Detect domain from text using keyword matching."""
-        text_lower = text.lower()
-
-        domain_keywords = {
-            "async_python": ["async", "await", "asyncio", "coroutine", "to_thread"],
-            "docker_ecs": ["docker", "container", "ecs", "fargate", "compose"],
-            "aws_infrastructure": ["aws", "terraform", "lambda", "ec2", "s3", "iam"],
-            "database": ["database", "postgres", "mysql", "redis", "query", "migration"],
-            "django_backend": ["django", "celery", "gunicorn", "wsgi", "drf"],
-            "webrtc_livekit": ["webrtc", "livekit", "turn", "stun", "websocket"],
-            "frontend_react": ["react", "component", "hook", "state", "redux"],
-            "voice_pipeline": ["voice", "tts", "stt", "whisper", "audio"],
-            "memory_system": ["memory", "context", "synaptic", "webhook", "injection"],
-        }
-
-        for domain, keywords in domain_keywords.items():
-            if any(kw in text_lower for kw in keywords):
-                return domain
-
+        t = (text or "").lower()
+        if any(k in t for k in ("webhook", "section", "inject")):
+            return "webhook"
+        if any(k in t for k in ("agent", "spawn", "swarm")):
+            return "agents"
+        if any(k in t for k in ("test", "pytest", "unittest")):
+            return "testing"
+        if any(k in t for k in ("deploy", "ship", "release")):
+            return "deploy"
+        if any(k in t for k in ("memory", "learning", "evidence")):
+            return "memory"
+        if any(k in t for k in ("fleet", "nats", "mac1", "mac2", "mac3")):
+            return "fleet"
+        if any(k in t for k in ("anticipation", "prediction")):
+            return "anticipation"
         return "general"
 
-    def _get_domain_keywords(self, domain: str) -> List[str]:
-        """Get keywords for a domain."""
-        domain_keywords = {
-            "async_python": ["async", "await", "asyncio", "coroutine"],
-            "docker_ecs": ["docker", "container", "ecs", "fargate"],
-            "aws_infrastructure": ["aws", "terraform", "lambda", "ec2"],
-            "database": ["database", "postgres", "mysql", "redis"],
-            "django_backend": ["django", "celery", "gunicorn"],
-            "webrtc_livekit": ["webrtc", "livekit", "turn"],
-            "frontend_react": ["react", "component", "hook"],
-            "voice_pipeline": ["voice", "tts", "stt"],
-            "memory_system": ["memory", "context", "synaptic"],
-        }
-        return domain_keywords.get(domain, [domain])
-
-    def _is_high_yield(self, pattern: FailurePattern) -> bool:
-        """Check if pattern is high-yield (worth warning about)."""
-        # High yield if:
-        # 1. High confidence (>= 0.8) - confirmed failures
-        if pattern.confidence >= self.HIGH_CONFIDENCE:
-            return True
-
-        # 2. Multiple occurrences with medium confidence
-        if pattern.occurrence_count >= 3 and pattern.confidence >= self.MEDIUM_CONFIDENCE:
-            return True
-
-        # 3. From miswiring (always high yield)
-        if "hindsight_validator" in pattern.sources:
-            return True
-
-        return False
-
-    def _merge_similar_patterns(self, patterns: List[FailurePattern]) -> List[FailurePattern]:
-        """Merge similar patterns to avoid duplicates."""
-        if not patterns:
-            return []
-
-        # Group by domain and similar keywords
-        groups = defaultdict(list)
-        for p in patterns:
-            key = (p.domain, tuple(sorted(p.keywords[:3])))
-            groups[key].append(p)
-
-        merged = []
-        for (domain, _), group in groups.items():
-            if len(group) == 1:
-                merged.append(group[0])
-            else:
-                # Merge into highest confidence pattern
-                best = max(group, key=lambda x: (x.confidence, x.occurrence_count))
-
-                # Aggregate counts and sources
-                total_count = sum(p.occurrence_count for p in group)
-                all_sources = list(set(s for p in group for s in p.sources))
-
-                merged.append(FailurePattern(
-                    pattern_id=best.pattern_id,
-                    domain=domain,
-                    description=best.description,
-                    occurrence_count=total_count,
-                    confidence=best.confidence,
-                    landmine_text=best.landmine_text,
-                    keywords=best.keywords,
-                    sources=all_sources,
-                    last_seen=best.last_seen,
-                ))
-
-        return merged
-
-    def _store_pattern(self, pattern: FailurePattern):
-        """Store or update a failure pattern in the database."""
-        import json
-
-        now = datetime.utcnow().isoformat()
-
-        with sqlite3.connect(self.db_path) as conn:
-            # Check if exists
-            existing = conn.execute(
-                f"SELECT occurrence_count, confidence FROM {_t_fail('failure_patterns')} WHERE pattern_id = ?",
-                (pattern.pattern_id,)
-            ).fetchone()
-
-            if existing:
-                # Update
-                new_count = max(existing[0], pattern.occurrence_count)
-                new_confidence = max(existing[1], pattern.confidence)
-
-                conn.execute(f"""
-                    UPDATE {_t_fail('failure_patterns')} SET
-                        occurrence_count = ?,
-                        confidence = ?,
-                        sources_json = ?,
-                        last_seen = ?,
-                        updated_at = ?
-                    WHERE pattern_id = ?
-                """, (
-                    new_count,
-                    new_confidence,
-                    json.dumps(pattern.sources),
-                    pattern.last_seen or now,
-                    now,
-                    pattern.pattern_id,
-                ))
-            else:
-                # Insert
-                conn.execute(f"""
-                    INSERT INTO {_t_fail('failure_patterns')} (
-                        pattern_id, domain, description, occurrence_count,
-                        confidence, landmine_text, keywords_json, sources_json,
-                        last_seen, created_at, updated_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """, (
-                    pattern.pattern_id,
-                    pattern.domain,
-                    pattern.description,
-                    pattern.occurrence_count,
-                    pattern.confidence,
-                    pattern.landmine_text,
-                    json.dumps(pattern.keywords),
-                    json.dumps(pattern.sources),
-                    pattern.last_seen or now,
-                    now,
-                    now,
-                ))
-
-    def _get_relevant_patterns(self, keywords: List[str], domain: str, limit: int) -> List[FailurePattern]:
-        """Get patterns relevant to keywords and domain."""
-        import json
-
-        with sqlite3.connect(self.db_path) as conn:
-            conn.row_factory = sqlite3.Row
-
-            # First try domain match
-            rows = conn.execute(f"""
-                SELECT * FROM {_t_fail('failure_patterns')}
-                WHERE domain = ?
-                ORDER BY confidence DESC, occurrence_count DESC
-                LIMIT ?
-            """, (domain, limit)).fetchall()
-
-            patterns = []
-            for row in rows:
-                patterns.append(FailurePattern(
-                    pattern_id=row['pattern_id'],
-                    domain=row['domain'],
-                    description=row['description'],
-                    occurrence_count=row['occurrence_count'],
-                    confidence=row['confidence'],
-                    landmine_text=row['landmine_text'],
-                    keywords=json.loads(row['keywords_json'] or '[]'),
-                    sources=json.loads(row['sources_json'] or '[]'),
-                    last_seen=row['last_seen'] or '',
-                ))
-
-            # If not enough, try keyword search
-            if len(patterns) < limit and keywords:
-                keyword_pattern = '%' + '%'.join(keywords[:3]) + '%'
-                more_rows = conn.execute(f"""
-                    SELECT * FROM {_t_fail('failure_patterns')}
-                    WHERE keywords_json LIKE ? AND pattern_id NOT IN (
-                        SELECT pattern_id FROM {_t_fail('failure_patterns')} WHERE domain = ?
-                    )
-                    ORDER BY confidence DESC
-                    LIMIT ?
-                """, (keyword_pattern, domain, limit - len(patterns))).fetchall()
-
-                for row in more_rows:
-                    patterns.append(FailurePattern(
-                        pattern_id=row['pattern_id'],
-                        domain=row['domain'],
-                        description=row['description'],
-                        occurrence_count=row['occurrence_count'],
-                        confidence=row['confidence'],
-                        landmine_text=row['landmine_text'],
-                        keywords=json.loads(row['keywords_json'] or '[]'),
-                        sources=json.loads(row['sources_json'] or '[]'),
-                        last_seen=row['last_seen'] or '',
-                    ))
-
-            return patterns
+    def _derive_id(self, kind: str, key: str, domain: str) -> str:
+        h = hashlib.sha1(f"{kind}:{domain}:{key}".encode("utf-8")).hexdigest()[:16]
+        return f"fp_{kind}_{h}"
 
 
-# =============================================================================
-# SINGLETON INSTANCE
-# =============================================================================
-
-_analyzer: Optional[FailurePatternAnalyzer] = None
-
-
-def get_failure_pattern_analyzer() -> FailurePatternAnalyzer:
-    """Get the singleton FailurePatternAnalyzer instance."""
-    global _analyzer
-    if _analyzer is None:
-        _analyzer = FailurePatternAnalyzer()
-    return _analyzer
+_STOPWORDS = {
+    "this", "that", "with", "from", "your", "have", "will", "what", "when",
+    "where", "their", "they", "would", "could", "should", "about", "into",
+    "more", "some", "than", "then", "there", "these", "those", "which",
+    "while", "after", "before", "again", "also", "been", "being",
+}
 
 
-# =============================================================================
-# CLI
-# =============================================================================
+# ---------------------------------------------------------------------------
+# Module-level functions (legacy import-site compatibility)
+# ---------------------------------------------------------------------------
 
-if __name__ == "__main__":
-    import sys
+_analyzer_singleton: Optional[FailurePatternAnalyzer] = None
+_analyzer_lock = threading.Lock()
 
-    if len(sys.argv) < 2:
-        print("=" * 60)
-        print("FAILURE PATTERN ANALYZER")
-        print("Intelligent hindsight for webhook LANDMINE warnings")
-        print("=" * 60)
-        print()
-        print("Usage:")
-        print("  python failure_pattern_analyzer.py analyze [hours]   # Analyze recent dialogue")
-        print("  python failure_pattern_analyzer.py landmines <task>  # Get landmines for task")
-        print("  python failure_pattern_analyzer.py list [domain]     # List high-yield patterns")
-        print("  python failure_pattern_analyzer.py status            # Show system status")
-        sys.exit(0)
 
-    cmd = sys.argv[1].lower()
+def get_failure_pattern_analyzer() -> Optional[FailurePatternAnalyzer]:
+    """Return a process-wide singleton, or ``None`` on init failure.
+
+    The legacy import sites all check truthiness before calling methods:
+
+    .. code-block:: python
+
+        analyzer = get_failure_pattern_analyzer()
+        if analyzer:
+            analyzer.get_landmines_for_task(...)
+
+    Returning ``None`` (rather than raising) preserves that pattern.
+    """
+    global _analyzer_singleton
+    if _analyzer_singleton is not None:
+        return _analyzer_singleton
+    with _analyzer_lock:
+        if _analyzer_singleton is None:
+            try:
+                _analyzer_singleton = FailurePatternAnalyzer()
+            except Exception as exc:  # noqa: BLE001
+                _bump("db_errors_total")
+                logger.warning(
+                    "failure_pattern_analyzer construction failed: %s", exc
+                )
+                return None
+    return _analyzer_singleton
+
+
+def analyze_recent_failures(window_hours: int = DEFAULT_WINDOW_HOURS) -> dict[str, Any]:
+    """Run a one-shot analysis and return a summary dict.
+
+    Used by the lite_scheduler's failure-pattern job (replaces the legacy
+    ``analyze_for_patterns`` call there). Always returns a dict — never
+    raises — and bumps ``analyze_runs_total``.
+    """
+    summary: dict[str, Any] = {
+        "ran": False,
+        "patterns_found": 0,
+        "high_yield": 0,
+        "domains": [],
+        "window_hours": int(window_hours),
+        "error": None,
+    }
     analyzer = get_failure_pattern_analyzer()
+    if analyzer is None:
+        summary["error"] = "analyzer_unavailable"
+        return summary
+    try:
+        patterns = analyzer.analyze_for_patterns(hours_back=int(window_hours))
+        summary["ran"] = True
+        summary["patterns_found"] = len(patterns)
+        summary["high_yield"] = sum(
+            1 for p in patterns if p.occurrence_count >= analyzer.MIN_OCCURRENCES
+        )
+        summary["domains"] = sorted({p.domain for p in patterns if p.domain})
+    except Exception as exc:  # noqa: BLE001
+        _bump("analyze_errors_total")
+        summary["error"] = str(exc)[:200]
+        logger.warning("analyze_recent_failures: %s", exc)
+    return summary
 
-    if cmd == "analyze":
-        hours = int(sys.argv[2]) if len(sys.argv) > 2 else 24
-        print(f"Analyzing dialogue for failure patterns (last {hours}h)...")
-        patterns = analyzer.analyze_for_patterns(hours_back=hours)
-        print(f"Found {len(patterns)} high-yield failure patterns:")
-        for p in patterns:
-            print(f"  [{p.confidence:.0%}] {p.domain}: {p.description[:60]}...")
-            print(f"    LANDMINE: {p.landmine_text[:80]}...")
-            print()
 
-    elif cmd == "landmines":
-        if len(sys.argv) < 3:
-            print("Usage: python failure_pattern_analyzer.py landmines <task>")
-            sys.exit(1)
-        task = " ".join(sys.argv[2:])
-        print(f"Getting LANDMINE warnings for: {task[:50]}...")
-        landmines = analyzer.get_landmines_for_task(task)
-        if landmines:
-            print(f"\nFound {len(landmines)} LANDMINE warnings:")
-            for lm in landmines:
-                print(f"  {lm}")
-        else:
-            print("No relevant LANDMINE warnings found")
+def get_failure_patterns(scope: str = "all") -> list[FailurePattern]:
+    """Return failure patterns within a scope.
 
-    elif cmd == "list":
-        domain = sys.argv[2] if len(sys.argv) > 2 else None
-        patterns = analyzer.get_high_yield_failures(domain=domain)
-        print(f"High-yield failure patterns{f' for {domain}' if domain else ''}:")
-        for p in patterns:
-            print(f"  [{p.confidence:.0%}] x{p.occurrence_count} | {p.domain}")
-            print(f"    {p.landmine_text[:80]}...")
-            print()
+    ``scope`` values:
+      * ``"all"``        — every stored pattern (limit 100)
+      * ``"landmines"``  — promoted patterns only
+      * ``"domain:X"``   — single-domain filter
+    """
+    analyzer = get_failure_pattern_analyzer()
+    if analyzer is None:
+        return []
+    try:
+        if scope.startswith("domain:"):
+            return analyzer.get_high_yield_failures(
+                limit=100, domain=scope.split(":", 1)[1]
+            )
+        if scope == "landmines":
+            with _conn() as c:
+                rows = c.execute(
+                    "SELECT * FROM failure_patterns WHERE promoted_to_landmine = 1 "
+                    "ORDER BY confidence DESC, occurrence_count DESC LIMIT 100"
+                ).fetchall()
+            return [analyzer._row_to_pattern(r) for r in rows]
+        return analyzer.get_high_yield_failures(limit=100)
+    except Exception as exc:  # noqa: BLE001
+        _bump("db_errors_total")
+        logger.debug("get_failure_patterns failed: %s", exc)
+        return []
 
-    elif cmd == "status":
-        print("FAILURE PATTERN ANALYZER STATUS")
-        print("-" * 40)
-        print(f"Database: {analyzer.db_path}")
-        print(f"DialogueMirror: {'Available' if analyzer.dialogue_mirror else 'Not available'}")
-        print(f"TemporalValidator: {'Available' if analyzer.temporal_validator else 'Not available'}")
-        print(f"HindsightValidator: {'Available' if analyzer.hindsight_validator else 'Not available'}")
 
-        patterns = analyzer.get_high_yield_failures()
-        print(f"\nStored patterns: {len(patterns)}")
-        if patterns:
-            domains = Counter(p.domain for p in patterns)
-            print("By domain:")
-            for d, count in domains.most_common():
-                print(f"  {d}: {count}")
+def correlate_with_prediction(prediction_id: str) -> dict[str, Any]:
+    """Find failure patterns that match a given anticipation prediction.
 
-    else:
-        print(f"Unknown command: {cmd}")
-        sys.exit(1)
+    Joins on keyword overlap — a prediction whose candidate text shares
+    >= 2 keywords with a stored pattern is recorded as a correlation. The
+    anticipation engine reads these correlations during ``learn_from_outcome``
+    so a miss can promote the predicted pattern to a landmine immediately.
+    """
+    result: dict[str, Any] = {
+        "prediction_id": prediction_id,
+        "correlated_patterns": [],
+        "ran": False,
+        "error": None,
+    }
+    ae = _try_anticipation_engine()
+    analyzer = get_failure_pattern_analyzer()
+    if ae is None or analyzer is None:
+        result["error"] = "upstream_unavailable"
+        return result
+
+    try:
+        with sqlite3.connect(str(ae._state_db_path())) as conn:
+            conn.row_factory = sqlite3.Row
+            row = conn.execute(
+                "SELECT candidate FROM predictions WHERE prediction_id = ?",
+                (prediction_id,),
+            ).fetchone()
+        if row is None:
+            result["error"] = "prediction_not_found"
+            return result
+        cand = row["candidate"]
+        cand_keywords = set(analyzer._extract_keywords(cand))
+        if not cand_keywords:
+            result["ran"] = True
+            return result
+
+        with _conn() as c:
+            rows = c.execute(
+                "SELECT pattern_id, landmine_text, keywords_json, domain, "
+                "confidence FROM failure_patterns"
+            ).fetchall()
+            now = _now_iso()
+            for r in rows:
+                pat_keywords = set(json.loads(r["keywords_json"] or "[]"))
+                overlap = len(cand_keywords & pat_keywords)
+                if overlap >= 2:
+                    c.execute(
+                        "INSERT OR IGNORE INTO prediction_correlations "
+                        "(prediction_id, pattern_id, correlated_at) VALUES (?, ?, ?)",
+                        (prediction_id, r["pattern_id"], now),
+                    )
+                    result["correlated_patterns"].append(
+                        {
+                            "pattern_id": r["pattern_id"],
+                            "domain": r["domain"],
+                            "landmine_text": r["landmine_text"],
+                            "confidence": r["confidence"],
+                            "overlap": overlap,
+                        }
+                    )
+        _bump("correlations_total")
+        result["ran"] = True
+        return result
+    except Exception as exc:  # noqa: BLE001
+        _bump("analyze_errors_total")
+        result["error"] = str(exc)[:200]
+        logger.warning("correlate_with_prediction failed: %s", exc)
+        return result
+
+
+# ---------------------------------------------------------------------------
+# Internals
+# ---------------------------------------------------------------------------
+
+
+def _now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+# Module load-time logging.
+logger.info(
+    "failure_pattern_analyzer loaded (state_db=%s, min_occurrences=%d, "
+    "high_confidence=%.2f)",
+    _state_db_path(),
+    MIN_OCCURRENCES,
+    HIGH_CONFIDENCE,
+)

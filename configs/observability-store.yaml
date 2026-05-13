@@ -1,0 +1,269 @@
+# =============================================================================
+# observability-store.yaml — JSON-RPC API config for the audit trail layer
+# -----------------------------------------------------------------------------
+# Synaptic flagged the missing `memory.observability_store` module as the #1
+# critical gap: 14+ callers (session_historian, mutual_heartbeat, agent_service,
+# lite_scheduler, session_gold_passes, persistent_hook_structure,
+# surgery-team) cannot record audit events, so failures are invisible and
+# webhook injection becomes stale.
+#
+# This file documents the JSON-RPC contract that
+# `contextdna-ide-oss/migrate3/memory/observability_store.py` exposes.  The
+# RPC server itself is intentionally out of scope here — the contract is
+# declared so any transport (FastAPI, anyio JSON-RPC, mux over NATS) can be
+# bolted on without changing the storage layer.
+#
+# See also:
+#   - memory.bak.20260426/observability_store.py  (legacy reference impl)
+#   - contextdna-ide-oss/migrate3/memory/observability_store.py
+#   - CLAUDE.md  "ZERO SILENT FAILURES" invariant
+# =============================================================================
+
+schema_version: "1.0.0"
+service_id: observability-store
+description: >
+  Session/workflow audit trail.  SQLite-first (always on); PostgreSQL is
+  optional via OBSERVABILITY_BACKEND=postgres (or auto + OBSERVABILITY_PG_DSN).
+
+# -----------------------------------------------------------------------------
+# Backend configuration
+# -----------------------------------------------------------------------------
+backend:
+  # Resolution order applied when callers do not pin a backend explicitly:
+  #   1. OBSERVABILITY_BACKEND env var      (sqlite|postgres|auto)
+  #   2. backend.default below
+  #   3. sqlite (final fallback — always available)
+  default: auto
+
+  sqlite:
+    # Path is overridable via env OBSERVABILITY_DB_DIR.
+    db_path: "${OBSERVABILITY_DB_DIR:-~/.claude/projects/contextdna-ide-oss}/.observability.db"
+    journal_mode: WAL
+    synchronous: NORMAL
+    busy_timeout_ms: 5000
+    # Triggered automatically on `sqlite3.DatabaseError` at init time.
+    corruption_recovery:
+      enabled: true
+      backup_suffix_pattern: ".db.corrupted_<ts>"
+      drop_wal_shm_on_recovery: true
+
+  postgres:
+    # Optional mirror.  A failed attach is counted (observability.pg.attach_errors)
+    # but never aborts the process — SQLite remains source of truth.
+    enabled_when:
+      - "OBSERVABILITY_BACKEND in [postgres, auto]"
+      - "OBSERVABILITY_PG_DSN is set"
+    dsn_env: OBSERVABILITY_PG_DSN
+    # Only `observability_events` is mirrored.  Rich tables (claim,
+    # direct_claim_outcome, dependency_status_event, etc.) stay SQLite-local.
+    mirror_tables:
+      - observability_events
+
+  ringbuf:
+    # Last-resort in-memory buffer for events that fail BOTH SQLite and PG.
+    capacity: 10000           # overridable via OBSERVABILITY_RINGBUF_SIZE
+    eviction: oldest_first
+    surfaced_in: get_health   # depth shows up in backend.ringbuf.depth
+
+# -----------------------------------------------------------------------------
+# Schema metadata
+# -----------------------------------------------------------------------------
+schema:
+  version: "1.0.0"
+  tables:
+    - name: observability_events
+      kind: primary
+      grain: per_event
+      indexed_columns: [timestamp_utc, event_type, session_id]
+    - name: outcome_event
+      kind: legacy
+      grain: per_event
+    - name: claim
+      kind: legacy
+      grain: per_claim
+    - name: direct_claim_outcome
+      kind: legacy
+      grain: per_outcome
+      foreign_keys: [claim.claim_id]
+    - name: dependency_status_event
+      kind: legacy
+      grain: per_event
+    - name: task_run_event
+      kind: legacy
+      grain: per_run
+    - name: recovery_attempt
+      kind: legacy
+      grain: per_attempt
+    - name: negative_pattern
+      kind: rollup
+      grain: per_pattern_key
+    - name: quarantine_item
+      kind: pipeline
+      grain: per_item
+    - name: observability_meta
+      kind: metadata
+      grain: per_key
+
+# -----------------------------------------------------------------------------
+# Retention policy
+# -----------------------------------------------------------------------------
+retention:
+  default_days: 30
+  # Per-table overrides.  A retention sweep (rotation) is run on the cadence
+  # below; failures bump observability.events.errors.
+  per_table_days:
+    observability_events: 30
+    outcome_event: 30
+    dependency_status_event: 30
+    task_run_event: 30
+    recovery_attempt: 30
+    direct_claim_outcome: 90
+    claim: 365
+    negative_pattern: 365
+    quarantine_item: 90
+    observability_meta: -1   # never expire
+
+rotation:
+  enabled: true
+  interval_minutes: 60
+  # When the SQLite db exceeds this size, the rotation task vacuums and
+  # rolls overflow to a date-stamped archive file.
+  max_db_size_mb: 256
+  archive_pattern: ".observability.db.archived_<yyyymmdd>"
+
+# -----------------------------------------------------------------------------
+# JSON-RPC API
+# -----------------------------------------------------------------------------
+# All methods are namespaced under `observability.*`.  Errors follow the
+# JSON-RPC 2.0 contract (-32600 invalid request, -32601 method not found,
+# -32603 internal error).  Internal errors NEVER swallow exceptions — every
+# code path bumps a counter (see `counters` section below).
+jsonrpc:
+  version: "2.0"
+  default_transport: stdio
+  supported_transports: [stdio, http, nats]
+
+  methods:
+    # ---------------------------------------------------------------- record
+    - name: observability.record_event
+      backed_by: ObservabilityStore.record_event
+      params:
+        event_type:   { type: string,  required: true }
+        payload:      { type: object,  required: false, default: {} }
+        session_id:   { type: string,  required: false, default: null }
+        success:      { type: boolean, required: false, default: true }
+        details:      { type: object,  required: false, default: null }
+      returns:
+        event_id:     { type: string }
+
+    # ---------------------------------------------------------------- query
+    - name: observability.query_events
+      backed_by: ObservabilityStore.query_events
+      params:
+        filters:
+          type: object
+          required: false
+          default: {}
+          properties:
+            event_type: { type: string }
+            session_id: { type: string }
+            success:    { type: boolean }
+            since_utc:  { type: string, format: date-time }
+        limit:        { type: integer, required: false, default: 200, maximum: 5000 }
+      returns:
+        events:       { type: array }
+
+    # ---------------------------------------------------------------- health
+    - name: observability.get_health
+      backed_by: ObservabilityStore.get_health
+      params: {}
+      returns:
+        status:       { type: string, enum: [ok, degraded, down] }
+        schema_version: { type: string }
+        started_at_utc: { type: string }
+        mode:         { type: string, enum: [lite, heavy] }
+        backend:      { type: object }
+        counters:     { type: object }
+
+    # ---------------------------------------------------------------- failures
+    - name: observability.get_recent_failures
+      backed_by: ObservabilityStore.get_recent_failures
+      params:
+        hours:        { type: integer, required: false, default: 24 }
+        limit:        { type: integer, required: false, default: 50, maximum: 1000 }
+      returns:
+        events:       { type: array }
+
+    # ---------------------------------------------------------------- trace
+    - name: observability.get_session_trace
+      backed_by: ObservabilityStore.get_session_trace
+      params:
+        session_id:   { type: string, required: true }
+        limit:        { type: integer, required: false, default: 500, maximum: 5000 }
+      returns:
+        events:       { type: array }
+
+# -----------------------------------------------------------------------------
+# Counter taxonomy — ZSF invariant (CLAUDE.md / "ZERO SILENT FAILURES")
+# -----------------------------------------------------------------------------
+# Every failure path increments exactly one of these counters; their values
+# are surfaced verbatim via observability.get_health().counters.  No
+# `except: pass` is permitted in the implementation.
+counters:
+  - name: observability.events.recorded
+    semantic: success_count
+  - name: observability.events.errors
+    semantic: failure_count
+  - name: observability.sqlite.write_errors
+    semantic: failure_count
+  - name: observability.sqlite.read_errors
+    semantic: failure_count
+  - name: observability.sqlite.corruption_recoveries
+    semantic: recovery_count
+  - name: observability.pg.attach_errors
+    semantic: failure_count
+  - name: observability.pg.write_errors
+    semantic: failure_count
+  - name: observability.ringbuf.flushes
+    semantic: fallback_count
+  - name: observability.ringbuf.depth
+    semantic: gauge
+  - name: observability.serialization_errors
+    semantic: failure_count
+
+# -----------------------------------------------------------------------------
+# Caller contract (informational — auto-discovered from grep 2026-05-13)
+# -----------------------------------------------------------------------------
+# These are the public methods the live codebase exercises.  Schemas
+# (parameter types, return types) match the legacy backup at
+# `memory.bak.20260426/observability_store.py` — keep this list in sync if
+# new callers appear.
+callers:
+  - file: memory/session_historian.py:1402
+    method: quarantine_item
+  - file: memory/mutual_heartbeat.py:62
+    method: get_observability_store  # heartbeat liveness probe
+  - file: memory/agent_service.py:3800
+    method: get_observability_store
+  - file: memory/lite_scheduler.py:108
+    method: get_observability_store
+  - file: memory/lite_scheduler.py:1783
+    method: get_observability_store  # grade upgrade SELECTs
+  - file: memory/lite_scheduler.py:1921
+    method: ObservabilityStore(mode=auto)  # webhook-quality claims scan
+  - file: memory/lite_scheduler.py:1939
+    method: ObservabilityStore(mode=auto)  # negative pattern surfacing
+  - file: memory/lite_scheduler.py:3318
+    method: record_outcome_event
+  - file: memory/session_gold_passes.py:2228
+    method: get_observability_store  # pass-13 evidence audit
+  - file: memory/session_gold_passes.py:2478
+    method: record_outcome_event     # session failure path
+  - file: memory/persistent_hook_structure.py:586
+    method: get_observability_store
+  - file: scripts/surgery-team.py:615
+    method: get_claims_by_status
+  - file: scripts/surgery-team.py:631
+    method: get_frequent_negative_patterns
+  - file: scripts/surgery-team.py:3257
+    method: get_claims_by_status

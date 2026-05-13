@@ -1,0 +1,277 @@
+# =============================================================================
+# ContextDNA IDE — Anticipation Engine config (v1.0.0)
+# -----------------------------------------------------------------------------
+# This file tunes `memory.anticipation_engine` and its sibling
+# `memory.failure_pattern_analyzer`. The engine is the predictive layer of
+# the subconscious: it watches dialogue, anticipates the *next* webhook
+# prompt, and pre-computes the heavy LLM-backed sections (S2 / S6 / S8)
+# during otherwise-idle GPU time.
+#
+# Loading order:
+#
+#   1. Defaults in this file
+#   2. Env vars (CONTEXTDNA_ANTICIPATION_*) — override file values at runtime
+#   3. Per-profile overrides under `services.anticipation_engine:` in any
+#      profile that extends `extensible.yaml`
+#
+# Every value documented below maps to an env var of the form
+# `CONTEXTDNA_ANTICIPATION_<KEY_UPPER>` (or the failure-analyzer's
+# `CONTEXTDNA_FPA_<KEY_UPPER>`). The Python code in
+# `memory/anticipation_engine.py` reads the env vars directly so this YAML
+# is purely operator-facing — the loader is `scripts/profile-resolve.py`.
+# =============================================================================
+
+schema_version: "1.0.0"
+identity:
+  module: "memory.anticipation_engine"
+  description: >
+    Real-time MLX probe. Predicts next actions, scores candidates, learns
+    from outcomes. Feeds the feedback-loop handler (services/feedback) so
+    the evidence ledger sees every hit/miss.
+  owner: "subconscious"
+  shipped_by: "migrate3 / Agent 1 of 2026-05-13 round"
+
+# -----------------------------------------------------------------------------
+# Cadence — how often anticipation runs
+# -----------------------------------------------------------------------------
+# `cycle_interval_s`     — lite_scheduler tick interval. Synaptic's directive
+#                          said "every 5 min" for *Atlas* polling; the
+#                          mothership runs much tighter (45 s) so the
+#                          predictive cache stays warm. Operators can dial
+#                          this up to 300 s on resource-constrained nodes.
+# `min_interval_s`       — refractory period between cycles. Prevents the
+#                          listener thread from firing back-to-back when
+#                          the session file is churning.
+# `llm_timeout_s`        — per-LLM-call ceiling. Falls back to keyword
+#                          extraction on timeout (degraded mode).
+# -----------------------------------------------------------------------------
+cadence:
+  cycle_interval_s: 45        # CONTEXTDNA_ANTICIPATION_INTERVAL_S
+  min_interval_s:   20        # CONTEXTDNA_ANTICIPATION_MIN_INTERVAL_S
+  llm_timeout_s:    30        # CONTEXTDNA_ANTICIPATION_LLM_TIMEOUT_S
+  # Synaptic-recommended Atlas cadence (lower-priority polling tier).
+  atlas_polling_interval_s: 300
+
+# -----------------------------------------------------------------------------
+# MLX probe — how the engine talks to the local LLM
+# -----------------------------------------------------------------------------
+# All LLM traffic routes through `memory.llm_priority_queue.llm_generate`
+# at `Priority.BACKGROUND` (P4) so we never preempt Aaron's webhook (P1)
+# or Atlas diagnostics (P2).
+#
+# `profile` choices (see CLAUDE.md → "LLM PRIORITY"):
+#   * `classify` — 64-token budget. Cheapest, used for scoring candidates.
+#   * `extract`  — 768-token budget. Used for superhero artifacts.
+#   * `voice`    — 256-token budget. S8 Synaptic voice generation.
+#   * `deep`     — 2048-token budget. Avoid in anticipation — too slow.
+# -----------------------------------------------------------------------------
+mlx_probe:
+  primary_profile:   "classify"   # candidate generation
+  superhero_profile: "extract"    # mission / gotchas / architecture / failures
+  fallback_to_keywords_on_timeout: true
+  # Hard stop — if more than N consecutive LLM calls fail, the engine
+  # disables itself for `cooldown_s` and bumps `llm_call_errors_total`.
+  circuit_breaker:
+    consecutive_failures: 5
+    cooldown_s: 600
+  # Prompt template used by `AnticipationEngine.predict_next_actions`.
+  # Operators can swap this in per profile to change the prediction style.
+  prediction_prompt_template: |
+    You are the anticipation engine. Given a recent user prompt and prior
+    outcomes, list the 1-5 next concrete actions the assistant should
+    pre-compute. One per line. No numbering. No prose.
+
+# -----------------------------------------------------------------------------
+# Learning loop — how the engine grades itself
+# -----------------------------------------------------------------------------
+# `learning_rate` controls how much each outcome adjusts the prior:
+#
+#     delta = learning_rate * (hit - score)
+#
+# 0.15 (default) is conservative — it takes ~7 hits to flip a 0.5 prior to
+# 0.8. Lower the rate when the operator wants slow drift; raise it during
+# bootstrap so the engine converges quickly on a new project.
+# -----------------------------------------------------------------------------
+learning:
+  learning_rate: 0.15            # CONTEXTDNA_ANTICIPATION_LEARNING_RATE
+  prediction_default_ttl_s: 600
+  # When a prediction expires without an outcome it counts as a miss.
+  # `auto_grade_expired` lets the scheduler call `learn_from_outcome`
+  # automatically — turn off for human-only grading.
+  auto_grade_expired: true
+
+# -----------------------------------------------------------------------------
+# Feedback-loop integration
+# -----------------------------------------------------------------------------
+# Every `AnticipationEngine.learn_from_outcome()` write fans out to three
+# sinks. Each is best-effort and ZSF — a failure in any one bumps a counter
+# and falls through to `/tmp/anticipation-outcomes.jsonl`.
+#
+# This section is the contract between Agent 1 (anticipation_engine) and
+# Agent 4 of the previous round (services/feedback/handler.py — already
+# shipped). When `enabled: false`, the engine still updates SQLite but
+# does not send feedback events to the evidence ledger.
+# -----------------------------------------------------------------------------
+feedback_loop:
+  enabled: true
+  handler_module: "services.feedback.handler"
+  # Map (anticipation outcome) → (feedback kind). Operators may rewire to
+  # send misses to `bug` instead of `unmet_expectation` when running in
+  # alpha mode and every miss is worth a triage.
+  outcome_to_feedback_kind:
+    hit:  "success_story"
+    miss: "unmet_expectation"
+  # Severity per outcome. Hits stay info; misses warn so they surface on
+  # the dashboard. Operators can dial misses up to `critical` for a hard
+  # bake-off period.
+  outcome_to_severity:
+    hit:  "info"
+    miss: "warning"
+  # Fallback file when both the feedback handler AND the evidence ledger
+  # are unreachable. The lite_scheduler reaps this file on the next cycle.
+  fallback_jsonl: "/tmp/anticipation-outcomes.jsonl"
+
+# -----------------------------------------------------------------------------
+# Superhero anticipation — the agent-swarm pre-compute
+# -----------------------------------------------------------------------------
+# When Atlas / Aaron triggers superhero mode (via
+# `POST /contextdna/superhero/activate`), the engine pre-computes four
+# artifacts that spawned agents read mid-task. TTL keeps the cache hot
+# for the duration of the swarm but bounded so stale state expires.
+# -----------------------------------------------------------------------------
+superhero:
+  artifact_ttl_s: 3600          # CONTEXTDNA_ANTICIPATION_SUPERHERO_TTL_S
+  artifacts:
+    - name: mission
+      system_prompt: "Summarize this task in 2 sentences. State the goal, key files."
+      max_tokens: 300
+    - name: gotchas
+      system_prompt: "List 3-5 gotchas for this task. One per line. Be specific."
+      max_tokens: 300
+    - name: architecture
+      system_prompt: "List the 3-5 most relevant modules / files for this task. One per line, module path only."
+      max_tokens: 300
+    - name: failures
+      system_prompt: "List 3 likely failure modes for this task. One per line."
+      max_tokens: 200
+
+# -----------------------------------------------------------------------------
+# Agent findings WAL — the mid-task observation channel
+# -----------------------------------------------------------------------------
+# Spawned agents can call `record_agent_finding(agent_id, finding, ...)`
+# to deposit observations during work. Atlas reads the digest at debrief
+# time. TTL keeps the WAL bounded.
+# -----------------------------------------------------------------------------
+agent_findings_wal:
+  retention_s: 7200             # CONTEXTDNA_ANTICIPATION_FINDINGS_TTL_S
+  max_findings_per_query: 200
+  finding_types:
+    - observation
+    - gotcha
+    - file_found
+    - error
+    - suggestion
+    - critical
+
+# -----------------------------------------------------------------------------
+# Failure-pattern analyzer (sibling module)
+# -----------------------------------------------------------------------------
+# Same physics: dialogue + observability + anticipation misses → clustered
+# `FailurePattern` rows → promoted to landmines.
+# -----------------------------------------------------------------------------
+failure_patterns:
+  min_occurrences:   2          # CONTEXTDNA_FPA_MIN_OCCURRENCES
+  high_confidence:   0.8        # CONTEXTDNA_FPA_HIGH_CONFIDENCE
+  medium_confidence: 0.6        # CONTEXTDNA_FPA_MEDIUM_CONFIDENCE
+  low_confidence:    0.4        # CONTEXTDNA_FPA_LOW_CONFIDENCE
+  window_hours:      24         # CONTEXTDNA_FPA_WINDOW_HOURS
+  # `auto_promote_to_landmine` controls whether patterns at or above
+  # `min_occurrences` become landmines on detection. Set to false to keep
+  # promotion human-in-the-loop during the migrate3 staged rollout.
+  auto_promote_to_landmine: true
+  # Domains the analyzer recognizes when bucketing failures. Add custom
+  # domains here to surface project-specific landmines.
+  domains:
+    - webhook
+    - agents
+    - testing
+    - deploy
+    - memory
+    - fleet
+    - anticipation
+    - general
+
+# -----------------------------------------------------------------------------
+# Graceful-degradation policy
+# -----------------------------------------------------------------------------
+# Each upstream module the engine touches MAY be missing during the
+# migrate3 staged rollout. The list below records the explicit fallback
+# the engine takes; the operator sees the counter increment via /health.
+# -----------------------------------------------------------------------------
+graceful_degradation:
+  observability_store:
+    on_missing: "skip_observability_source"
+    counter:    "upstream_missing_observability_store_total"
+  learning_store:
+    on_missing: "skip_priors"
+    counter:    "upstream_missing_learning_store_total"
+  feedback_handler:
+    on_missing: "fallback_jsonl"
+    counter:    "upstream_missing_feedback_handler_total"
+  llm_priority_queue:
+    on_missing: "keyword_extraction_fallback"
+    counter:    "upstream_missing_llm_priority_queue_total"
+
+# -----------------------------------------------------------------------------
+# Observability surface
+# -----------------------------------------------------------------------------
+# Counters bumped by the engine. The mothership /health endpoint scrapes
+# these via `memory.anticipation_engine.get_counters()` and
+# `memory.failure_pattern_analyzer.get_counters()`.
+# -----------------------------------------------------------------------------
+observability:
+  expose_via_health_endpoint: true
+  counters:
+    anticipation_engine:
+      - cycle_runs_total
+      - cycle_skipped_total
+      - cycle_errors_total
+      - predictions_generated_total
+      - predictions_scored_total
+      - predictions_stored_total
+      - outcomes_recorded_total
+      - outcomes_hits_total
+      - outcomes_misses_total
+      - outcome_fallback_writes_total
+      - superhero_activations_total
+      - superhero_artifacts_cached_total
+      - agent_findings_recorded_total
+      - llm_calls_total
+      - llm_call_errors_total
+      - llm_call_timeouts_total
+    failure_pattern_analyzer:
+      - patterns_detected_total
+      - patterns_stored_total
+      - patterns_promoted_to_landmine_total
+      - landmines_emitted_total
+      - analyze_runs_total
+      - analyze_errors_total
+      - correlations_total
+
+# -----------------------------------------------------------------------------
+# Verification recipe (operator copy-paste)
+# -----------------------------------------------------------------------------
+# Quick smoke test — exercises the public API without an LLM:
+#
+#   PYTHONPATH=. .venv/bin/python3 -c "import sys; \
+#     sys.path.insert(0, 'contextdna-ide-oss/migrate3'); \
+#     from memory.anticipation_engine import AnticipationEngine; \
+#     from memory.failure_pattern_analyzer import analyze_recent_failures; \
+#     e = AnticipationEngine(); \
+#     print('predict:', e.predict_next_actions({'prompt': 'six words to pass gate'})); \
+#     print('analyze:', analyze_recent_failures(window_hours=1))"
+#
+# Expected output on a clean install (no LLM, no observability):
+#   predict: []                              # gate may pass + LLM unavailable → degraded path
+#   analyze: {'ran': True, 'patterns_found': 0, 'high_yield': 0, ...}
+# -----------------------------------------------------------------------------

@@ -7,7 +7,7 @@ WORKDIR /app
 
 # Install minimal dependencies
 RUN pip install --no-cache-dir \
-    mcp==0.9.0 \
+    mcp>=0.9.1,<2 \
     fastapi==0.115.0 \
     uvicorn==0.30.0
 

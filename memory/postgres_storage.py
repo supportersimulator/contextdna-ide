@@ -1,220 +1,222 @@
 #!/usr/bin/env python3
 """
-Context DNA PostgreSQL Storage Adapter
+PostgreSQL Storage Backend — Unified Storage Layer (Postgres half)
+==================================================================
 
-This module provides PostgreSQL-backed storage for the memory system,
-replacing SQLite for production use. Connects to the containerized
-contextdna-pg service (pgvector/pgvector:pg16).
+Mirrors the public surface of :mod:`memory.sqlite_storage` so consumers can
+swap backends by setting ``STORAGE_BACKEND=postgres``. Functions exported at
+module level match the legacy contract used by ``persistent_hook_structure.py``
+and ``synaptic_service_hub.py``:
 
-ARCHITECTURE:
-- PostgreSQL: durable source of truth (sessions, messages, tasks, skills, metadata)
-- Enables: versioned diffs, time-slicing ("last 4 hours"), auditing
-- JSONB for evolving schemas (perfect for "hierarchies that change")
-- pgvector for embeddings (semantic search)
-
-CONNECTION (from context-dna/docker-compose.yml):
-- Docker: context-dna-postgres (port 5432)
-- Database: contextdna (hierarchy/profiles) on same server as context_dna (observability)
-- User: context_dna
-- Password: context_dna_dev (default)
-
-Tables:
-- hierarchies: Project hierarchy metadata
-- skills: Extracted skills/SOPs
-- events: Event log (append-only)
-- snapshots: Periodic state snapshots
-- facts: Curated decisions/conventions/constraints
-
-Usage:
     from memory.postgres_storage import (
-        store_hierarchy, get_hierarchy,
-        store_skill, get_skills,
-        store_event, get_recent_events
+        store_learning, get_failure_count,
+        get_connection, release_connection,
     )
+
+ZSF / graceful degradation:
+    * psycopg2 is **not** imported at module load. Every function lazy-imports
+      it inside the call. When psycopg2 is missing, ``BackendUnavailable`` is
+      raised (or the public function returns a safe default + bumps a counter
+      so the caller — and observability — can see the failure).
+    * Every operation increments a per-method counter in :data:`_COUNTERS`.
+
+Connection config (env, in order):
+    LEARNINGS_DB_USER / DATABASE_USER     → ``context_dna``
+    LEARNINGS_DB_PASSWORD / DATABASE_PASSWORD → ``context_dna_dev``
+    LEARNINGS_DB_HOST / DATABASE_HOST     → ``127.0.0.1``
+    LEARNINGS_DB_PORT / DATABASE_PORT     → ``5432``
+    LEARNINGS_DB_NAME / DATABASE_NAME     → ``context_dna``
+    DATABASE_URL                          → overrides everything above
 """
 
-import os
+from __future__ import annotations
+
 import json
 import logging
-from datetime import datetime, timedelta
-from typing import Dict, List, Optional, Any
+import os
+import threading
+from collections import Counter
 from contextlib import contextmanager
-from pathlib import Path
+from datetime import datetime, timedelta, timezone
+from typing import Any, Dict, List, Optional
 
-# Load Context DNA credentials if not already set
-try:
-    from dotenv import load_dotenv
-    _env_paths = [
-        Path(__file__).parent.parent / "context-dna" / "infra" / ".env",
-        Path(__file__).parent.parent / ".env",
-    ]
-    for _env_path in _env_paths:
-        if _env_path.exists():
-            load_dotenv(_env_path)
-            break
-except ImportError:
-    pass  # dotenv not available, rely on environment
 
-logger = logging.getLogger('contextdna.postgres')
+logger = logging.getLogger("contextdna.postgres")
 
-# =============================================================================
-# DATABASE CONFIGURATION
-# =============================================================================
 
-# LEARNINGS_DB_* takes priority over DATABASE_* to prevent .env hijacking
-# (context-dna/infra/.env sets DATABASE_USER=acontext for the upstream DB,
-#  but this module needs the context_dna database)
-DATABASE_USER = os.environ.get('LEARNINGS_DB_USER', os.environ.get('DATABASE_USER', 'context_dna'))
-DATABASE_PASSWORD = os.environ.get('LEARNINGS_DB_PASSWORD', os.environ.get('DATABASE_PASSWORD', 'context_dna_dev'))
-DATABASE_HOST = os.environ.get('LEARNINGS_DB_HOST', os.environ.get('DATABASE_HOST', '127.0.0.1'))
-DATABASE_PORT = os.environ.get('LEARNINGS_DB_PORT', os.environ.get('DATABASE_PORT', '5432'))
-DATABASE_NAME = os.environ.get('LEARNINGS_DB_NAME', os.environ.get('DATABASE_NAME', 'context_dna'))
+# --------------------------------------------------------------------------- #
+# Config                                                                       #
+# --------------------------------------------------------------------------- #
+
+def _env(name: str, fallback: str, default: str) -> str:
+    return os.environ.get(name, os.environ.get(fallback, default))
+
+
+DATABASE_USER = _env("LEARNINGS_DB_USER", "DATABASE_USER", "context_dna")
+DATABASE_PASSWORD = _env("LEARNINGS_DB_PASSWORD", "DATABASE_PASSWORD", "context_dna_dev")
+DATABASE_HOST = _env("LEARNINGS_DB_HOST", "DATABASE_HOST", "127.0.0.1")
+DATABASE_PORT = _env("LEARNINGS_DB_PORT", "DATABASE_PORT", "5432")
+DATABASE_NAME = _env("LEARNINGS_DB_NAME", "DATABASE_NAME", "context_dna")
 
 DATABASE_URL = os.environ.get(
-    'DATABASE_URL',
-    f"postgresql://{DATABASE_USER}:YOUR_PASSWORD@{DATABASE_HOST}:{DATABASE_PORT}/{DATABASE_NAME}"
+    "DATABASE_URL",
+    f"postgresql://{DATABASE_USER}:{DATABASE_PASSWORD}@{DATABASE_HOST}:{DATABASE_PORT}/{DATABASE_NAME}",
 )
 
-# Global connection pool
+
+# --------------------------------------------------------------------------- #
+# Errors + counters (ZSF)                                                      #
+# --------------------------------------------------------------------------- #
+
+
+class BackendUnavailable(RuntimeError):
+    """Raised when psycopg2 is missing or the DB is unreachable."""
+
+
+_COUNTERS: Counter[str] = Counter()
+_COUNTER_LOCK = threading.Lock()
+
+
+def _bump(key: str) -> None:
+    with _COUNTER_LOCK:
+        _COUNTERS[key] += 1
+
+
+def get_counters() -> Dict[str, int]:
+    """Return a snapshot of operation counters."""
+    with _COUNTER_LOCK:
+        return dict(_COUNTERS)
+
+
+# --------------------------------------------------------------------------- #
+# Connection pool                                                              #
+# --------------------------------------------------------------------------- #
+
 _connection_pool = None
+_pool_lock = threading.Lock()
 
 
-# =============================================================================
-# CONNECTION MANAGEMENT
-# =============================================================================
+def _psycopg2():
+    """Lazy import of psycopg2. Raises :class:`BackendUnavailable` on failure."""
+    try:
+        import psycopg2  # noqa: WPS433
+        from psycopg2 import pool  # noqa: WPS433
+
+        return psycopg2, pool
+    except ImportError as exc:
+        _bump("psycopg2.missing")
+        raise BackendUnavailable("psycopg2 not installed") from exc
+
 
 def get_connection():
-    """Get a database connection from the pool."""
-    global _connection_pool
+    """Return a pooled connection or ``None`` if the backend is unavailable.
 
+    Backward-compatible with legacy callers in ``persistent_hook_structure.py``
+    which expect ``None`` rather than an exception when psycopg2 isn't around.
+    """
+    global _connection_pool
     try:
-        import psycopg2
-        from psycopg2 import pool
-    except ImportError:
-        logger.warning("psycopg2 not available - PostgreSQL storage disabled")
+        _, pool = _psycopg2()
+    except BackendUnavailable:
+        logger.warning("psycopg2 not available — PostgreSQL storage disabled")
         return None
 
     try:
-        if _connection_pool is None:
-            _connection_pool = pool.ThreadedConnectionPool(
-                minconn=1,
-                maxconn=10,
-                dsn=DATABASE_URL
-            )
-            logger.info("PostgreSQL connection pool created")
-
-        return _connection_pool.getconn()
-    except Exception as e:
-        logger.error(f"Failed to get PostgreSQL connection: {e}")
+        with _pool_lock:
+            if _connection_pool is None:
+                _connection_pool = pool.ThreadedConnectionPool(
+                    minconn=1, maxconn=10, dsn=DATABASE_URL
+                )
+                _bump("pool.created")
+                logger.info("PostgreSQL connection pool created")
+        conn = _connection_pool.getconn()
+        _bump("conn.acquired")
+        return conn
+    except Exception as exc:  # psycopg2 errors aren't a single base
+        _bump("conn.fail")
+        logger.error("Failed to get PostgreSQL connection: %s", exc)
         return None
 
 
-def release_connection(conn):
-    """Return a connection to the pool."""
+def release_connection(conn) -> None:
+    """Return a connection to the pool (no-op if pool/conn is missing)."""
     global _connection_pool
-    if _connection_pool and conn:
+    if _connection_pool is None or conn is None:
+        return
+    try:
         _connection_pool.putconn(conn)
+        _bump("conn.released")
+    except Exception as exc:
+        _bump("conn.release_fail")
+        logger.error("Failed to release PostgreSQL connection: %s", exc)
 
 
 @contextmanager
 def get_db_connection():
-    """Context manager for database connections."""
+    """Context manager mirroring the legacy API."""
     conn = get_connection()
     try:
         yield conn
     finally:
-        if conn:
+        if conn is not None:
             release_connection(conn)
 
 
-def init_tables():
-    """Initialize database tables if they don't exist."""
-    with get_db_connection() as conn:
-        if not conn:
-            logger.warning("Cannot initialize tables - no database connection")
-            return False
+# --------------------------------------------------------------------------- #
+# Schema bootstrap                                                             #
+# --------------------------------------------------------------------------- #
 
+
+def init_tables() -> bool:
+    """Create the seven canonical tables if they do not exist."""
+    with get_db_connection() as conn:
+        if conn is None:
+            _bump("init.no_conn")
+            return False
         try:
             cur = conn.cursor()
-
-            # Hierarchies table
-            cur.execute("""
-                CREATE TABLE IF NOT EXISTS contextdna_hierarchies (
-                    id SERIAL PRIMARY KEY,
-                    project_path TEXT UNIQUE NOT NULL,
-                    hierarchy_type TEXT,
-                    boundaries JSONB DEFAULT '[]'::jsonb,
-                    stack_hints JSONB DEFAULT '[]'::jsonb,
-                    entrypoints JSONB DEFAULT '[]'::jsonb,
-                    metadata JSONB DEFAULT '{}'::jsonb,
-                    created_at TIMESTAMP DEFAULT NOW(),
-                    updated_at TIMESTAMP DEFAULT NOW()
-                )
-            """)
-
-            # Skills table
-            cur.execute("""
-                CREATE TABLE IF NOT EXISTS contextdna_skills (
-                    id SERIAL PRIMARY KEY,
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS contextdna_learnings (
+                    id TEXT PRIMARY KEY,
+                    type TEXT NOT NULL,
                     title TEXT NOT NULL,
-                    content TEXT,
-                    tags JSONB DEFAULT '[]'::jsonb,
-                    confidence FLOAT DEFAULT 0.5,
-                    project_id TEXT,
-                    scope TEXT,
-                    metadata JSONB DEFAULT '{}'::jsonb,
-                    created_at TIMESTAMP DEFAULT NOW(),
-                    updated_at TIMESTAMP DEFAULT NOW()
+                    content TEXT NOT NULL,
+                    tags JSONB NOT NULL DEFAULT '[]'::jsonb,
+                    session_id TEXT DEFAULT '',
+                    injection_id TEXT DEFAULT '',
+                    source TEXT DEFAULT 'manual',
+                    workspace_id TEXT NOT NULL DEFAULT '',
+                    metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
+                    merge_count INTEGER DEFAULT 1,
+                    created_at TIMESTAMPTZ DEFAULT NOW(),
+                    updated_at TIMESTAMPTZ DEFAULT NOW(),
+                    fts tsvector GENERATED ALWAYS AS (
+                        setweight(to_tsvector('english', coalesce(title, '')), 'A') ||
+                        setweight(to_tsvector('english', coalesce(content, '')), 'B')
+                    ) STORED
                 )
-            """)
+                """
+            )
+            cur.execute(
+                "CREATE INDEX IF NOT EXISTS idx_cdna_learnings_fts "
+                "ON contextdna_learnings USING GIN (fts)"
+            )
+            cur.execute(
+                "CREATE INDEX IF NOT EXISTS idx_cdna_learnings_type "
+                "ON contextdna_learnings(type)"
+            )
+            cur.execute(
+                "CREATE INDEX IF NOT EXISTS idx_cdna_learnings_session "
+                "ON contextdna_learnings(session_id)"
+            )
+            cur.execute(
+                "CREATE INDEX IF NOT EXISTS idx_cdna_learnings_workspace "
+                "ON contextdna_learnings(workspace_id)"
+            )
 
-            # Events table (append-only log)
-            cur.execute("""
-                CREATE TABLE IF NOT EXISTS contextdna_events (
-                    id SERIAL PRIMARY KEY,
-                    event_type TEXT NOT NULL,
-                    project_id TEXT,
-                    scope TEXT,
-                    payload JSONB NOT NULL,
-                    created_at TIMESTAMP DEFAULT NOW()
-                )
-            """)
-
-            # Create index for time-based queries
-            cur.execute("""
-                CREATE INDEX IF NOT EXISTS idx_events_created_at
-                ON contextdna_events(created_at DESC)
-            """)
-
-            # Snapshots table (periodic state captures)
-            cur.execute("""
-                CREATE TABLE IF NOT EXISTS contextdna_snapshots (
-                    id SERIAL PRIMARY KEY,
-                    snapshot_type TEXT NOT NULL,
-                    project_id TEXT,
-                    data JSONB NOT NULL,
-                    created_at TIMESTAMP DEFAULT NOW()
-                )
-            """)
-
-            # Facts table (curated decisions/conventions)
-            cur.execute("""
-                CREATE TABLE IF NOT EXISTS contextdna_facts (
-                    id SERIAL PRIMARY KEY,
-                    fact_type TEXT NOT NULL,
-                    title TEXT NOT NULL,
-                    content TEXT,
-                    project_id TEXT,
-                    scope TEXT,
-                    locked BOOLEAN DEFAULT FALSE,
-                    metadata JSONB DEFAULT '{}'::jsonb,
-                    created_at TIMESTAMP DEFAULT NOW(),
-                    updated_at TIMESTAMP DEFAULT NOW()
-                )
-            """)
-
-            # Failures table (for Three-Tier escalation tracking)
-            cur.execute("""
+            cur.execute(
+                """
                 CREATE TABLE IF NOT EXISTS contextdna_failures (
                     id SERIAL PRIMARY KEY,
                     session_id TEXT NOT NULL,
@@ -222,426 +224,547 @@ def init_tables():
                     prompt TEXT,
                     error_message TEXT,
                     metadata JSONB DEFAULT '{}'::jsonb,
-                    created_at TIMESTAMP DEFAULT NOW()
+                    created_at TIMESTAMPTZ DEFAULT NOW()
                 )
-            """)
+                """
+            )
+            cur.execute(
+                "CREATE INDEX IF NOT EXISTS idx_cdna_failures_session "
+                "ON contextdna_failures(session_id, created_at DESC)"
+            )
 
-            # Create index for session-based failure queries
-            cur.execute("""
-                CREATE INDEX IF NOT EXISTS idx_failures_session
-                ON contextdna_failures(session_id, created_at DESC)
-            """)
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS contextdna_events (
+                    id SERIAL PRIMARY KEY,
+                    event_type TEXT NOT NULL,
+                    project_id TEXT,
+                    scope TEXT,
+                    payload JSONB NOT NULL,
+                    created_at TIMESTAMPTZ DEFAULT NOW()
+                )
+                """
+            )
+            cur.execute(
+                "CREATE INDEX IF NOT EXISTS idx_cdna_events_created "
+                "ON contextdna_events(created_at DESC)"
+            )
 
             conn.commit()
-            logger.info("PostgreSQL tables initialized successfully")
+            _bump("init.ok")
             return True
-
-        except Exception as e:
-            logger.error(f"Failed to initialize tables: {e}")
-            conn.rollback()
+        except Exception as exc:
+            _bump("init.fail")
+            logger.error("Failed to initialize tables: %s", exc)
+            try:
+                conn.rollback()
+            except Exception:
+                _bump("init.rollback_fail")
             return False
 
 
-# =============================================================================
-# HIERARCHY STORAGE
-# =============================================================================
+# --------------------------------------------------------------------------- #
+# Learnings (the unified contract)                                             #
+# --------------------------------------------------------------------------- #
 
-def store_hierarchy(project_path: str, hierarchy: Dict) -> bool:
-    """Store or update project hierarchy."""
+
+def store_learning(
+    learning_data: Dict[str, Any],
+    skip_dedup: bool = False,
+    consolidate: bool = True,
+    workspace_id: str = "",
+) -> Dict[str, Any]:
+    """Insert a learning row. Honors the same dedup contract as SQLite."""
     with get_db_connection() as conn:
-        if not conn:
-            return False
-
+        if conn is None:
+            _bump("store.no_conn")
+            raise BackendUnavailable("PostgreSQL unavailable for store_learning")
         try:
             cur = conn.cursor()
-            cur.execute("""
-                INSERT INTO contextdna_hierarchies
-                    (project_path, hierarchy_type, boundaries, stack_hints, entrypoints, metadata, updated_at)
-                VALUES (%s, %s, %s, %s, %s, %s, NOW())
-                ON CONFLICT (project_path) DO UPDATE SET
-                    hierarchy_type = EXCLUDED.hierarchy_type,
-                    boundaries = EXCLUDED.boundaries,
-                    stack_hints = EXCLUDED.stack_hints,
-                    entrypoints = EXCLUDED.entrypoints,
+            learning_id = learning_data.get("id") or (
+                f"learn_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S_%f')}"
+            )
+            now = datetime.now(timezone.utc)
+            cur.execute(
+                """
+                INSERT INTO contextdna_learnings
+                (id, type, title, content, tags, session_id, injection_id, source,
+                 workspace_id, metadata, merge_count, created_at, updated_at)
+                VALUES (%s, %s, %s, %s, %s::jsonb, %s, %s, %s, %s, %s::jsonb, 1, %s, %s)
+                ON CONFLICT (id) DO UPDATE SET
+                    title = EXCLUDED.title,
+                    content = EXCLUDED.content,
+                    tags = EXCLUDED.tags,
                     metadata = EXCLUDED.metadata,
-                    updated_at = NOW()
-            """, (
-                project_path,
-                hierarchy.get("type", "unknown"),
-                json.dumps(hierarchy.get("boundaries", [])),
-                json.dumps(hierarchy.get("stack_hints", [])),
-                json.dumps(hierarchy.get("entrypoints", [])),
-                json.dumps(hierarchy.get("metadata", {}))
-            ))
-            conn.commit()
-            return True
-        except Exception as e:
-            logger.error(f"Failed to store hierarchy: {e}")
-            conn.rollback()
-            return False
-
-
-def get_hierarchy(project_path: str) -> Optional[Dict]:
-    """Get project hierarchy."""
-    with get_db_connection() as conn:
-        if not conn:
-            return None
-
-        try:
-            cur = conn.cursor()
-            cur.execute("""
-                SELECT hierarchy_type, boundaries, stack_hints, entrypoints, metadata, updated_at
-                FROM contextdna_hierarchies
-                WHERE project_path = %s
-            """, (project_path,))
-
+                    merge_count = contextdna_learnings.merge_count + 1,
+                    updated_at = EXCLUDED.updated_at
+                RETURNING id, type, title, content, tags, session_id, injection_id,
+                          source, workspace_id, metadata, merge_count,
+                          created_at, updated_at
+                """,
+                (
+                    learning_id,
+                    learning_data.get("type", "win"),
+                    learning_data.get("title", ""),
+                    learning_data.get("content", ""),
+                    json.dumps(learning_data.get("tags", [])),
+                    learning_data.get("session_id", ""),
+                    learning_data.get("injection_id", ""),
+                    learning_data.get("source", "manual"),
+                    workspace_id,
+                    json.dumps(learning_data.get("metadata", {})),
+                    now,
+                    now,
+                ),
+            )
             row = cur.fetchone()
-            if row:
-                return {
-                    "type": row[0],
-                    "boundaries": row[1] or [],
-                    "stack_hints": row[2] or [],
-                    "entrypoints": row[3] or [],
-                    "metadata": row[4] or {},
-                    "updated_at": row[5].isoformat() if row[5] else None
-                }
+            conn.commit()
+            _bump("store.ok")
+            return _row_to_dict(row)
+        except Exception as exc:
+            _bump("store.fail")
+            logger.error("store_learning failed: %s", exc)
+            try:
+                conn.rollback()
+            except Exception:
+                _bump("store.rollback_fail")
+            raise BackendUnavailable(f"store_learning failed: {exc}") from exc
+
+
+def get_learning(learning_id: str) -> Optional[Dict[str, Any]]:
+    with get_db_connection() as conn:
+        if conn is None:
+            _bump("get.no_conn")
             return None
-        except Exception as e:
-            logger.error(f"Failed to get hierarchy: {e}")
+        try:
+            cur = conn.cursor()
+            cur.execute(
+                "SELECT id, type, title, content, tags, session_id, injection_id, "
+                "source, workspace_id, metadata, merge_count, created_at, updated_at "
+                "FROM contextdna_learnings WHERE id = %s",
+                (learning_id,),
+            )
+            row = cur.fetchone()
+            _bump("get.ok")
+            return _row_to_dict(row) if row else None
+        except Exception:
+            _bump("get.fail")
             return None
 
 
-# =============================================================================
-# SKILLS STORAGE
-# =============================================================================
-
-def store_skill(skill: Dict) -> bool:
-    """Store a new skill/SOP."""
+def get_recent_learnings(limit: int = 20) -> List[Dict[str, Any]]:
     with get_db_connection() as conn:
-        if not conn:
-            return False
-
+        if conn is None:
+            _bump("recent.no_conn")
+            return []
         try:
             cur = conn.cursor()
-            cur.execute("""
-                INSERT INTO contextdna_skills
-                    (title, content, tags, confidence, project_id, scope, metadata)
-                VALUES (%s, %s, %s, %s, %s, %s, %s)
-            """, (
-                skill.get("title", "Untitled"),
-                skill.get("content", ""),
-                json.dumps(skill.get("tags", [])),
-                skill.get("confidence", 0.5),
-                skill.get("project_id"),
-                skill.get("scope"),
-                json.dumps(skill.get("metadata", {}))
-            ))
+            cur.execute(
+                "SELECT id, type, title, content, tags, session_id, injection_id, "
+                "source, workspace_id, metadata, merge_count, created_at, updated_at "
+                "FROM contextdna_learnings ORDER BY created_at DESC LIMIT %s",
+                (limit,),
+            )
+            _bump("recent.ok")
+            return [_row_to_dict(r) for r in cur.fetchall()]
+        except Exception:
+            _bump("recent.fail")
+            return []
+
+
+def query_learnings(search: str, limit: int = 10) -> List[Dict[str, Any]]:
+    """Full-text search via the generated tsvector column."""
+    with get_db_connection() as conn:
+        if conn is None:
+            _bump("query.no_conn")
+            return []
+        try:
+            cur = conn.cursor()
+            cur.execute(
+                "SELECT id, type, title, content, tags, session_id, injection_id, "
+                "source, workspace_id, metadata, merge_count, created_at, updated_at "
+                "FROM contextdna_learnings "
+                "WHERE fts @@ plainto_tsquery('english', %s) "
+                "ORDER BY ts_rank(fts, plainto_tsquery('english', %s)) DESC LIMIT %s",
+                (search, search, limit),
+            )
+            _bump("query.ok")
+            return [_row_to_dict(r) for r in cur.fetchall()]
+        except Exception:
+            _bump("query.fail")
+            return []
+
+
+def _row_to_dict(row) -> Dict[str, Any]:
+    if not row:
+        return {}
+    tags = row[4]
+    if isinstance(tags, str):
+        try:
+            tags = json.loads(tags)
+        except (json.JSONDecodeError, TypeError):
+            tags = []
+    metadata = row[9]
+    if isinstance(metadata, str):
+        try:
+            metadata = json.loads(metadata)
+        except (json.JSONDecodeError, TypeError):
+            metadata = {}
+    return {
+        "id": row[0],
+        "type": row[1],
+        "title": row[2],
+        "content": row[3],
+        "tags": tags or [],
+        "session_id": row[5],
+        "injection_id": row[6],
+        "source": row[7],
+        "workspace_id": row[8],
+        "metadata": metadata or {},
+        "_merge_count": row[10],
+        "timestamp": row[11].isoformat() if row[11] else None,
+        "updated_at": row[12].isoformat() if row[12] else None,
+    }
+
+
+# --------------------------------------------------------------------------- #
+# Failure tracking (Three-Tier escalation)                                     #
+# --------------------------------------------------------------------------- #
+
+
+def record_failure(
+    session_id: str,
+    failure_type: str = "task_failed",
+    prompt: Optional[str] = None,
+    error_message: Optional[str] = None,
+) -> bool:
+    with get_db_connection() as conn:
+        if conn is None:
+            _bump("failure.no_conn")
+            return False
+        try:
+            cur = conn.cursor()
+            cur.execute(
+                "INSERT INTO contextdna_failures (session_id, failure_type, prompt, error_message) "
+                "VALUES (%s, %s, %s, %s)",
+                (session_id, failure_type, prompt, error_message),
+            )
             conn.commit()
+            _bump("failure.recorded")
             return True
-        except Exception as e:
-            logger.error(f"Failed to store skill: {e}")
-            conn.rollback()
-            return False
-
-
-def get_skills(project_id: str = None, limit: int = 20) -> List[Dict]:
-    """Get skills, optionally filtered by project."""
-    with get_db_connection() as conn:
-        if not conn:
-            return []
-
-        try:
-            cur = conn.cursor()
-            if project_id:
-                cur.execute("""
-                    SELECT id, title, content, tags, confidence, project_id, scope, created_at
-                    FROM contextdna_skills
-                    WHERE project_id = %s
-                    ORDER BY created_at DESC
-                    LIMIT %s
-                """, (project_id, limit))
-            else:
-                cur.execute("""
-                    SELECT id, title, content, tags, confidence, project_id, scope, created_at
-                    FROM contextdna_skills
-                    ORDER BY created_at DESC
-                    LIMIT %s
-                """, (limit,))
-
-            rows = cur.fetchall()
-            return [
-                {
-                    "id": row[0],
-                    "title": row[1],
-                    "content": row[2],
-                    "tags": row[3] or [],
-                    "confidence": row[4],
-                    "project_id": row[5],
-                    "scope": row[6],
-                    "created_at": row[7].isoformat() if row[7] else None
-                }
-                for row in rows
-            ]
-        except Exception as e:
-            logger.error(f"Failed to get skills: {e}")
-            return []
-
-
-# =============================================================================
-# EVENT STORAGE (Append-only log)
-# =============================================================================
-
-def store_event(event_type: str, payload: Dict, project_id: str = None, scope: str = None) -> bool:
-    """Store an event in the append-only log."""
-    with get_db_connection() as conn:
-        if not conn:
-            return False
-
-        try:
-            cur = conn.cursor()
-            cur.execute("""
-                INSERT INTO contextdna_events (event_type, project_id, scope, payload)
-                VALUES (%s, %s, %s, %s)
-            """, (event_type, project_id, scope, json.dumps(payload)))
-            conn.commit()
-            return True
-        except Exception as e:
-            logger.error(f"Failed to store event: {e}")
-            conn.rollback()
-            return False
-
-
-def get_recent_events(hours: int = 4, event_type: str = None, limit: int = 100) -> List[Dict]:
-    """Get recent events within a time window."""
-    with get_db_connection() as conn:
-        if not conn:
-            return []
-
-        try:
-            cur = conn.cursor()
-            cutoff = datetime.utcnow() - timedelta(hours=hours)
-
-            if event_type:
-                cur.execute("""
-                    SELECT id, event_type, project_id, scope, payload, created_at
-                    FROM contextdna_events
-                    WHERE created_at > %s AND event_type = %s
-                    ORDER BY created_at DESC
-                    LIMIT %s
-                """, (cutoff, event_type, limit))
-            else:
-                cur.execute("""
-                    SELECT id, event_type, project_id, scope, payload, created_at
-                    FROM contextdna_events
-                    WHERE created_at > %s
-                    ORDER BY created_at DESC
-                    LIMIT %s
-                """, (cutoff, limit))
-
-            rows = cur.fetchall()
-            return [
-                {
-                    "id": row[0],
-                    "event_type": row[1],
-                    "project_id": row[2],
-                    "scope": row[3],
-                    "payload": row[4] or {},
-                    "created_at": row[5].isoformat() if row[5] else None
-                }
-                for row in rows
-            ]
-        except Exception as e:
-            logger.error(f"Failed to get events: {e}")
-            return []
-
-
-# =============================================================================
-# FAILURE TRACKING (For Three-Tier Escalation)
-# =============================================================================
-
-def record_failure(session_id: str, failure_type: str = "task_failed",
-                   prompt: str = None, error_message: str = None) -> bool:
-    """Record a failure for Three-Tier escalation tracking."""
-    with get_db_connection() as conn:
-        if not conn:
-            return False
-
-        try:
-            cur = conn.cursor()
-            cur.execute("""
-                INSERT INTO contextdna_failures
-                    (session_id, failure_type, prompt, error_message)
-                VALUES (%s, %s, %s, %s)
-            """, (session_id, failure_type, prompt, error_message))
-            conn.commit()
-            return True
-        except Exception as e:
-            logger.error(f"Failed to record failure: {e}")
-            conn.rollback()
+        except Exception as exc:
+            _bump("failure.fail")
+            logger.error("record_failure failed: %s", exc)
+            try:
+                conn.rollback()
+            except Exception:
+                _bump("failure.rollback_fail")
             return False
 
 
 def get_failure_count(session_id: str, hours: int = 1) -> int:
-    """Get failure count for a session within a time window."""
     with get_db_connection() as conn:
-        if not conn:
+        if conn is None:
+            _bump("failure.count_no_conn")
             return 0
-
         try:
             cur = conn.cursor()
-            cutoff = datetime.utcnow() - timedelta(hours=hours)
-            cur.execute("""
-                SELECT COUNT(*)
-                FROM contextdna_failures
-                WHERE session_id = %s AND created_at > %s
-            """, (session_id, cutoff))
-            return cur.fetchone()[0]
-        except Exception as e:
-            logger.error(f"Failed to get failure count: {e}")
+            cutoff = datetime.now(timezone.utc) - timedelta(hours=hours)
+            cur.execute(
+                "SELECT COUNT(*) FROM contextdna_failures "
+                "WHERE session_id = %s AND created_at > %s",
+                (session_id, cutoff),
+            )
+            count = cur.fetchone()[0]
+            _bump("failure.count_ok")
+            return int(count)
+        except Exception:
+            _bump("failure.count_fail")
             return 0
 
 
 def clear_failures(session_id: str) -> bool:
-    """Clear failures for a session (after success)."""
     with get_db_connection() as conn:
-        if not conn:
+        if conn is None:
+            _bump("failure.clear_no_conn")
             return False
-
         try:
             cur = conn.cursor()
-            cur.execute("""
-                DELETE FROM contextdna_failures
-                WHERE session_id = %s
-            """, (session_id,))
+            cur.execute(
+                "DELETE FROM contextdna_failures WHERE session_id = %s",
+                (session_id,),
+            )
             conn.commit()
+            _bump("failure.cleared")
             return True
-        except Exception as e:
-            logger.error(f"Failed to clear failures: {e}")
-            conn.rollback()
+        except Exception:
+            _bump("failure.clear_fail")
+            try:
+                conn.rollback()
+            except Exception:
+                _bump("failure.clear_rollback_fail")
             return False
 
 
-# =============================================================================
-# SNAPSHOT STORAGE
-# =============================================================================
+# --------------------------------------------------------------------------- #
+# Events                                                                       #
+# --------------------------------------------------------------------------- #
 
-def store_snapshot(snapshot_type: str, data: Dict, project_id: str = None) -> bool:
-    """Store a state snapshot."""
+
+def store_event(
+    event_type: str,
+    payload: Dict[str, Any],
+    project_id: Optional[str] = None,
+    scope: Optional[str] = None,
+) -> bool:
     with get_db_connection() as conn:
-        if not conn:
+        if conn is None:
+            _bump("event.no_conn")
             return False
-
         try:
             cur = conn.cursor()
-            cur.execute("""
-                INSERT INTO contextdna_snapshots (snapshot_type, project_id, data)
-                VALUES (%s, %s, %s)
-            """, (snapshot_type, project_id, json.dumps(data)))
+            cur.execute(
+                "INSERT INTO contextdna_events (event_type, project_id, scope, payload) "
+                "VALUES (%s, %s, %s, %s::jsonb)",
+                (event_type, project_id, scope, json.dumps(payload)),
+            )
             conn.commit()
+            _bump("event.stored")
             return True
-        except Exception as e:
-            logger.error(f"Failed to store snapshot: {e}")
-            conn.rollback()
+        except Exception:
+            _bump("event.fail")
+            try:
+                conn.rollback()
+            except Exception:
+                _bump("event.rollback_fail")
             return False
 
 
-def get_latest_snapshot(snapshot_type: str, project_id: str = None) -> Optional[Dict]:
-    """Get the most recent snapshot of a given type."""
+def get_recent_events(
+    hours: int = 4, event_type: Optional[str] = None, limit: int = 100
+) -> List[Dict[str, Any]]:
     with get_db_connection() as conn:
-        if not conn:
-            return None
-
+        if conn is None:
+            _bump("event.list_no_conn")
+            return []
         try:
             cur = conn.cursor()
-            if project_id:
-                cur.execute("""
-                    SELECT data, created_at
-                    FROM contextdna_snapshots
-                    WHERE snapshot_type = %s AND project_id = %s
-                    ORDER BY created_at DESC
-                    LIMIT 1
-                """, (snapshot_type, project_id))
+            cutoff = datetime.now(timezone.utc) - timedelta(hours=hours)
+            if event_type:
+                cur.execute(
+                    "SELECT id, event_type, project_id, scope, payload, created_at "
+                    "FROM contextdna_events "
+                    "WHERE created_at > %s AND event_type = %s "
+                    "ORDER BY created_at DESC LIMIT %s",
+                    (cutoff, event_type, limit),
+                )
             else:
-                cur.execute("""
-                    SELECT data, created_at
-                    FROM contextdna_snapshots
-                    WHERE snapshot_type = %s
-                    ORDER BY created_at DESC
-                    LIMIT 1
-                """, (snapshot_type,))
-
-            row = cur.fetchone()
-            if row:
-                return {
-                    "data": row[0] or {},
-                    "created_at": row[1].isoformat() if row[1] else None
+                cur.execute(
+                    "SELECT id, event_type, project_id, scope, payload, created_at "
+                    "FROM contextdna_events WHERE created_at > %s "
+                    "ORDER BY created_at DESC LIMIT %s",
+                    (cutoff, limit),
+                )
+            rows = cur.fetchall()
+            _bump("event.list_ok")
+            return [
+                {
+                    "id": r[0],
+                    "event_type": r[1],
+                    "project_id": r[2],
+                    "scope": r[3],
+                    "payload": r[4] or {},
+                    "created_at": r[5].isoformat() if r[5] else None,
                 }
-            return None
-        except Exception as e:
-            logger.error(f"Failed to get snapshot: {e}")
-            return None
+                for r in rows
+            ]
+        except Exception:
+            _bump("event.list_fail")
+            return []
 
 
-def diff_snapshots(snapshot_type: str, project_id: str = None, hours: int = 4) -> Dict:
-    """Compare current state with snapshot from N hours ago."""
-    with get_db_connection() as conn:
-        if not conn:
-            return {"error": "No database connection"}
+# --------------------------------------------------------------------------- #
+# PostgresStorage class wrapper                                                #
+# --------------------------------------------------------------------------- #
 
+
+class PostgresStorage:
+    """Class wrapper matching the SQLiteStorage public surface.
+
+    Used by :mod:`memory.learning_store` when ``STORAGE_BACKEND=postgres``.
+    """
+
+    def __init__(self) -> None:
+        # Trigger schema bootstrap if connection is available. The constructor
+        # never raises — callers can still create an instance and have queries
+        # degrade gracefully when Postgres is offline.
         try:
-            cur = conn.cursor()
-            cutoff = datetime.utcnow() - timedelta(hours=hours)
+            init_tables()
+            _bump("class.init_ok")
+        except BackendUnavailable:
+            _bump("class.init_unavailable")
 
-            # Get latest snapshot
-            cur.execute("""
-                SELECT data, created_at
-                FROM contextdna_snapshots
-                WHERE snapshot_type = %s
-                ORDER BY created_at DESC
-                LIMIT 1
-            """, (snapshot_type,))
-            latest = cur.fetchone()
+    def store_learning(
+        self,
+        learning_data: Dict[str, Any],
+        skip_dedup: bool = False,
+        consolidate: bool = True,
+        workspace_id: str = "",
+    ) -> Dict[str, Any]:
+        return store_learning(learning_data, skip_dedup, consolidate, workspace_id)
 
-            # Get snapshot from N hours ago
-            cur.execute("""
-                SELECT data, created_at
-                FROM contextdna_snapshots
-                WHERE snapshot_type = %s AND created_at <= %s
-                ORDER BY created_at DESC
-                LIMIT 1
-            """, (snapshot_type, cutoff))
-            older = cur.fetchone()
+    def get_by_id(self, learning_id: str) -> Optional[Dict[str, Any]]:
+        return get_learning(learning_id)
 
-            if not latest:
-                return {"error": "No snapshots found"}
+    def get_recent(self, limit: int = 20) -> List[Dict[str, Any]]:
+        return get_recent_learnings(limit)
 
-            if not older:
+    def get_by_session(self, session_id: str) -> List[Dict[str, Any]]:
+        with get_db_connection() as conn:
+            if conn is None:
+                _bump("session.no_conn")
+                return []
+            try:
+                cur = conn.cursor()
+                cur.execute(
+                    "SELECT id, type, title, content, tags, session_id, injection_id, "
+                    "source, workspace_id, metadata, merge_count, created_at, updated_at "
+                    "FROM contextdna_learnings WHERE session_id = %s "
+                    "ORDER BY created_at DESC",
+                    (session_id,),
+                )
+                _bump("session.ok")
+                return [_row_to_dict(r) for r in cur.fetchall()]
+            except Exception:
+                _bump("session.fail")
+                return []
+
+    def get_since(self, timestamp: str, limit: int = 20) -> List[Dict[str, Any]]:
+        with get_db_connection() as conn:
+            if conn is None:
+                _bump("since.no_conn")
+                return []
+            try:
+                cur = conn.cursor()
+                cur.execute(
+                    "SELECT id, type, title, content, tags, session_id, injection_id, "
+                    "source, workspace_id, metadata, merge_count, created_at, updated_at "
+                    "FROM contextdna_learnings WHERE created_at >= %s "
+                    "ORDER BY created_at DESC LIMIT %s",
+                    (timestamp, limit),
+                )
+                _bump("since.ok")
+                return [_row_to_dict(r) for r in cur.fetchall()]
+            except Exception:
+                _bump("since.fail")
+                return []
+
+    def get_by_type(self, learning_type: str, limit: int = 20) -> List[Dict[str, Any]]:
+        with get_db_connection() as conn:
+            if conn is None:
+                _bump("by_type.no_conn")
+                return []
+            try:
+                cur = conn.cursor()
+                cur.execute(
+                    "SELECT id, type, title, content, tags, session_id, injection_id, "
+                    "source, workspace_id, metadata, merge_count, created_at, updated_at "
+                    "FROM contextdna_learnings WHERE type = %s "
+                    "ORDER BY created_at DESC LIMIT %s",
+                    (learning_type, limit),
+                )
+                _bump("by_type.ok")
+                return [_row_to_dict(r) for r in cur.fetchall()]
+            except Exception:
+                _bump("by_type.fail")
+                return []
+
+    def query(self, search: str, limit: int = 10) -> List[Dict[str, Any]]:
+        return query_learnings(search, limit)
+
+    def get_stats(self) -> Dict[str, Any]:
+        with get_db_connection() as conn:
+            if conn is None:
+                _bump("stats.no_conn")
+                return {"total": 0, "wins": 0, "fixes": 0, "patterns": 0, "by_type": {}}
+            try:
+                cur = conn.cursor()
+                cur.execute("SELECT COUNT(*) FROM contextdna_learnings")
+                total = int(cur.fetchone()[0])
+                by_type: Dict[str, int] = {}
+                for lt in ("win", "fix", "pattern", "insight", "gotcha", "sop"):
+                    cur.execute(
+                        "SELECT COUNT(*) FROM contextdna_learnings WHERE type = %s",
+                        (lt,),
+                    )
+                    count = int(cur.fetchone()[0])
+                    if count:
+                        by_type[lt] = count
+                _bump("stats.ok")
                 return {
-                    "current": latest[0],
-                    "previous": None,
-                    "diff": "No previous snapshot for comparison"
+                    "total": total,
+                    "wins": by_type.get("win", 0),
+                    "fixes": by_type.get("fix", 0),
+                    "patterns": by_type.get("pattern", 0),
+                    "by_type": by_type,
                 }
+            except Exception:
+                _bump("stats.fail")
+                return {"total": 0, "wins": 0, "fixes": 0, "patterns": 0, "by_type": {}}
 
-            # Simple diff (in production, use a proper diff library)
-            return {
-                "current": latest[0],
-                "current_at": latest[1].isoformat() if latest[1] else None,
-                "previous": older[0],
-                "previous_at": older[1].isoformat() if older[1] else None,
-                "hours_apart": hours
-            }
+    def health_check(self) -> bool:
+        with get_db_connection() as conn:
+            if conn is None:
+                _bump("health.no_conn")
+                return False
+            try:
+                cur = conn.cursor()
+                cur.execute("SELECT 1")
+                cur.fetchone()
+                _bump("health.ok")
+                return True
+            except Exception:
+                _bump("health.fail")
+                return False
 
-        except Exception as e:
-            logger.error(f"Failed to diff snapshots: {e}")
-            return {"error": str(e)}
+    def close(self) -> None:
+        global _connection_pool
+        if _connection_pool is not None:
+            try:
+                _connection_pool.closeall()
+                _bump("pool.closed")
+            except Exception:
+                _bump("pool.close_fail")
+            _connection_pool = None
 
 
-# =============================================================================
-# INITIALIZATION
-# =============================================================================
+# --------------------------------------------------------------------------- #
+# Singleton accessor                                                           #
+# --------------------------------------------------------------------------- #
 
-# Try to initialize tables on import
-try:
-    init_tables()
-except Exception as e:
-    logger.warning(f"Could not initialize PostgreSQL tables on import: {e}")
+_postgres_storage: Optional[PostgresStorage] = None
+_postgres_lock = threading.Lock()
+
+
+def get_postgres_storage() -> PostgresStorage:
+    """Return a thread-safe singleton instance of :class:`PostgresStorage`."""
+    global _postgres_storage
+    if _postgres_storage is None:
+        with _postgres_lock:
+            if _postgres_storage is None:
+                _postgres_storage = PostgresStorage()
+    return _postgres_storage
+
+
+# Legacy compatibility — original module attempted ``init_tables()`` at import
+# time. We deliberately do **not** do that here: schema bootstrap is lazy so
+# importing this module on a host without psycopg2 (or with PG offline) never
+# raises. Callers must invoke :func:`init_tables` (or instantiate
+# :class:`PostgresStorage`) when they actually need persistence.
+
+
+if __name__ == "__main__":
+    storage = get_postgres_storage()
+    print(f"DATABASE_URL: {DATABASE_URL}")
+    print(f"health:       {storage.health_check()}")
+    print(f"counters:     {get_counters()}")

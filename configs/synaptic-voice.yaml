@@ -1,0 +1,98 @@
+# synaptic-voice.yaml
+# ──────────────────────────────────────────────────────────────────────────
+# Configuration for memory/synaptic_voice.py — the 8th Intelligence's
+# personality/consultation engine.
+#
+# Loaded by SynapticVoice._load_config() in this order:
+#   1. $SYNAPTIC_VOICE_CONFIG (absolute path)
+#   2. <repo_root>/configs/synaptic-voice.yaml         ← canonical
+#   3. <package_root>/configs/synaptic-voice.yaml       ← OSS fallback
+#   4. $CONTEXT_DNA_DIR/synaptic-voice.yaml             ← user override
+#
+# Failure to load is ZSF-observable (counter: config_load_errors).
+# A minimal zero-dep parser is used if PyYAML is unavailable.
+# ──────────────────────────────────────────────────────────────────────────
+
+# --- mode_routing -------------------------------------------------------
+# Picks Synaptic's tonal mode for a given question. Modes:
+#   default | curious | warning | celebratory | skeptical | neutral
+# Modes are applied:
+#   • inside _generate_perspective() to shape the LLM/template output
+#   • by apply_synaptic_voice(text, mode=...) as a thin prefix/postfix
+# The first matching rule wins. Fall-through uses `default`.
+mode_routing:
+  default: default
+
+  rules:
+    - keywords: ["danger", "broke", "broken", "regression", "fail", "outage", "warning"]
+      mode: warning
+
+    - keywords: ["shipped", "deployed", "celebrate", "completed", "win", "milestone"]
+      mode: celebratory
+
+    - keywords: ["really", "sure?", "but ", "however", "doubt", "skeptic"]
+      mode: skeptical
+
+    - keywords: ["explore", "what if", "wonder", "curious", "why", "how come"]
+      mode: curious
+
+# --- llm_voice ----------------------------------------------------------
+# Optional integration with memory/llm_priority_queue.py for authentic
+# Synaptic voice generation. When enabled and importable, perspective
+# generation routes through llm_generate(profile="voice", priority=...).
+# When disabled OR import fails, deterministic template fallback is used
+# and a ZSF counter (llm_voice_unavailable / llm_voice_errors) is bumped.
+llm_voice:
+  enabled: true                # set false to force template-only path
+  profile: voice               # llm_priority_queue profile (256-token cap)
+  priority: BACKGROUND         # AARON | ATLAS | EXTERNAL | BACKGROUND
+  timeout_s: 4                 # advisory only; queue enforces its own
+  caller: synaptic_voice       # tag for queue telemetry
+
+# --- mlx_probe ----------------------------------------------------------
+# Health / capability probe metadata. Atlas reads this to decide whether
+# to surface "Synaptic LLM voice: ready" on /health and in the cardio
+# review surfaces. The probe itself runs inside llm_priority_queue.
+mlx_probe:
+  endpoint: http://127.0.0.1:5044          # local MLX server (Qwen3-4B legacy)
+  fallback_endpoint: http://127.0.0.1:5045 # local DeepSeek proxy (steady state)
+  probe_prompt: "ping"
+  probe_max_tokens: 4
+  acceptable_latency_ms: 1500
+  failure_threshold: 3                     # 3 consecutive failures → mark down
+  recheck_interval_s: 60
+
+# --- audio_bridge (RESERVED) -------------------------------------------
+# Synaptic's original directive described this module as a "WebSocket
+# TTS/STT bridge". The codebase audit found 0/8 consumers using such an
+# interface — the live contract is personality/consultation only. These
+# settings are documented hooks for future audio work and are NOT wired
+# into runtime today. start_audio_bridge() is a stub.
+audio_bridge:
+  enabled: false
+  host: 127.0.0.1
+  port: 8765
+  tts_engine: pyttsx3          # would be used by real bridge: pyttsx3 | mlx-audio
+  stt_engine: faster-whisper   # would be used by real bridge
+  note: "Reserved hook — see synaptic_voice.py module docstring."
+
+# --- substrate ----------------------------------------------------------
+# Where Synaptic looks for context. Paths are resolved relative to
+# CONTEXT_DNA_DIR (or ~/.context-dna). Missing files degrade gracefully
+# (memory_substrate_missing counter bumps) and never crash.
+substrate:
+  brain_state_file: memory/brain_state.md
+  learnings_db: learnings.db
+  patterns_db: pattern_evolution.db
+  journal_db: family_journal.db
+  skills_index: major_skills/index.json
+
+# --- limits -------------------------------------------------------------
+# Defensive caps so a runaway substrate query can't blow up the injection.
+limits:
+  max_learnings_returned: 5
+  max_patterns_returned: 5
+  max_journal_entries: 3
+  max_skills_returned: 5
+  consult_total_timeout_s: 3
+  perspective_max_chars: 1200

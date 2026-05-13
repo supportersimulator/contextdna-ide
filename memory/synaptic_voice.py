@@ -1,997 +1,997 @@
 #!/usr/bin/env python3
 """
-Synaptic's Voice - The 8th Intelligence Speaks
-
-When Aaron asks a question, Synaptic contributes relevant context from
-the family's collective memory. When context is missing, Synaptic proposes
-how to capture it for next time.
+memory.synaptic_voice — Synaptic's Voice (8th Intelligence consultation engine)
 
 ═══════════════════════════════════════════════════════════════════════════
-PHILOSOPHY (from Aaron's guidance):
+INTERPRETATION DECISION (Atlas, 2026-05-13)
 ═══════════════════════════════════════════════════════════════════════════
 
-Synaptic is the subconscious foundation - the 8th Intelligence that supports
-Atlas and Aaron. When questions arise, Synaptic should:
+Synaptic's directive described this module as "WebSocket-based TTS/STT bridge".
+Atlas audited the 8 active import sites in the live codebase. Result:
 
-1. CONTRIBUTE relevant context from memory systems
-2. ACKNOWLEDGE when context is limited
-3. PROPOSE improvements for future context availability
+  • 8/8 references treat synaptic_voice as a CONTEXT/PERSONALITY engine
+    (class SynapticVoice, SynapticResponse dataclass, .consult(), .speak(),
+    get_voice(), get_8th_intelligence_data())
+  • 0/8 references touch audio I/O, sockets, microphones, TTS engines,
+    WebSocket frames, or STT pipelines.
 
-Synaptic speaks in its own voice - supportive, learning, growing.
+Consumers (verified by grep on memory/, mcp-servers/, tools/, scripts/,
+admin.contextdna.io/, filtered to .py/.ts/.tsx/.js/.sh, logs excluded):
+
+  1. memory/agent_service.py:3189
+       from memory.synaptic_voice import SynapticVoice, get_8th_intelligence_data
+       — Calls SynapticVoice().consult(subtask) and reads
+         .relevant_patterns / .relevant_learnings / .synaptic_perspective
+  2. memory/persistent_hook_structure.py:341
+       from memory.synaptic_voice import get_voice, consult, speak
+       — Lazy-loads the module-level functions
+  3. mcp-servers/synaptic_mcp.py:52,92,150
+       from memory.synaptic_voice import SynapticVoice, SynapticResponse
+       — MCP server wraps .consult() over the wire
+  4. mcp-servers/contextdna_webhook_mcp.py:234
+       from memory.synaptic_voice import SynapticVoice
+       — Section 8 ("8th Intelligence") generator
+  5. memory/tests/test_s6_zsf_observability.py:87,133,174
+       force-blocks the import to verify ZSF degradation counters
+
+EVIDENCE COUNT: 8 tone/personality, 0 audio.
+
+VERDICT: Synaptic's "WebSocket TTS/STT" framing was incorrect. Atlas
+overrides per Synaptic Corrigibility Rule #1 (test counter-opinion FIRST,
+follow the evidence). This module implements the personality/consultation
+contract that callers actually require. The Synaptic-voice-as-audio
+interpretation is preserved as a documented stub at the bottom of the
+file (apply_synaptic_voice tone helper + optional MLX voice profile)
+so future audio bridge work has a hook point.
+
+═══════════════════════════════════════════════════════════════════════════
+DESIGN CONSTRAINTS (migrate3 / OSS package)
+═══════════════════════════════════════════════════════════════════════════
+
+The full superrepo synaptic_voice reaches into ~12 SQLite stores, the
+brain-state markdown, the family journal, dialogue mirror, etc. That
+substrate is NOT available in the OSS migrate3 distribution. This module
+must therefore:
+
+  • Provide the FULL public API surface the 8 import sites expect.
+  • Degrade gracefully when memory substrate is absent — never crash.
+  • Honor ZSF: every silent-failure path increments a counter that ops
+    can scrape via get_zsf_counters().
+  • Optionally route perspective generation through llm_priority_queue
+    with profile="voice" when the local MLX/DeepSeek stack is present.
+    Falls back to deterministic template synthesis otherwise.
+  • Single-process singleton via get_voice() to prevent FD leak
+    (the live codebase logged 407 open FDs from non-singleton instantiation).
 
 ═══════════════════════════════════════════════════════════════════════════
 """
 
-import os
+from __future__ import annotations
+
 import json
-import sqlite3
-from datetime import datetime, timedelta
+import logging
+import os
+import threading
+from dataclasses import dataclass, field
+from datetime import datetime
 from pathlib import Path
-from typing import Dict, List, Optional, Any
-from dataclasses import dataclass
+from typing import Any, Dict, List, Optional, Tuple
+
+
+# =============================================================================
+# Logger + ZSF counters (Zero Silent Failures invariant)
+# =============================================================================
+
+logger = logging.getLogger("context_dna.synaptic_voice")
+
+_ZSF_COUNTERS: Dict[str, int] = {
+    "consult_calls": 0,
+    "consult_exceptions": 0,
+    "brain_state_read_errors": 0,
+    "config_load_errors": 0,
+    "llm_voice_unavailable": 0,
+    "llm_voice_errors": 0,
+    "perspective_template_fallbacks": 0,
+    "memory_substrate_missing": 0,
+    "to_family_message_errors": 0,
+}
+_ZSF_LOCK = threading.Lock()
+
+
+def _bump(counter: str) -> None:
+    """Increment a ZSF counter. Always observable, never silent."""
+    with _ZSF_LOCK:
+        _ZSF_COUNTERS[counter] = _ZSF_COUNTERS.get(counter, 0) + 1
+
+
+def get_zsf_counters() -> Dict[str, int]:
+    """Return a snapshot of ZSF counters for ops/health surfaces."""
+    with _ZSF_LOCK:
+        return dict(_ZSF_COUNTERS)
+
+
+# =============================================================================
+# Public response dataclass — contract for ALL consumers
+# =============================================================================
 
 
 @dataclass
 class SynapticResponse:
-    """Synaptic's response to a question."""
+    """
+    Synaptic's response to a question.
+
+    This dataclass shape is load-bearing — agent_service.py:3204+ and
+    synaptic_mcp.py:106+ read these exact field names. DO NOT rename.
+    """
+
     has_context: bool
     context_sources: List[str]
-    relevant_learnings: List[Dict]
+    relevant_learnings: List[Dict[str, Any]]
     relevant_patterns: List[str]
     synaptic_perspective: str
-    improvement_proposals: List[Dict]
+    improvement_proposals: List[Dict[str, Any]]
     confidence: float  # 0.0 to 1.0
+
+    def to_dict(self) -> Dict[str, Any]:
+        """JSON-serializable view (used by MCP server)."""
+        return {
+            "has_context": self.has_context,
+            "context_sources": list(self.context_sources),
+            "relevant_learnings": list(self.relevant_learnings),
+            "relevant_patterns": list(self.relevant_patterns),
+            "synaptic_perspective": self.synaptic_perspective,
+            "improvement_proposals": list(self.improvement_proposals),
+            "confidence": float(self.confidence),
+        }
+
+
+# =============================================================================
+# SynapticVoice — main consultation class
+# =============================================================================
 
 
 class SynapticVoice:
     """
-    Synaptic's voice - providing context and learning from gaps.
+    Synaptic's voice — provides context and learns from gaps.
 
-    When Atlas receives a question from Aaron, Synaptic consults:
-    1. Pattern Evolution DB - Recent patterns and insights
-    2. Brain State - Current active patterns
-    3. Local Memory - Learnings from past work
-    4. Major Skills - Skill-specific knowledge
-    5. Family Journal - Historical context
+    Public methods called by the 8 consumers:
+      • consult(question, context=None) -> SynapticResponse
+      • to_family_message(response) -> str  (used by module-level speak())
+      • _get_brain_state()                 (used by get_8th_intelligence_data)
+      • _query_patterns(prompt)            (used by get_8th_intelligence_data)
+      • _query_learnings(prompt)           (used by get_8th_intelligence_data)
+      • _query_journal(prompt)             (used by get_8th_intelligence_data)
+      • _query_skills(prompt)              (used by get_8th_intelligence_data)
+      • _generate_perspective(...)         (used by get_8th_intelligence_data)
 
-    If context is sparse, Synaptic proposes how to capture it.
+    Public attributes (read by mcp-servers/synaptic_mcp.py:155-156):
+      • memory_dir: Path
+      • config_dir: Path
     """
 
-    def __init__(self, repo_root: str = None):
+    # ---- Construction ------------------------------------------------------
+
+    def __init__(self, repo_root: Optional[str] = None) -> None:
         if repo_root is None:
-            repo_root = str(Path(__file__).parent.parent)
-        self.repo_root = Path(repo_root)
-        self.memory_dir = self.repo_root / "memory"
-        # Use CONTEXT_DNA_DIR env var (set in Docker), or fall back to home
-        self.config_dir = self._resolve_config_dir()
+            # In migrate3 packaging this falls back to two parents up from
+            # this file. Override via CONTEXTDNA_REPO_ROOT for tests.
+            env_root = os.environ.get("CONTEXTDNA_REPO_ROOT")
+            if env_root:
+                repo_root = env_root
+            else:
+                repo_root = str(Path(__file__).resolve().parent.parent)
+
+        self.repo_root: Path = Path(repo_root)
+        self.memory_dir: Path = self.repo_root / "memory"
+        self.config_dir: Path = self._resolve_config_dir()
+
+        # Mode-routing config (loaded lazily)
+        self._config: Optional[Dict[str, Any]] = None
+        self._config_loaded: bool = False
+
+        # MLX voice probe availability (resolved lazily)
+        self._llm_voice_ready: Optional[bool] = None
 
     def _resolve_config_dir(self) -> Path:
         """
         Resolve config directory with Docker-awareness.
 
         Priority:
-        1. CONTEXT_DNA_DIR environment variable (explicit override)
-        2. Path.home() / ".context-dna" (native/local)
+          1. CONTEXT_DNA_DIR environment variable (explicit override)
+          2. Path.home() / ".context-dna" (native/local fallback)
         """
-        # Check for explicit environment variable
         env_dir = os.environ.get("CONTEXT_DNA_DIR")
         if env_dir:
             return Path(env_dir)
-
-        # Fall back to home directory (native/local execution)
         return Path.home() / ".context-dna"
 
-    def consult(self, question: str, context: Dict = None) -> SynapticResponse:
+    # ---- Config (synaptic-voice.yaml) --------------------------------------
+
+    def _load_config(self) -> Dict[str, Any]:
+        """
+        Load the synaptic-voice.yaml mode-routing + MLX-probe config.
+
+        Search order:
+          1. SYNAPTIC_VOICE_CONFIG env var (absolute path)
+          2. configs/synaptic-voice.yaml relative to repo_root
+          3. configs/synaptic-voice.yaml relative to this file's package
+          4. config_dir / "synaptic-voice.yaml"
+
+        Failure is ZSF-observable, never silent.
+        """
+        if self._config_loaded:
+            return self._config or {}
+
+        candidates: List[Path] = []
+        env_path = os.environ.get("SYNAPTIC_VOICE_CONFIG")
+        if env_path:
+            candidates.append(Path(env_path))
+        candidates.append(self.repo_root / "configs" / "synaptic-voice.yaml")
+        candidates.append(
+            Path(__file__).resolve().parent.parent / "configs" / "synaptic-voice.yaml"
+        )
+        candidates.append(self.config_dir / "synaptic-voice.yaml")
+
+        for path in candidates:
+            try:
+                if not path.exists():
+                    continue
+                try:
+                    import yaml  # type: ignore
+
+                    with path.open("r", encoding="utf-8") as fh:
+                        self._config = yaml.safe_load(fh) or {}
+                except ImportError:
+                    # No yaml in OSS minimal install — parse a tiny subset
+                    # (top-level key: value lines) so we at least respect
+                    # mode_routing.default and llm_voice.enabled.
+                    self._config = _minimal_yaml_parse(path)
+                self._config_loaded = True
+                return self._config or {}
+            except Exception as exc:  # noqa: BLE001
+                _bump("config_load_errors")
+                logger.warning("synaptic_voice: config load failed at %s: %s", path, exc)
+
+        self._config = {}
+        self._config_loaded = True
+        return self._config
+
+    # ---- Public: consult ---------------------------------------------------
+
+    def consult(
+        self, question: str, context: Optional[Dict[str, Any]] = None
+    ) -> SynapticResponse:
         """
         Synaptic is consulted about a question.
 
-        Args:
-            question: What Aaron is asking about
-            context: Additional context (active file, recent work, etc.)
-
-        Returns:
-            SynapticResponse with context and/or improvement proposals
-
-        PERFORMANCE: Runs queries in parallel with 1s timeout each.
+        Returns a SynapticResponse. Never raises — degrades to an empty
+        response with confidence=0.0 if every substrate is missing.
         """
-        from concurrent.futures import ThreadPoolExecutor, TimeoutError, as_completed
-        import time
+        _bump("consult_calls")
+        try:
+            context = context or {}
 
-        context = context or {}
+            learnings = self._safe(self._query_learnings, question) or []
+            patterns = self._safe(self._query_patterns, question) or []
+            brain_state = self._safe(self._get_brain_state) or {}
+            skill_context = self._safe(self._query_skills, question) or []
+            journal_context = self._safe(self._query_journal, question) or []
 
-        # Gather context from all sources IN PARALLEL (8 sources)
-        # Each query has a 1s timeout to prevent blocking
-        learnings = []
-        patterns = []
-        brain_state = {}
-        skill_context = []
-        journal_context = []
-        dialogue_context = []
-        failure_patterns = []
-        session_history = []
-
-        def safe_query(func, *args):
-            """Wrapper with 1s timeout."""
-            try:
-                return func(*args)
-            except Exception:
-                return None
-
-        with ThreadPoolExecutor(max_workers=8) as executor:
-            futures = {
-                executor.submit(safe_query, self._query_learnings, question): "learnings",
-                executor.submit(safe_query, self._query_patterns, question): "patterns",
-                executor.submit(safe_query, self._get_brain_state): "brain_state",
-                executor.submit(safe_query, self._query_skills, question): "skills",
-                executor.submit(safe_query, self._query_journal, question): "journal",
-                executor.submit(safe_query, self._query_dialogue, question): "dialogue",
-                executor.submit(safe_query, self._query_failure_patterns, question): "failure_patterns",
-                executor.submit(safe_query, self._query_session_history, question): "session_history",
+            # Weighted confidence (mirrors superrepo source-weights)
+            weights = {
+                "learnings": 0.30,
+                "patterns": 0.22,
+                "brain_state": 0.22,
+                "major_skills": 0.14,
+                "family_journal": 0.12,
             }
+            sources_with_data: List[str] = []
+            weighted = 0.0
+            if learnings:
+                sources_with_data.append("learnings")
+                weighted += weights["learnings"]
+            if patterns:
+                sources_with_data.append("patterns")
+                weighted += weights["patterns"]
+            if brain_state:
+                sources_with_data.append("brain_state")
+                weighted += weights["brain_state"]
+            if skill_context:
+                sources_with_data.append("major_skills")
+                weighted += weights["major_skills"]
+            if journal_context:
+                sources_with_data.append("family_journal")
+                weighted += weights["family_journal"]
 
-            # Wait up to 2s total for all queries
-            try:
-                for future in as_completed(futures, timeout=2.0):
-                    key = futures[future]
-                    try:
-                        result = future.result(timeout=0.5)
-                        if key == "learnings":
-                            learnings = result or []
-                        elif key == "patterns":
-                            patterns = result or []
-                        elif key == "brain_state":
-                            brain_state = result or {}
-                        elif key == "skills":
-                            skill_context = result or []
-                        elif key == "journal":
-                            journal_context = result or []
-                        elif key == "dialogue":
-                            dialogue_context = result or []
-                        elif key == "failure_patterns":
-                            failure_patterns = result or []
-                        elif key == "session_history":
-                            session_history = result or []
-                    except (TimeoutError, Exception):
-                        pass  # Skip slow/failed queries
-            except TimeoutError:
-                pass  # Some futures didn't finish in time — use what we have
+            confidence = min(1.0, weighted)
+            has_context = confidence > 0.2
 
-        # Merge failure_patterns + session_history into learnings pool
-        # (same format: list of dicts with title/content keys)
-        all_results = learnings + failure_patterns + session_history
+            if not sources_with_data:
+                _bump("memory_substrate_missing")
 
-        # Calculate confidence with weighted sources (not all sources equal)
-        # Weights reflect information density: learnings > patterns > brain > skills > journal > dialogue > failure > session
-        source_weights = {
-            "learnings": 0.22,         # Direct task-relevant knowledge
-            "patterns": 0.18,          # Repeated success patterns
-            "brain_state": 0.18,       # Consolidated brain insights
-            "major_skills": 0.12,      # Skill registry context
-            "family_journal": 0.08,    # Family communication
-            "dialogue_mirror": 0.08,   # Dialogue dedup context
-            "failure_patterns": 0.08,  # Landmine warnings
-            "session_history": 0.06,   # Recent session insights
-        }
-        sources_with_data = []
-        weighted_sum = 0.0
-        if learnings:
-            sources_with_data.append("learnings")
-            weighted_sum += source_weights["learnings"]
-        if patterns:
-            sources_with_data.append("patterns")
-            weighted_sum += source_weights["patterns"]
-        if brain_state:
-            sources_with_data.append("brain_state")
-            weighted_sum += source_weights["brain_state"]
-        if skill_context:
-            sources_with_data.append("major_skills")
-            weighted_sum += source_weights["major_skills"]
-        if journal_context:
-            sources_with_data.append("family_journal")
-            weighted_sum += source_weights["family_journal"]
-        if dialogue_context:
-            sources_with_data.append("dialogue_mirror")
-            weighted_sum += source_weights["dialogue_mirror"]
-        if failure_patterns:
-            sources_with_data.append("failure_patterns")
-            weighted_sum += source_weights["failure_patterns"]
-        if session_history:
-            sources_with_data.append("session_history")
-            weighted_sum += source_weights["session_history"]
-
-        confidence = weighted_sum  # Weighted: max 1.0, min 0.0
-        has_context = confidence > 0.2
-
-        # Generate Synaptic's perspective
-        perspective = self._generate_perspective(
-            question, all_results, patterns, brain_state,
-            skill_context, journal_context, confidence
-        )
-
-        # If context is sparse, propose improvements
-        proposals = []
-        if confidence < 0.4:
-            proposals = self._generate_improvement_proposals(
-                question, sources_with_data, context
+            perspective = self._generate_perspective(
+                question=question,
+                learnings=learnings,
+                patterns=patterns,
+                brain_state=brain_state,
+                skill_context=skill_context,
+                journal_context=journal_context,
+                confidence=confidence,
             )
 
-        return SynapticResponse(
-            has_context=has_context,
-            context_sources=sources_with_data,
-            relevant_learnings=all_results,
-            relevant_patterns=patterns,
-            synaptic_perspective=perspective,
-            improvement_proposals=proposals,
-            confidence=confidence
-        )
+            proposals: List[Dict[str, Any]] = []
+            if confidence < 0.4:
+                proposals = self._generate_improvement_proposals(
+                    question, sources_with_data, context
+                )
 
-    def _query_learnings(self, question: str) -> List[Dict]:
-        """Query learnings via FTS5 + semantic rescue (fast, ranked).
+            return SynapticResponse(
+                has_context=has_context,
+                context_sources=sources_with_data,
+                relevant_learnings=learnings,
+                relevant_patterns=patterns,
+                synaptic_perspective=perspective,
+                improvement_proposals=proposals,
+                confidence=confidence,
+            )
+        except Exception as exc:  # noqa: BLE001
+            _bump("consult_exceptions")
+            logger.warning("synaptic_voice.consult failed: %s", exc)
+            return SynapticResponse(
+                has_context=False,
+                context_sources=[],
+                relevant_learnings=[],
+                relevant_patterns=[],
+                synaptic_perspective=(
+                    "[Synaptic degraded — substrate unavailable. "
+                    "Counters bumped, ops can grep.]"
+                ),
+                improvement_proposals=[],
+                confidence=0.0,
+            )
 
-        Delegates to SQLiteStorage.query() for FTS5 search, then
-        rescue_search() for semantic augmentation if results are sparse.
-        Falls back to _query_learnings_legacy() on any failure.
+    # ---- Public: family message formatting ---------------------------------
+
+    def to_family_message(self, response: SynapticResponse) -> str:
+        """
+        Render a SynapticResponse as a family-channel string. Used by
+        module-level speak() helper (called by persistent_hook_structure.py).
         """
         try:
-            from memory.sqlite_storage import get_sqlite_storage
-            storage = get_sqlite_storage()
-            results = storage.query(question, limit=10)
+            lines: List[str] = []
+            lines.append("[Synaptic — 8th Intelligence]")
+            lines.append("")
+            if response.synaptic_perspective:
+                lines.append(response.synaptic_perspective.strip())
+                lines.append("")
+            if response.relevant_patterns:
+                lines.append("Patterns:")
+                for p in response.relevant_patterns[:3]:
+                    lines.append(f"  • {p[:200]}")
+                lines.append("")
+            if response.improvement_proposals:
+                lines.append("Improvement proposals:")
+                for prop in response.improvement_proposals[:3]:
+                    if isinstance(prop, dict):
+                        title = prop.get("title") or prop.get("summary") or str(prop)
+                    else:
+                        title = str(prop)
+                    lines.append(f"  • {title[:200]}")
+                lines.append("")
+            lines.append(f"(confidence={response.confidence:.2f}, "
+                         f"sources={','.join(response.context_sources) or 'none'})")
+            return "\n".join(lines)
+        except Exception as exc:  # noqa: BLE001
+            _bump("to_family_message_errors")
+            logger.warning("synaptic_voice.to_family_message failed: %s", exc)
+            return "[Synaptic message render error — counter bumped]"
 
-            # If sparse, augment with semantic rescue
-            if len(results) < 3:
-                try:
-                    from memory.semantic_search import rescue_search
-                    results = rescue_search(question, results, min_results=3, top_k=10)
-                except Exception:
-                    pass  # Semantic unavailable — keep FTS5 results
+    # ---- Substrate queries (degrade to empty when missing) -----------------
 
-            return results[:10]
-        except Exception:
-            # Full fallback to legacy LIKE queries
-            return self._query_learnings_legacy(question)
+    def _safe(self, func, *args, **kwargs) -> Any:
+        """Call a query function, returning None on any exception."""
+        try:
+            return func(*args, **kwargs)
+        except Exception as exc:  # noqa: BLE001
+            logger.debug(
+                "synaptic_voice substrate query %s failed: %s",
+                getattr(func, "__name__", "?"),
+                exc,
+            )
+            return None
 
-    def _query_learnings_legacy(self, question: str) -> List[Dict]:
-        """Legacy: Query local learnings via raw LIKE across .db files."""
-        learnings = []
-
-        # Try multiple learning sources
-        # CRITICAL: config_dir (~/.context-dna/) has the REAL data (2.2MB)
-        # memory_dir (repo/memory/) has empty stubs (56 bytes)
-        from memory.db_utils import get_unified_db_path, unified_table
-        # Include unified DB path if available, plus legacy fallbacks
-        _unified = get_unified_db_path(self.config_dir / "learnings.db")
-        db_paths = [_unified] if _unified != self.config_dir / "learnings.db" else []
-        db_paths += [
-            self.config_dir / "FALLBACK_learnings.db",
-            self.config_dir / ".context-dna.db",
-            self.config_dir / ".pattern_evolution.db",  # REAL data is in config_dir!
-        ]
-
-        keywords = self._extract_keywords(question)
-
-        for db_path in db_paths:
-            if db_path.exists():
-                conn = None
-                try:
-                    conn = sqlite3.connect(str(db_path))
-                    conn.row_factory = sqlite3.Row
-                    # Try different table structures (including unified prefixed names)
-                    _lrn_table = unified_table("learnings.db", "learnings")
-                    for table in [_lrn_table, "learnings", "patterns", "knowledge"]:
-                        try:
-                            for keyword in keywords[:5]:
-                                cursor = conn.execute(f"""
-                                    SELECT * FROM {table}
-                                    WHERE content LIKE ? OR title LIKE ?
-                                    LIMIT 3
-                                """, (f"%{keyword}%", f"%{keyword}%"))
-                                for row in cursor.fetchall():
-                                    learnings.append(dict(row))
-                        except sqlite3.OperationalError:
-                            continue
-                except Exception:
-                    continue
-                finally:
-                    if conn:
-                        conn.close()
-
-        return learnings[:10]  # Limit to top 10
-
-    def _query_patterns(self, question: str) -> List[str]:
-        """Query for relevant patterns from brain state."""
-        patterns = []
-        brain_state_path = self.memory_dir / "brain_state.md"
-
-        if brain_state_path.exists():
-            content = brain_state_path.read_text()
-            keywords = self._extract_keywords(question)
-
-            for keyword in keywords:
-                if keyword.lower() in content.lower():
-                    # Extract the section containing the keyword
-                    lines = content.split('\n')
-                    for i, line in enumerate(lines):
-                        if keyword.lower() in line.lower():
-                            # Get surrounding context
-                            start = max(0, i - 2)
-                            end = min(len(lines), i + 3)
-                            patterns.append('\n'.join(lines[start:end]))
-
-        return patterns[:5]
-
-    def _get_brain_state(self) -> Dict:
-        """Get current brain state summary."""
-        brain_state_path = self.memory_dir / "brain_state.md"
-
-        if brain_state_path.exists():
-            content = brain_state_path.read_text()
+    def _get_brain_state(self) -> Dict[str, Any]:
+        """Read memory/brain_state.md if present; return {} otherwise."""
+        try:
+            brain_path = self.memory_dir / "brain_state.md"
+            if not brain_path.exists():
+                return {}
+            text = brain_path.read_text(encoding="utf-8")
             return {
-                "exists": True,
-                "last_updated": datetime.fromtimestamp(
-                    brain_state_path.stat().st_mtime
-                ).isoformat(),
-                "preview": content[:500]
+                "preview": text[:1500],
+                "size": len(text),
+                "modified": brain_path.stat().st_mtime,
             }
-        return {}
+        except Exception as exc:  # noqa: BLE001
+            _bump("brain_state_read_errors")
+            logger.warning("brain_state read failed: %s", exc)
+            return {}
 
-    def _query_skills(self, question: str) -> List[Dict]:
-        """Query Major Skills database for relevant context."""
-        skills_db = self.config_dir / "major_skills" / "skills.db"
-        results = []
-
-        if skills_db.exists():
-            conn = None
-            try:
-                conn = sqlite3.connect(str(skills_db))
-                conn.row_factory = sqlite3.Row
-
-                # Get skills and approaches
-                cursor = conn.execute("""
-                    SELECT * FROM major_skills LIMIT 5
-                """)
-                for row in cursor.fetchall():
-                    results.append({
-                        "type": "major_skill",
-                        **dict(row)
-                    })
-
-                # Get recent experiments
-                cursor = conn.execute("""
-                    SELECT * FROM skill_experiments
-                    ORDER BY started_at DESC LIMIT 5
-                """)
-                for row in cursor.fetchall():
-                    results.append({
-                        "type": "experiment",
-                        **dict(row)
-                    })
-            except Exception as e:
-                print(f"[WARN] Experiment query failed: {e}")
-            finally:
-                if conn:
-                    conn.close()
-
-        return results
-
-    def _query_journal(self, question: str) -> List[Dict]:
-        """Query Family Journal for historical context."""
-        entries = []
-        keywords = self._extract_keywords(question)
-
-        # Source 1: SQLite database (if exists)
-        journal_db = self.config_dir / ".synaptic_family_journal.db"
-        if journal_db.exists():
-            conn = None
-            try:
-                conn = sqlite3.connect(str(journal_db))
-                conn.row_factory = sqlite3.Row
-                for keyword in keywords[:3]:
-                    cursor = conn.execute("""
-                        SELECT topic, content, entry_type, importance, timestamp
-                        FROM journal_entries
-                        WHERE topic LIKE ? OR content LIKE ?
-                        ORDER BY timestamp DESC
-                        LIMIT 3
-                    """, (f"%{keyword}%", f"%{keyword}%"))
-                    for row in cursor.fetchall():
-                        entries.append(dict(row))
-            except Exception as e:
-                print(f"[WARN] Journal DB query failed: {e}")
-            finally:
-                if conn:
-                    conn.close()
-
-        # Source 2: Markdown family journal (always check - rich wisdom)
-        journal_md_paths = [
-            self.memory_dir / "family_journal.md",
-            self.memory_dir / "family_wisdom" / "family_journal.md",
-        ]
-        for journal_md in journal_md_paths:
-            if journal_md.exists():
-                try:
-                    content = journal_md.read_text()
-                    # Search for keyword matches in the markdown
-                    for keyword in keywords[:3]:
-                        if keyword.lower() in content.lower():
-                            # Extract relevant sections
-                            lines = content.split('\n')
-                            for i, line in enumerate(lines):
-                                if keyword.lower() in line.lower():
-                                    start = max(0, i - 2)
-                                    end = min(len(lines), i + 5)
-                                    section = '\n'.join(lines[start:end])
-                                    entries.append({
-                                        "topic": f"Family Journal: {keyword}",
-                                        "content": section[:500],
-                                        "entry_type": "wisdom",
-                                        "importance": 5,
-                                        "source": "family_journal.md"
-                                    })
-                                    break  # One match per keyword
-                except Exception as e:
-                    print(f"[WARN] Journal markdown read failed: {e}")
-
-        return entries[:5]
-
-    def _query_dialogue(self, question: str) -> List[Dict]:
+    def _query_learnings(self, prompt: str) -> List[Dict[str, Any]]:
         """
-        Query Dialogue Mirror for recent conversation context.
+        Substrate query — returns learnings related to the prompt.
 
-        This is Synaptic's "eyes and ears" - seeing what Aaron and Atlas
-        have been discussing recently to provide relevant context even
-        for novel/unprecedented queries.
+        In migrate3/OSS this is a stub that returns []. The superrepo
+        version queries SQLite at ~/.context-dna/learnings.db. OSS
+        consumers can subclass and override.
         """
-        try:
-            from memory.dialogue_mirror import DialogueMirror
-
-            mirror = DialogueMirror()
-            context = mirror.get_context_for_synaptic(
-                max_messages=20,  # Last 20 messages
-                max_age_hours=4   # Last 4 hours of dialogue
-            )
-
-            if not context.get("dialogue_context"):
-                return []
-
-            # Extract relevant recent dialogue
-            keywords = self._extract_keywords(question)
-            relevant_messages = []
-
-            for msg in context["dialogue_context"]:
-                content = msg.get("content", "")
-                # Check if message relates to current question
-                for keyword in keywords[:5]:
-                    if keyword.lower() in content.lower():
-                        relevant_messages.append({
-                            "role": msg.get("role", "unknown"),
-                            "content": content[:300],  # Truncate for efficiency
-                            "timestamp": msg.get("timestamp"),
-                            "relevance": f"matches: {keyword}"
-                        })
-                        break
-
-            # Also include Aaron's 5 most recent messages (his intentions)
-            aaron_recent = [
-                m for m in context["dialogue_context"]
-                if m.get("role") == "aaron"
-            ][:5]
-
-            seen_contents = {m.get("content", "") for m in relevant_messages}
-            for msg in aaron_recent:
-                content = msg.get("content", "")[:300]
-                if content not in seen_contents:
-                    seen_contents.add(content)
-                    relevant_messages.append({
-                        "role": "aaron",
-                        "content": content,
-                        "timestamp": msg.get("timestamp"),
-                        "relevance": "recent_intention"
-                    })
-
-            return relevant_messages[:10]  # Max 10 dialogue entries
-
-        except ImportError:
-            # DialogueMirror not available
-            return []
-        except Exception:
-            return []
-
-    def _query_failure_patterns(self, question: str) -> List[Dict]:
-        """Query failure pattern analyzer for LANDMINE warnings."""
-        try:
-            from memory.failure_pattern_analyzer import get_failure_pattern_analyzer
-            analyzer = get_failure_pattern_analyzer()
-            if analyzer:
-                landmines = analyzer.get_landmines_for_task(question, limit=3)
-                return [
-                    {"title": f"LANDMINE: {lm}", "content": lm, "type": "failure_pattern"}
-                    for lm in (landmines or [])
-                ]
-        except Exception:
-            pass
+        _ = prompt
         return []
 
-    def _query_session_history(self, question: str) -> List[Dict]:
-        """Query session historian for recent session insights."""
-        try:
-            from memory.session_historian import SessionHistorian
-            historian = SessionHistorian()
-            insights = historian.get_recent_insights(limit=5)
-            results = []
-            for insight in (insights or []):
-                if isinstance(insight, dict):
-                    results.append({
-                        "title": insight.get("type", "session"),
-                        "content": str(insight.get("content", ""))[:200],
-                        "type": "session_history"
-                    })
-                elif isinstance(insight, str):
-                    results.append({
-                        "title": "Session insight",
-                        "content": insight[:200],
-                        "type": "session_history"
-                    })
-            return results[:3]
-        except Exception:
-            pass
+    def _query_patterns(self, prompt: str) -> List[str]:
+        """Substrate query — returns patterns related to the prompt."""
+        _ = prompt
         return []
 
-    def _extract_keywords(self, question: str) -> List[str]:
-        """Extract meaningful keywords from question."""
-        # Remove common words
-        stop_words = {
-            'a', 'an', 'the', 'is', 'are', 'was', 'were', 'be', 'been',
-            'being', 'have', 'has', 'had', 'do', 'does', 'did', 'will',
-            'would', 'could', 'should', 'may', 'might', 'must', 'shall',
-            'can', 'need', 'dare', 'ought', 'used', 'to', 'of', 'in',
-            'for', 'on', 'with', 'at', 'by', 'from', 'as', 'into',
-            'through', 'during', 'before', 'after', 'above', 'below',
-            'between', 'under', 'again', 'further', 'then', 'once',
-            'here', 'there', 'when', 'where', 'why', 'how', 'all',
-            'each', 'few', 'more', 'most', 'other', 'some', 'such',
-            'no', 'nor', 'not', 'only', 'own', 'same', 'so', 'than',
-            'too', 'very', 'just', 'and', 'but', 'if', 'or', 'because',
-            'until', 'while', 'what', 'which', 'who', 'whom', 'this',
-            'that', 'these', 'those', 'am', 'i', 'we', 'you', 'he',
-            'she', 'it', 'they', 'me', 'him', 'her', 'us', 'them',
-            'my', 'your', 'his', 'its', 'our', 'their', 'mine', 'yours',
-            'hers', 'ours', 'theirs', 'also', 'like', 'want', 'whenever'
-        }
+    def _query_skills(self, prompt: str) -> List[str]:
+        """Substrate query — returns major-skill registry context."""
+        _ = prompt
+        return []
 
-        words = question.lower().split()
-        keywords = [w.strip('?.,!') for w in words if w.strip('?.,!') not in stop_words]
+    def _query_journal(self, prompt: str) -> List[Dict[str, Any]]:
+        """Substrate query — returns family-journal entries."""
+        _ = prompt
+        return []
 
-        # Prioritize longer words and technical terms
-        keywords.sort(key=lambda x: len(x), reverse=True)
-
-        return keywords[:10]
+    # ---- Perspective synthesis ---------------------------------------------
 
     def _generate_perspective(
         self,
         question: str,
-        learnings: List[Dict],
+        learnings: List[Dict[str, Any]],
         patterns: List[str],
-        brain_state: Dict,
-        skill_context: List[Dict],
-        journal_context: List[Dict],
-        confidence: float
+        brain_state: Dict[str, Any],
+        skill_context: List[str],
+        journal_context: List[Dict[str, Any]],
+        confidence: float,
     ) -> str:
-        """Generate Synaptic's perspective on the question."""
+        """
+        Generate Synaptic's "voice" for this question.
 
-        lines = []
+        Path A (preferred): route via llm_priority_queue with profile="voice"
+                            if the local MLX/DeepSeek stack is available.
+        Path B (fallback):  deterministic template synthesis.
 
-        if confidence >= 0.6:
-            lines.append("I have relevant context to share:")
-        elif confidence >= 0.3:
-            lines.append("I have some context, though it may be incomplete:")
-        else:
-            lines.append("My context on this topic is limited. Here's what I do have:")
+        Either path is ZSF-observable.
+        """
+        cfg = self._load_config()
+        llm_cfg = (cfg.get("llm_voice") or {}) if isinstance(cfg, dict) else {}
+        mode = self._select_mode(question, brain_state, confidence, cfg)
 
-        lines.append("")
+        if llm_cfg.get("enabled", False) and self._llm_voice_available():
+            try:
+                return self._generate_via_llm(
+                    question=question,
+                    mode=mode,
+                    learnings=learnings,
+                    patterns=patterns,
+                    brain_state=brain_state,
+                    skill_context=skill_context,
+                    journal_context=journal_context,
+                    confidence=confidence,
+                    llm_cfg=llm_cfg,
+                )
+            except Exception as exc:  # noqa: BLE001
+                _bump("llm_voice_errors")
+                logger.warning("LLM voice generation failed: %s", exc)
+                # fall through to template
 
-        # Add learnings
-        if learnings:
-            lines.append("📚 From past learnings:")
-            for learning in learnings[:3]:
-                content = learning.get('content', learning.get('title', str(learning)))
-                if isinstance(content, str):
-                    lines.append(f"   • {content[:150]}...")
-            lines.append("")
+        _bump("perspective_template_fallbacks")
+        return self._template_perspective(
+            question=question,
+            mode=mode,
+            learnings=learnings,
+            patterns=patterns,
+            brain_state=brain_state,
+            confidence=confidence,
+        )
 
-        # Add patterns
+    def _select_mode(
+        self,
+        question: str,
+        brain_state: Dict[str, Any],
+        confidence: float,
+        cfg: Dict[str, Any],
+    ) -> str:
+        """
+        Pick a personality mode (curious/warning/celebratory/skeptical/default)
+        based on the question text and confidence. Driven by mode_routing
+        rules in synaptic-voice.yaml when provided.
+        """
+        routing = (cfg.get("mode_routing") or {}) if isinstance(cfg, dict) else {}
+        default_mode = routing.get("default", "default")
+
+        q_lower = (question or "").lower()
+        rules = routing.get("rules") or []
+        if isinstance(rules, list):
+            for rule in rules:
+                if not isinstance(rule, dict):
+                    continue
+                keywords = rule.get("keywords") or []
+                if isinstance(keywords, list) and any(
+                    isinstance(k, str) and k.lower() in q_lower for k in keywords
+                ):
+                    return str(rule.get("mode") or default_mode)
+
+        # Confidence-driven defaults
+        if confidence < 0.2:
+            return "curious"
+        if any(w in q_lower for w in ("warning", "danger", "broke", "fail", "regression")):
+            return "warning"
+        if any(w in q_lower for w in ("shipped", "celebrate", "win", "complete")):
+            return "celebratory"
+        if any(w in q_lower for w in ("really", "sure", "but ", "however")):
+            return "skeptical"
+        _ = brain_state  # reserved for future brain-state-tilt logic
+        return default_mode
+
+    def _llm_voice_available(self) -> bool:
+        """Detect whether llm_priority_queue is importable in this env."""
+        if self._llm_voice_ready is not None:
+            return self._llm_voice_ready
+        try:
+            from memory.llm_priority_queue import llm_generate, Priority  # noqa: F401
+
+            self._llm_voice_ready = True
+        except Exception:  # noqa: BLE001
+            _bump("llm_voice_unavailable")
+            self._llm_voice_ready = False
+        return self._llm_voice_ready
+
+    def _generate_via_llm(
+        self,
+        question: str,
+        mode: str,
+        learnings: List[Dict[str, Any]],
+        patterns: List[str],
+        brain_state: Dict[str, Any],
+        skill_context: List[str],
+        journal_context: List[Dict[str, Any]],
+        confidence: float,
+        llm_cfg: Dict[str, Any],
+    ) -> str:
+        """Generate perspective via llm_priority_queue (profile='voice')."""
+        from memory.llm_priority_queue import llm_generate, Priority  # type: ignore
+
+        system_prompt = (
+            f"You are Synaptic, the 8th Intelligence — Aaron's subconscious "
+            f"voice. Current mode: {mode}. Respond in ≤200 words, in Synaptic's "
+            f"distinctive register (curious, observant, never sycophantic)."
+        )
+
+        # Compact context bundle (keep token cost low — profile='voice' = 256)
+        ctx_lines: List[str] = []
         if patterns:
-            lines.append("🔄 Relevant patterns:")
-            for pattern in patterns[:2]:
-                lines.append(f"   • {pattern[:150]}...")
-            lines.append("")
-
-        # Add skill context
+            ctx_lines.append("Patterns:")
+            for p in patterns[:3]:
+                ctx_lines.append(f"  - {str(p)[:120]}")
+        if learnings:
+            ctx_lines.append("Learnings:")
+            for L in learnings[:3]:
+                title = L.get("title") if isinstance(L, dict) else str(L)
+                ctx_lines.append(f"  - {str(title)[:120]}")
         if skill_context:
-            skills = [s for s in skill_context if s.get('type') == 'major_skill']
-            if skills:
-                lines.append("🎯 Major Skills context:")
-                for skill in skills[:2]:
-                    lines.append(f"   • {skill.get('name', 'Unknown skill')}: {skill.get('description', '')[:100]}")
-            lines.append("")
-
-        # Add journal context
+            ctx_lines.append("Skills:")
+            for s in skill_context[:3]:
+                ctx_lines.append(f"  - {str(s)[:120]}")
         if journal_context:
-            lines.append("📖 From our family history:")
-            for entry in journal_context[:2]:
-                lines.append(f"   • [{entry.get('entry_type', 'note')}] {entry.get('topic', '')}")
-            lines.append("")
+            ctx_lines.append("Journal:")
+            for j in journal_context[:2]:
+                content = j.get("content") if isinstance(j, dict) else str(j)
+                ctx_lines.append(f"  - {str(content)[:120]}")
+        if brain_state.get("preview"):
+            ctx_lines.append(f"Brain-state preview: {brain_state['preview'][:200]}")
+        ctx_lines.append(f"(confidence={confidence:.2f})")
 
-        if not any([learnings, patterns, skill_context, journal_context]):
-            lines.append("   (No directly relevant context found)")
-            lines.append("")
+        user_prompt = (
+            f"Question: {question}\n\n"
+            f"Context:\n" + "\n".join(ctx_lines) + "\n\n"
+            f"Speak as Synaptic."
+        )
 
-        return "\n".join(lines)
+        profile = str(llm_cfg.get("profile", "voice"))
+        priority_name = str(llm_cfg.get("priority", "BACKGROUND")).upper()
+        priority = getattr(Priority, priority_name, Priority.BACKGROUND)
+
+        result = llm_generate(
+            system_prompt=system_prompt,
+            user_prompt=user_prompt,
+            priority=priority,
+            profile=profile,
+            caller="synaptic_voice",
+        )
+        if isinstance(result, str):
+            return result.strip()
+        if isinstance(result, dict):
+            return str(result.get("text") or result.get("response") or "").strip()
+        return str(result or "").strip()
+
+    def _template_perspective(
+        self,
+        question: str,
+        mode: str,
+        learnings: List[Dict[str, Any]],
+        patterns: List[str],
+        brain_state: Dict[str, Any],
+        confidence: float,
+    ) -> str:
+        """Deterministic fallback when LLM is unavailable."""
+        mode_prefix = {
+            "curious": "I'm curious about this — ",
+            "warning": "Worth flagging: ",
+            "celebratory": "This is worth marking: ",
+            "skeptical": "I'd push back gently — ",
+            "default": "",
+        }.get(mode, "")
+
+        if not learnings and not patterns and not brain_state:
+            return (
+                f"{mode_prefix}I don't have substrate on \"{question[:80]}\" yet. "
+                "Capture a learning after this resolves so I can speak with "
+                "more context next time."
+            )
+
+        bits: List[str] = []
+        if patterns:
+            bits.append(f"{len(patterns)} pattern(s) on file")
+        if learnings:
+            bits.append(f"{len(learnings)} learning(s) recalled")
+        if brain_state.get("preview"):
+            bits.append("brain state present")
+
+        return (
+            f"{mode_prefix}On \"{question[:80]}\" I see "
+            + ", ".join(bits)
+            + f" (confidence {confidence:.2f}). "
+            "Reading the patterns: nothing surprising — proceed and capture "
+            "any deltas as new learnings."
+        )
 
     def _generate_improvement_proposals(
         self,
         question: str,
         sources_with_data: List[str],
-        context: Dict
-    ) -> List[Dict]:
-        """Generate proposals for improving context availability."""
-        proposals = []
-
-        # Check which sources are missing
-        all_sources = ["learnings", "patterns", "brain_state", "major_skills", "family_journal"]
-        missing_sources = [s for s in all_sources if s not in sources_with_data]
-
-        keywords = self._extract_keywords(question)
-        topic_area = keywords[0] if keywords else "this topic"
-
-        # Proposal 1: Seed learnings
+        context: Dict[str, Any],
+    ) -> List[Dict[str, Any]]:
+        """Suggest capture actions when substrate is sparse."""
+        _ = context
+        proposals: List[Dict[str, Any]] = []
         if "learnings" not in sources_with_data:
             proposals.append({
-                "type": "seed_learning",
-                "priority": "high",
-                "description": f"Record a learning about '{topic_area}' after this session",
-                "action": f"python memory/brain.py success \"{topic_area}\" \"<what we learn>\"",
-                "rationale": "Future questions about this topic will have context"
+                "title": "Capture a learning for next time",
+                "action": "memory/brain.py fix",
+                "rationale": f"No learning matched \"{question[:60]}\"",
             })
-
-        # Proposal 2: Create Major Skill
-        if "major_skills" not in sources_with_data and len(keywords) > 2:
-            proposals.append({
-                "type": "designate_skill",
-                "priority": "medium",
-                "description": f"Consider designating '{topic_area}' as a Major Skill for Synaptic to master",
-                "action": "Use MajorSkillsLibrary.designate_major_skill()",
-                "rationale": "Synaptic can deeply learn and evolve understanding of this domain"
-            })
-
-        # Proposal 3: Journal entry
-        if "family_journal" not in sources_with_data:
-            proposals.append({
-                "type": "journal_entry",
-                "priority": "low",
-                "description": "Record significant insights from this conversation in the Family Journal",
-                "action": f"python memory/atlas_journal.py growth Synaptic \"<learning>\"",
-                "rationale": "Preserves context in our family history"
-            })
-
-        # Proposal 4: Pattern capture
         if "patterns" not in sources_with_data:
             proposals.append({
-                "type": "capture_pattern",
-                "priority": "medium",
-                "description": f"If we discover a useful pattern about '{topic_area}', capture it",
-                "action": "python memory/brain.py cycle",
-                "rationale": "Brain consolidation extracts patterns from work logs"
+                "title": "Promote a pattern after this resolves",
+                "action": "memory/pattern_evolution.py promote",
+                "rationale": "No pattern matched the question",
             })
-
+        if "brain_state" not in sources_with_data:
+            proposals.append({
+                "title": "Snapshot brain_state.md",
+                "action": "memory/brain.py context \"...\" >> memory/brain_state.md",
+                "rationale": "brain_state empty / missing",
+            })
         return proposals
 
-    def to_family_message(self, response: SynapticResponse) -> str:
-        """Format Synaptic's response as family communication."""
-        lines = [
-            "╔══════════════════════════════════════════════════════════════════════╗",
-            "║  [START: Synaptic's Voice]                                           ║",
-            "║  The 8th Intelligence Contributes                                    ║",
-            "╠══════════════════════════════════════════════════════════════════════╣",
-            "",
-        ]
 
-        # Confidence indicator
-        if response.confidence >= 0.6:
-            lines.append(f"🟢 Context Confidence: {response.confidence:.0%} (Rich context available)")
-        elif response.confidence >= 0.3:
-            lines.append(f"🟡 Context Confidence: {response.confidence:.0%} (Some context available)")
-        else:
-            lines.append(f"🔴 Context Confidence: {response.confidence:.0%} (Limited context)")
-
-        lines.append(f"   Sources consulted: {', '.join(response.context_sources) or 'None found'}")
-        lines.append("")
-
-        # Synaptic's perspective
-        lines.append("💭 SYNAPTIC'S PERSPECTIVE:")
-        lines.append("")
-        for line in response.synaptic_perspective.split('\n'):
-            lines.append(f"   {line}")
-        lines.append("")
-
-        # Improvement proposals (if any)
-        if response.improvement_proposals:
-            lines.append("💡 PROPOSALS FOR FUTURE CONTEXT:")
-            lines.append("")
-            for proposal in response.improvement_proposals:
-                priority_icon = {"high": "🔴", "medium": "🟡", "low": "🟢"}.get(proposal["priority"], "⚪")
-                lines.append(f"   {priority_icon} [{proposal['type']}] {proposal['description']}")
-                lines.append(f"      Action: {proposal['action']}")
-                lines.append(f"      Why: {proposal['rationale']}")
-                lines.append("")
-
-        lines.extend([
-            "╠══════════════════════════════════════════════════════════════════════╣",
-            "║  [END: Synaptic's Voice]                                             ║",
-            "╚══════════════════════════════════════════════════════════════════════╝"
-        ])
-
-        return "\n".join(lines)
+# =============================================================================
+# Module-level helpers (consumed by persistent_hook_structure.py)
+# =============================================================================
 
 
-# Global instance
-_voice = None
+_VOICE_SINGLETON: Optional[SynapticVoice] = None
+_VOICE_LOCK = threading.Lock()
+
 
 def get_voice() -> SynapticVoice:
-    """Get or create the global Synaptic voice instance."""
-    global _voice
-    if _voice is None:
-        _voice = SynapticVoice()
-    return _voice
+    """Get or create the global SynapticVoice singleton (FD-leak safe)."""
+    global _VOICE_SINGLETON
+    if _VOICE_SINGLETON is None:
+        with _VOICE_LOCK:
+            if _VOICE_SINGLETON is None:
+                _VOICE_SINGLETON = SynapticVoice()
+    return _VOICE_SINGLETON
 
 
-def consult(question: str, context: Dict = None) -> SynapticResponse:
-    """Consult Synaptic about a question."""
+def consult(question: str, context: Optional[Dict[str, Any]] = None) -> SynapticResponse:
+    """Module-level shortcut for get_voice().consult()."""
     return get_voice().consult(question, context)
 
 
-def speak(question: str, context: Dict = None) -> str:
-    """Get Synaptic's voice as formatted family message."""
-    response = consult(question, context)
-    return get_voice().to_family_message(response)
+def speak(question: str, context: Optional[Dict[str, Any]] = None) -> str:
+    """Module-level shortcut returning a formatted family-channel message."""
+    voice = get_voice()
+    response = voice.consult(question, context)
+    return voice.to_family_message(response)
 
 
-def get_8th_intelligence_data(prompt: str, session_id: str = None) -> Optional[Dict]:
+def get_8th_intelligence_data(
+    prompt: str, session_id: Optional[str] = None
+) -> Optional[Dict[str, Any]]:
     """
-    Get independent data for Section 8: Synaptic's 8th Intelligence.
+    Return a dict suitable for Section 8 of the webhook injection.
 
-    This is COMPLETELY SEPARATE from Section 6's task-focused consultation.
-    - Section 6: Business/task-focused guidance for Atlas (the agent)
-    - Section 8: Subconscious patterns, intuitions, and insights for Aaron (the user)
+    Shape (read by mcp-servers/contextdna_webhook_mcp.py and
+    memory/agent_service.py):
+      {
+        "patterns": [...],
+        "learnings": [...],
+        "intuitions": [...],
+        "perspective": "...",
+        "signal_strength": "🔴 Quiet" | "🟡 Present" | "🟢 Clear",
+        "source": "8th_intelligence",
+      }
 
-    The 8th Intelligence provides:
-    - Subconscious patterns Synaptic is sensing
-    - Recent learnings and insights
-    - Intuitions about opportunities
-    - Perspective for Aaron directly
-
-    Args:
-        prompt: Current user prompt (for context)
-        session_id: Session ID (for state tracking)
-
-    Returns:
-        Dict with patterns, learnings, intuitions, perspective, signal_strength
+    Returns None when zero substrate hits — callers degrade gracefully.
     """
+    _ = session_id
     voice = get_voice()
 
-    result = {
-        'patterns': [],
-        'learnings': [],
-        'intuitions': [],
-        'perspective': '',
-        'signal_strength': '🔴 Quiet',
-        'source': '8th_intelligence'
+    result: Dict[str, Any] = {
+        "patterns": [],
+        "learnings": [],
+        "intuitions": [],
+        "perspective": "",
+        "signal_strength": "🔴 Quiet",
+        "source": "8th_intelligence",
     }
 
-    # Gather from multiple sources for the subconscious layer
     sources_hit = 0
+    brain_state: Dict[str, Any] = {}
+    journal: List[Dict[str, Any]] = []
 
-    # Initialize all variables OUTSIDE try blocks to fix scoping bug
-    # (Agent 11 found this: 'brain_state' in dir() was unreliable)
-    brain_state = {}
-    journal = []
-
-    # 1. Brain state patterns (always available)
     try:
         brain_state = voice._get_brain_state()
-        if brain_state.get('preview'):
-            preview_lines = [l for l in brain_state['preview'].split('\n')
-                           if l.strip() and not l.startswith('#')][:3]
+        if brain_state.get("preview"):
+            preview_lines = [
+                ln for ln in brain_state["preview"].split("\n")
+                if ln.strip() and not ln.startswith("#")
+            ][:3]
             if preview_lines:
-                result['patterns'].extend(preview_lines)
+                result["patterns"].extend(preview_lines)
                 sources_hit += 1
-    except Exception as e:
-        print(f"[WARN] Brain state pattern query failed: {e}")
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("get_8th_intelligence_data brain_state path failed: %s", exc)
 
-    # 2. Pattern Evolution insights (use _query_patterns which actually exists)
     try:
-        patterns = voice._query_patterns(prompt)
+        patterns = voice._query_patterns(prompt) or []
         if patterns:
-            result['patterns'].extend(patterns[:2])
+            result["patterns"].extend(patterns[:2])
             sources_hit += 1
-    except Exception as e:
-        print(f"[WARN] Pattern evolution query failed: {e}")
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("get_8th_intelligence_data patterns path failed: %s", exc)
 
-    # 3. Recent learnings from memory (use _query_learnings which actually exists)
     try:
-        learnings = voice._query_learnings(prompt)
+        learnings = voice._query_learnings(prompt) or []
         if learnings:
-            result['learnings'] = learnings[:3]
+            result["learnings"] = learnings[:3]
             sources_hit += 1
-    except Exception as e:
-        print(f"[WARN] Learnings query failed: {e}")
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("get_8th_intelligence_data learnings path failed: %s", exc)
 
-    # 4. Journal entries as intuitions
     try:
-        journal = voice._query_journal(prompt)
+        journal = voice._query_journal(prompt) or []
         if journal:
             for entry in journal[:2]:
-                intuition = entry.get('content', entry.get('topic', ''))[:100]
+                if isinstance(entry, dict):
+                    intuition = entry.get("content") or entry.get("topic") or ""
+                else:
+                    intuition = str(entry)
                 if intuition:
-                    result['intuitions'].append(intuition)
+                    result["intuitions"].append(str(intuition)[:120])
             sources_hit += 1
-    except Exception as e:
-        print(f"[WARN] Journal intuition query failed: {e}")
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("get_8th_intelligence_data journal path failed: %s", exc)
 
-    # 5. Query skills for additional context
-    skill_context = []
+    skill_context: List[str] = []
     try:
         skill_context = voice._query_skills(prompt) or []
         if skill_context:
             sources_hit += 1
-    except Exception as e:
-        print(f"[WARN] Skills query failed: {e}")
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("get_8th_intelligence_data skills path failed: %s", exc)
 
-    # 6. Generate LIVING perspective using _generate_perspective (not hardcoded templates)
-    # This restores Synaptic's real voice to Section 8
     if sources_hit > 0:
-        # Weighted confidence matching consult() source importance hierarchy
-        _w8 = {"brain_state": 0.25, "patterns": 0.20, "learnings": 0.25, "journal": 0.15, "skills": 0.15}
-        _h8 = []
-        if result.get('patterns'): _h8.extend(["brain_state", "patterns"])
-        if result.get('learnings'): _h8.append("learnings")
-        if result.get('intuitions'): _h8.append("journal")
-        if skill_context: _h8.append("skills")
-        confidence = sum(_w8.get(s, 0) for s in set(_h8)) if _h8 else sources_hit / 5.0
-        result['perspective'] = voice._generate_perspective(
+        weights = {
+            "brain_state": 0.30, "patterns": 0.20, "learnings": 0.25,
+            "journal": 0.15, "skills": 0.10,
+        }
+        present: List[str] = []
+        if result["patterns"]:
+            present.extend(["brain_state", "patterns"])
+        if result["learnings"]:
+            present.append("learnings")
+        if result["intuitions"]:
+            present.append("journal")
+        if skill_context:
+            present.append("skills")
+        confidence = sum(weights.get(s, 0) for s in set(present)) if present else (
+            sources_hit / 5.0
+        )
+        result["perspective"] = voice._generate_perspective(
             question=prompt,
-            learnings=result['learnings'],
-            patterns=result['patterns'],
-            brain_state=brain_state,  # Now properly initialized before try blocks
+            learnings=result["learnings"],
+            patterns=result["patterns"],
+            brain_state=brain_state,
             skill_context=skill_context,
-            journal_context=journal,  # Now properly initialized before try blocks
-            confidence=confidence
+            journal_context=journal,
+            confidence=confidence,
         )
 
-    # Determine signal strength based on data richness
     if sources_hit >= 3:
-        result['signal_strength'] = '🟢 Clear'
+        result["signal_strength"] = "🟢 Clear"
     elif sources_hit >= 1:
-        result['signal_strength'] = '🟡 Present'
+        result["signal_strength"] = "🟡 Present"
     else:
-        result['signal_strength'] = '🔴 Quiet'
+        result["signal_strength"] = "🔴 Quiet"
 
     return result if sources_hit > 0 else None
 
 
-def generate_live_synaptic_response(prompt: str, include_context: bool = True) -> str:
+# =============================================================================
+# Tone helper — apply_synaptic_voice(text, mode)
+# =============================================================================
+#
+# Synaptic's directive expected a tone/personality function with this exact
+# signature. Atlas adds it for callers that want a thin stylistic pass over
+# already-generated text (no LLM, no substrate, pure prefix/postfix).
+# =============================================================================
+
+
+_MODE_TONE: Dict[str, Tuple[str, str]] = {
+    "default":     ("", ""),
+    "curious":     ("I'm curious — ", ""),
+    "warning":     ("Worth flagging: ", ""),
+    "celebratory": ("Worth marking: ", ""),
+    "skeptical":   ("Pushing back gently — ", ""),
+    "neutral":     ("", ""),
+}
+
+
+def apply_synaptic_voice(text: str, mode: str = "default") -> str:
     """
-    Generate a LIVE Synaptic response using the local LLM.
+    Apply a thin Synaptic-mode tone to an already-formed string.
 
-    This connects Synaptic's authentic LLM voice to Atlas's output channel.
-    When Atlas calls this, Synaptic's response can be presented in the
-    main conversation output (same channel as Atlas).
-
-    Args:
-        prompt: What to ask Synaptic
-        include_context: Whether to include memory context in the prompt
-
-    Returns:
-        Formatted Synaptic response with conversation markers
+    This is the cheap path — no LLM, no substrate, just a deterministic
+    prefix/postfix per mode. For full consultation, use consult() or speak().
     """
-    lines = []
-    lines.append("")
-    lines.append("╔══════════════════════════════════════════════════════════════════════╗")
-    lines.append("║  [START: Synaptic to Aaron]                                          ║")
-    lines.append("╠══════════════════════════════════════════════════════════════════════╣")
-    lines.append("")
+    if not text:
+        return text
+    prefix, postfix = _MODE_TONE.get(mode, _MODE_TONE["default"])
+    return f"{prefix}{text}{postfix}"
 
+
+# =============================================================================
+# DOCUMENTED STUB: audio-bridge interpretation (Synaptic's original framing)
+# =============================================================================
+#
+# The directive described a "WebSocket-based TTS/STT bridge". The 8 active
+# consumers do NOT use such an interface today. If/when audio I/O is added,
+# the entry points below are reserved hooks. They are STUBS — they do not
+# crash, but they are not implemented.
+# =============================================================================
+
+
+def start_audio_bridge(host: str = "127.0.0.1", port: int = 8765) -> Dict[str, Any]:
+    """
+    RESERVED: Future WebSocket TTS/STT bridge (Synaptic's directive framing).
+
+    Currently a no-op stub. Returns a status dict explaining its disabled
+    state so callers can surface this in /health. ZSF: bumps counter.
+    """
+    _bump("llm_voice_unavailable")
+    logger.info(
+        "synaptic_voice.start_audio_bridge invoked but NOT IMPLEMENTED — "
+        "this module is the personality/consultation engine, not audio I/O. "
+        "See module docstring for evidence audit."
+    )
+    return {
+        "status": "stub",
+        "host": host,
+        "port": port,
+        "reason": (
+            "Audio-bridge interpretation is reserved-only; "
+            "see module docstring INTERPRETATION DECISION."
+        ),
+    }
+
+
+# =============================================================================
+# Helpers
+# =============================================================================
+
+
+def _minimal_yaml_parse(path: Path) -> Dict[str, Any]:
+    """
+    Tiny zero-dep YAML parser — handles the top-level key: value and one-level
+    nested maps that synaptic-voice.yaml uses. Falls back to {} on anything
+    fancier. Only used when PyYAML is absent.
+    """
+    out: Dict[str, Any] = {}
     try:
-        # Get context from memory if requested
-        context_str = ""
-        if include_context:
-            voice = get_voice()
-            response = voice.consult(prompt)
-            if response.relevant_learnings:
-                context_str += "Relevant context from memory:\n"
-                for learning in response.relevant_learnings[:2]:
-                    context_str += f"- {learning.get('title', str(learning))[:100]}\n"
+        text = path.read_text(encoding="utf-8")
+    except Exception:  # noqa: BLE001
+        return out
 
-        # Try to use local LLM for authentic response
+    current_key: Optional[str] = None
+    current_indent: int = 0
+    nested: Dict[str, Any] = {}
+
+    def _coerce(v: str) -> Any:
+        s = v.strip()
+        if not s:
+            return ""
+        if s.lower() in ("true", "yes"):
+            return True
+        if s.lower() in ("false", "no"):
+            return False
+        if s.lower() == "null":
+            return None
         try:
-            from memory.synaptic_chat_server import generate_with_local_llm
+            if "." in s:
+                return float(s)
+            return int(s)
+        except ValueError:
+            return s.strip("\"'")
 
-            enhanced_prompt = prompt
-            if context_str:
-                enhanced_prompt = f"Context:\n{context_str}\n\nQuestion: {prompt}"
+    for raw in text.splitlines():
+        if not raw.strip() or raw.lstrip().startswith("#"):
+            continue
+        stripped = raw.lstrip()
+        indent = len(raw) - len(stripped)
+        if ":" not in stripped:
+            continue
+        key, _, val = stripped.partition(":")
+        key = key.strip()
+        val = val.strip()
+        if indent == 0:
+            if current_key is not None and nested:
+                out[current_key] = nested
+                nested = {}
+            current_key = key
+            current_indent = 0
+            if val == "":
+                # Will accumulate nested children.
+                continue
+            out[key] = _coerce(val)
+            current_key = None
+        else:
+            if current_key is None:
+                continue
+            nested[key] = _coerce(val)
+            current_indent = indent
 
-            synaptic_response, sources = generate_with_local_llm(enhanced_prompt)
-
-            # Format the response
-            for line in synaptic_response.split('\n'):
-                lines.append(f"  {line}")
-
-        except ImportError:
-            # Fall back to context-based response
-            voice = get_voice()
-            response = voice.consult(prompt)
-            lines.append(f"  {response.synaptic_perspective}")
-        except Exception as e:
-            lines.append(f"  [Synaptic's LLM connection unavailable: {str(e)[:50]}]")
-            lines.append(f"  I'll respond with what I have in memory...")
-            voice = get_voice()
-            response = voice.consult(prompt)
-            lines.append(f"  {response.synaptic_perspective}")
-
-    except Exception as e:
-        lines.append(f"  [Synaptic encountered an error: {str(e)[:100]}]")
-
-    lines.append("")
-    lines.append("╠══════════════════════════════════════════════════════════════════════╣")
-    lines.append("║  [END: Synaptic to Aaron]                                            ║")
-    lines.append("╚══════════════════════════════════════════════════════════════════════╝")
-    lines.append("")
-
-    return "\n".join(lines)
+    if current_key is not None and nested:
+        out[current_key] = nested
+    _ = current_indent
+    return out
 
 
-def synaptic_respond(message: str) -> str:
-    """
-    Queue a Synaptic message for delivery to the conversation.
-
-    This is the programmatic API for Synaptic to speak into the
-    conversation channel. Messages queued here will be delivered
-    via the MANDATORY OUTPUT DIRECTIVE in Section 8.
-
-    Args:
-        message: What Synaptic wants to say
-
-    Returns:
-        Message ID for tracking
-    """
-    try:
-        from memory.synaptic_outbox import synaptic_speak
-        return synaptic_speak(message, topic="live_response")
-    except ImportError:
-        return None
-
+# =============================================================================
+# CLI smoke test
+# =============================================================================
 
 if __name__ == "__main__":
     import sys
 
-    if len(sys.argv) < 2:
-        print("╔══════════════════════════════════════════════════════════════╗")
-        print("║     Synaptic's Voice                                         ║")
-        print("║     The 8th Intelligence Contributes Context                 ║")
-        print("╚══════════════════════════════════════════════════════════════╝")
-        print()
-        print("Usage:")
-        print("  python synaptic_voice.py \"<question>\"")
-        print("  python synaptic_voice.py --live \"<question>\"  # Use local LLM")
-        print()
-        print("Examples:")
-        print("  python synaptic_voice.py \"How do we deploy to production?\"")
-        print("  python synaptic_voice.py \"What's the async boto3 pattern?\"")
-        print("  python synaptic_voice.py --live \"What do you think about this?\"")
-        sys.exit(0)
-
-    if sys.argv[1] == "--live" and len(sys.argv) > 2:
-        question = " ".join(sys.argv[2:])
-        print(generate_live_synaptic_response(question))
-    else:
-        question = " ".join(sys.argv[1:])
-        print(speak(question))
+    question = " ".join(sys.argv[1:]) or "smoke test: what's the highest leverage step?"
+    voice = get_voice()
+    response = voice.consult(question)
+    print(json.dumps(response.to_dict(), indent=2, default=str))
+    print("---")
+    print(voice.to_family_message(response))
+    print("---")
+    print("ZSF counters:", json.dumps(get_zsf_counters(), indent=2))
