@@ -16,13 +16,19 @@ set -uo pipefail
 
 CHECK_ONLY=false
 NO_AUTO=false
+PASSPHRASE_SOURCE="tty"   # tty | stdin | clipboard | env:NAME
 BUNDLE=""
 for arg in "$@"; do
     case "$arg" in
-        --check)   CHECK_ONLY=true ;;
-        --no-auto) NO_AUTO=true ;;
+        --check)                CHECK_ONLY=true ;;
+        --no-auto)              NO_AUTO=true ;;
+        --passphrase-stdin)     PASSPHRASE_SOURCE="stdin" ;;
+        --passphrase-clipboard) PASSPHRASE_SOURCE="clipboard" ;;
+        --passphrase-env)       PASSPHRASE_SOURCE="env" ;;
         --help|-h) sed -n '2,18p' "$0" | sed 's|^# ||; s|^#||'; exit 0 ;;
-        *)         BUNDLE="$arg" ;;
+        *)
+            if [[ "$PASSPHRASE_SOURCE" = "env" && "$arg" =~ ^[A-Z_]+$ ]]; then PASSPHRASE_SOURCE="env:$arg"
+            else BUNDLE="$arg"; fi ;;
     esac
 done
 
@@ -66,11 +72,32 @@ if [[ "$HEAD" == *"age-encryption.org"* ]]; then
     _ok "age decryption succeeded"
 elif [[ "$HEAD" == "Salted__"* ]]; then
     command -v openssl >/dev/null || _fail "openssl not found"
-    echo "  ${BOLD}Enter passphrase below (openssl AES-256-CBC + PBKDF2).${RESET}"
-    # openssl reads passphrase from /dev/tty if available, else stdin
-    openssl enc -d -aes-256-cbc -pbkdf2 -iter 250000 -salt \
-        -in "$BUNDLE" -out "$TAR_FILE" \
-        || _fail "openssl decrypt failed (wrong passphrase or corrupted bundle)"
+    case "$PASSPHRASE_SOURCE" in
+        tty)
+            echo "  ${BOLD}Enter passphrase below (openssl AES-256-CBC + PBKDF2).${RESET}"
+            openssl enc -d -aes-256-cbc -pbkdf2 -iter 250000 -salt \
+                -in "$BUNDLE" -out "$TAR_FILE" \
+                || _fail "openssl decrypt failed (wrong passphrase or corrupted bundle)" ;;
+        stdin)
+            _info "reading passphrase from stdin"
+            openssl enc -d -aes-256-cbc -pbkdf2 -iter 250000 -salt -pass stdin \
+                -in "$BUNDLE" -out "$TAR_FILE" \
+                || _fail "openssl decrypt failed" ;;
+        clipboard)
+            command -v pbpaste >/dev/null || _fail "--passphrase-clipboard requires pbpaste"
+            _info "reading passphrase from macOS clipboard"
+            pbpaste | openssl enc -d -aes-256-cbc -pbkdf2 -iter 250000 -salt -pass stdin \
+                -in "$BUNDLE" -out "$TAR_FILE" \
+                || _fail "openssl decrypt failed (wrong passphrase?)" ;;
+        env:*)
+            varname="${PASSPHRASE_SOURCE#env:}"
+            passval="${!varname:-}"
+            [ -n "$passval" ] || _fail "env var $varname is empty"
+            printf '%s' "$passval" | openssl enc -d -aes-256-cbc -pbkdf2 -iter 250000 -salt -pass stdin \
+                -in "$BUNDLE" -out "$TAR_FILE" \
+                || _fail "openssl decrypt failed"
+            unset passval ;;
+    esac
     _ok "openssl decryption succeeded"
 else
     _fail "bundle format not recognised (expected age or openssl AES-256-CBC)"
