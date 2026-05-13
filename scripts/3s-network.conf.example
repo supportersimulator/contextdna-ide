@@ -1,0 +1,11 @@
+# 3s-network peer configuration
+# Copy this to scripts/3s-network.local.conf and fill in your values.
+# 3s-network.local.conf is gitignored — never commit real IPs.
+
+PEER_NAMES="mac1 mac2 mac3"
+PEER_mac1="user@192.168.x.x"
+PEER_mac2="user@192.168.x.x"
+PEER_mac3="user@192.168.x.x"
+
+# Chief = the machine running ContextDNA (receives final synthesis)
+CHIEF="mac1"

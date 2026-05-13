@@ -1,0 +1,1766 @@
+#!/bin/bash
+# =============================================================================
+# Context DNA Installation Wizard
+# =============================================================================
+# Complete guided setup for the Context DNA learning system
+#
+# This script handles:
+# 1. System prerequisites (Python 3, Homebrew on macOS)
+# 2. Optional dependencies (xbar for menu bar, VS Code, Claude Code extension)
+# 3. Context DNA package installation
+# 4. Claude Code hooks configuration
+# 5. Full verification
+#
+# Usage:
+#   ./scripts/install-context-dna.sh           # Full guided installation
+#   ./scripts/install-context-dna.sh --quick   # Skip optional dependencies
+#   ./scripts/install-context-dna.sh --verify  # Just verify installation
+#
+# =============================================================================
+
+set -e
+
+# Colors for output
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+CYAN='\033[0;36m'
+MAGENTA='\033[0;35m'
+BOLD='\033[1m'
+NC='\033[0m' # No Color
+
+# Configuration
+CONTEXT_DNA_DIR="${CONTEXT_DNA_DIR:-$HOME/.context-dna}"
+REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+VENV_DIR="$REPO_DIR/.venv"
+OS_TYPE="$(uname -s)"
+
+# =============================================================================
+# Helper Functions
+# =============================================================================
+
+print_banner() {
+    echo ""
+    echo -e "${CYAN}${BOLD}"
+    echo "   ██████╗ ██████╗ ███╗   ██╗████████╗███████╗██╗  ██╗████████╗"
+    echo "  ██╔════╝██╔═══██╗████╗  ██║╚══██╔══╝██╔════╝╚██╗██╔╝╚══██╔══╝"
+    echo "  ██║     ██║   ██║██╔██╗ ██║   ██║   █████╗   ╚███╔╝    ██║   "
+    echo "  ██║     ██║   ██║██║╚██╗██║   ██║   ██╔══╝   ██╔██╗    ██║   "
+    echo "  ╚██████╗╚██████╔╝██║ ╚████║   ██║   ███████╗██╔╝ ██╗   ██║   "
+    echo "   ╚═════╝ ╚═════╝ ╚═╝  ╚═══╝   ╚═╝   ╚══════╝╚═╝  ╚═╝   ╚═╝   "
+    echo "                      ██████╗ ███╗   ██╗ █████╗                 "
+    echo "                      ██╔══██╗████╗  ██║██╔══██╗                "
+    echo "                      ██║  ██║██╔██╗ ██║███████║                "
+    echo "                      ██║  ██║██║╚██╗██║██╔══██║                "
+    echo "                      ██████╔╝██║ ╚████║██║  ██║                "
+    echo "                      ╚═════╝ ╚═╝  ╚═══╝╚═╝  ╚═╝                "
+    echo -e "${NC}"
+    echo -e "${MAGENTA}        Autonomous Learning System for Developers${NC}"
+    echo ""
+}
+
+print_header() {
+    echo ""
+    echo -e "${CYAN}══════════════════════════════════════════════════════════════════════${NC}"
+    echo -e "${CYAN}  $1${NC}"
+    echo -e "${CYAN}══════════════════════════════════════════════════════════════════════${NC}"
+    echo ""
+}
+
+print_step() {
+    echo -e "${BLUE}▶ $1${NC}"
+}
+
+print_success() {
+    echo -e "${GREEN}✅ $1${NC}"
+}
+
+print_warning() {
+    echo -e "${YELLOW}⚠️  $1${NC}"
+}
+
+print_error() {
+    echo -e "${RED}❌ $1${NC}"
+}
+
+print_info() {
+    echo -e "${MAGENTA}ℹ️  $1${NC}"
+}
+
+# =============================================================================
+# Retry and Fallback Functions (Guaranteed Installation)
+# =============================================================================
+
+# Retry a command up to N times with exponential backoff
+# Usage: retry_command 3 "pip install mlx"
+retry_command() {
+    local max_attempts="${1:-3}"
+    local delay=2
+    local attempt=1
+    shift
+    local cmd="$@"
+
+    while [ $attempt -le $max_attempts ]; do
+        if eval "$cmd"; then
+            return 0
+        fi
+
+        if [ $attempt -lt $max_attempts ]; then
+            print_warning "Attempt $attempt failed, retrying in ${delay}s... ($(($max_attempts - $attempt)) attempts left)"
+            sleep $delay
+            delay=$((delay * 2))  # Exponential backoff
+        fi
+        attempt=$((attempt + 1))
+    done
+
+    print_error "Command failed after $max_attempts attempts: $cmd"
+    return 1
+}
+
+# Install pip packages with retries
+# Usage: pip_install_retry "$PYTHON" "package1 package2"
+pip_install_retry() {
+    local python="$1"
+    local packages="$2"
+    local max_attempts=3
+    local attempt=1
+
+    while [ $attempt -le $max_attempts ]; do
+        if "$python" -m pip install $packages -q 2>/dev/null; then
+            return 0
+        fi
+
+        # If quiet mode failed, try verbose to see error
+        if [ $attempt -eq $max_attempts ]; then
+            print_warning "Attempting verbose install to diagnose..."
+            "$python" -m pip install $packages
+        else
+            print_warning "pip install attempt $attempt failed, retrying..."
+            sleep 2
+        fi
+        attempt=$((attempt + 1))
+    done
+
+    return 1
+}
+
+# Install brew package with retries and fallback versions
+# Usage: brew_install_retry "$BREW" "python@3.12" "python@3.11 python@3.10"
+brew_install_retry() {
+    local brew="$1"
+    local package="$2"
+    local fallbacks="${3:-}"
+
+    # Try primary package
+    if retry_command 2 "$brew install $package"; then
+        return 0
+    fi
+
+    # Try fallbacks
+    for fallback in $fallbacks; do
+        print_warning "Trying fallback: $fallback"
+        if retry_command 2 "$brew install $fallback"; then
+            print_success "Installed fallback: $fallback"
+            return 0
+        fi
+    done
+
+    return 1
+}
+
+# Wait for service with timeout and retries
+# Usage: wait_for_service "http://127.0.0.1:5043/health" 30
+wait_for_service() {
+    local url="$1"
+    local timeout="${2:-30}"
+    local interval="${3:-1}"
+    local elapsed=0
+
+    while [ $elapsed -lt $timeout ]; do
+        if curl -s "$url" &>/dev/null; then
+            return 0
+        fi
+        sleep $interval
+        elapsed=$((elapsed + interval))
+    done
+
+    return 1
+}
+
+prompt_yes_no() {
+    local prompt="$1"
+    local default="${2:-y}"
+    local response
+
+    if [ "$default" = "y" ]; then
+        echo -en "${YELLOW}$prompt [Y/n]: ${NC}"
+    else
+        echo -en "${YELLOW}$prompt [y/N]: ${NC}"
+    fi
+
+    read -r response
+    response=${response:-$default}
+
+    case "$response" in
+        [yY][eE][sS]|[yY]) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+wait_for_enter() {
+    echo -en "${YELLOW}Press Enter to continue...${NC}"
+    read -r
+}
+
+# =============================================================================
+# Prerequisite Checks
+# =============================================================================
+
+check_python() {
+    print_step "Checking Python 3..."
+
+    if command -v python3 &> /dev/null; then
+        PYTHON_VERSION=$(python3 --version 2>&1 | grep -oE '[0-9]+\.[0-9]+')
+        PYTHON_MAJOR=$(echo "$PYTHON_VERSION" | cut -d. -f1)
+        PYTHON_MINOR=$(echo "$PYTHON_VERSION" | cut -d. -f2)
+
+        if [ "$PYTHON_MAJOR" -ge 3 ] && [ "$PYTHON_MINOR" -ge 8 ]; then
+            print_success "Python $PYTHON_VERSION found"
+            return 0
+        else
+            print_warning "Python $PYTHON_VERSION found but 3.8+ required"
+        fi
+    fi
+
+    print_error "Python 3.8+ is required but not found"
+    echo ""
+
+    if [ "$OS_TYPE" = "Darwin" ]; then
+        echo "Install Python on macOS:"
+        echo "  Option 1: brew install python@3.12"
+        echo "  Option 2: Download from https://www.python.org/downloads/"
+    else
+        echo "Install Python on Linux:"
+        echo "  Ubuntu/Debian: sudo apt install python3 python3-venv python3-pip"
+        echo "  Fedora: sudo dnf install python3 python3-pip"
+    fi
+    echo ""
+
+    if prompt_yes_no "Would you like me to try installing Python automatically?"; then
+        install_python
+        return $?
+    fi
+
+    return 1
+}
+
+install_python() {
+    if [ "$OS_TYPE" = "Darwin" ]; then
+        if command -v brew &> /dev/null; then
+            print_step "Installing Python via Homebrew..."
+            brew install python@3.12
+            print_success "Python installed"
+            return 0
+        else
+            print_error "Homebrew not found. Please install Python manually."
+            return 1
+        fi
+    else
+        print_error "Automatic Python installation not supported on this OS"
+        return 1
+    fi
+}
+
+check_homebrew() {
+    if [ "$OS_TYPE" != "Darwin" ]; then
+        return 0  # Skip on non-macOS
+    fi
+
+    print_step "Checking Homebrew (macOS package manager)..."
+
+    if command -v brew &> /dev/null; then
+        print_success "Homebrew found"
+        return 0
+    fi
+
+    print_warning "Homebrew not found (needed for xbar installation)"
+
+    if prompt_yes_no "Would you like to install Homebrew?"; then
+        print_step "Installing Homebrew..."
+        /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
+
+        # Add Homebrew to PATH for this session
+        if [ -f "/opt/homebrew/bin/brew" ]; then
+            eval "$(/opt/homebrew/bin/brew shellenv)"
+        fi
+
+        print_success "Homebrew installed"
+        return 0
+    fi
+
+    return 1
+}
+
+# =============================================================================
+# ARM64 Homebrew + MLX Setup (Apple Silicon Native)
+# =============================================================================
+
+setup_arm64_homebrew_and_mlx() {
+    if [ "$OS_TYPE" != "Darwin" ]; then
+        return 0  # Skip on non-macOS
+    fi
+
+    ARCH=$(uname -m)
+    if [ "$ARCH" != "arm64" ]; then
+        print_info "Not Apple Silicon - skipping ARM64 setup"
+        return 0
+    fi
+
+    print_header "Apple Silicon Native Setup (ARM64 Homebrew + MLX)"
+
+    echo "For optimal MLX performance, Context DNA needs:"
+    echo "  • ARM64 Homebrew (in /opt/homebrew)"
+    echo "  • Native ARM64 Python 3.12"
+    echo "  • MLX framework for Metal GPU acceleration"
+    echo ""
+
+    # Check if ARM64 Homebrew exists
+    if [ -f "/opt/homebrew/bin/brew" ]; then
+        print_success "ARM64 Homebrew found at /opt/homebrew"
+        ARM_BREW="/opt/homebrew/bin/brew"
+    else
+        # Check if Intel Homebrew is being used
+        if [ -f "/usr/local/bin/brew" ]; then
+            print_warning "Intel Homebrew detected at /usr/local/bin"
+            print_info "MLX requires ARM64 Homebrew for native Metal GPU access"
+            echo ""
+        fi
+
+        if ! prompt_yes_no "Install ARM64 Homebrew for native Metal GPU performance?"; then
+            print_info "Skipping ARM64 Homebrew - will use Ollama instead"
+            return 0
+        fi
+
+        # Request sudo upfront for directory creation
+        echo ""
+        echo -e "${YELLOW}${BOLD}Administrator password required to install ARM64 Homebrew${NC}"
+        echo "This creates /opt/homebrew for native Apple Silicon tools."
+        echo ""
+
+        # Try standard sudo first, fall back to GUI prompt if no TTY
+        if sudo -v 2>/dev/null; then
+            # TTY available - sudo works normally
+            print_success "Administrator access confirmed"
+            USE_ASKPASS=false
+        else
+            # No TTY available - use macOS GUI password prompt with SUDO_ASKPASS
+            print_step "Requesting administrator access via system dialog..."
+
+            # Get password via GUI dialog (only asked ONCE)
+            SUDO_PASS=$(osascript -e 'display dialog "Context DNA needs administrator access to install ARM64 Homebrew for native Metal GPU acceleration.\n\nEnter your password:" default answer "" with hidden answer with title "Context DNA Installer" with icon caution' -e 'text returned of result' 2>/dev/null)
+
+            if [ -z "$SUDO_PASS" ]; then
+                print_error "Password dialog cancelled"
+                print_info "Install manually: arch -arm64 /bin/bash -c \"\$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)\""
+                return 1
+            fi
+
+            # Validate the password works
+            if ! echo "$SUDO_PASS" | sudo -S -v 2>/dev/null; then
+                print_error "Invalid password"
+                print_info "Install manually: arch -arm64 /bin/bash -c \"\$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)\""
+                unset SUDO_PASS
+                return 1
+            fi
+
+            # Create a temporary askpass script that provides the password
+            # This allows ALL sudo calls (including Homebrew's internal ones) to work
+            ASKPASS_SCRIPT=$(mktemp)
+            chmod 700 "$ASKPASS_SCRIPT"
+            cat > "$ASKPASS_SCRIPT" << ASKPASS_EOF
+#!/bin/bash
+echo '$SUDO_PASS'
+ASKPASS_EOF
+
+            # Export SUDO_ASKPASS so all sudo calls use it
+            export SUDO_ASKPASS="$ASKPASS_SCRIPT"
+            USE_ASKPASS=true
+
+            # Clear password from memory (it's now in the askpass script)
+            unset SUDO_PASS
+
+            print_success "Administrator access configured (password entered once)"
+        fi
+
+        # Keep sudo credential cache alive during installation
+        (while true; do sudo -n true 2>/dev/null || true; sleep 50; done) &
+        SUDO_KEEPALIVE_PID=$!
+
+        print_step "Creating /opt/homebrew directories..."
+        # Create ALL directories Homebrew needs
+        BREW_DIRS="/opt/homebrew /opt/homebrew/bin /opt/homebrew/etc /opt/homebrew/include /opt/homebrew/lib /opt/homebrew/sbin /opt/homebrew/share /opt/homebrew/var /opt/homebrew/opt /opt/homebrew/share/zsh /opt/homebrew/share/zsh/site-functions /opt/homebrew/var/homebrew /opt/homebrew/var/homebrew/linked /opt/homebrew/Cellar /opt/homebrew/Caskroom /opt/homebrew/Frameworks /opt/homebrew/share/doc /opt/homebrew/share/man /opt/homebrew/share/man/man1"
+
+        if [ "$USE_ASKPASS" = true ]; then
+            # Use -A flag which tells sudo to use SUDO_ASKPASS
+            sudo -A mkdir -p $BREW_DIRS
+            sudo -A chown -R $(whoami):admin /opt/homebrew
+            sudo -A chmod -R 755 /opt/homebrew
+            echo "/opt/homebrew/bin" | sudo -A tee /etc/paths.d/homebrew > /dev/null
+        else
+            sudo mkdir -p $BREW_DIRS
+            sudo chown -R $(whoami):admin /opt/homebrew
+            sudo chmod -R 755 /opt/homebrew
+            echo "/opt/homebrew/bin" | sudo tee /etc/paths.d/homebrew > /dev/null
+        fi
+
+        print_step "Installing ARM64 Homebrew..."
+        # CI=1 NONINTERACTIVE=1 tells Homebrew to run non-interactively
+        # SUDO_ASKPASS is already exported, so Homebrew's sudo calls will use it
+        CI=1 NONINTERACTIVE=1 arch -arm64 /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
+
+        # Cleanup: kill keepalive and remove askpass script
+        kill $SUDO_KEEPALIVE_PID 2>/dev/null || true
+        if [ "$USE_ASKPASS" = true ] && [ -n "$ASKPASS_SCRIPT" ]; then
+            rm -f "$ASKPASS_SCRIPT"
+            unset SUDO_ASKPASS
+        fi
+
+        if [ -f "/opt/homebrew/bin/brew" ]; then
+            print_success "ARM64 Homebrew installed"
+            ARM_BREW="/opt/homebrew/bin/brew"
+            # Add to PATH for this session
+            eval "$(/opt/homebrew/bin/brew shellenv)"
+        else
+            print_error "ARM64 Homebrew installation failed"
+            return 1
+        fi
+    fi
+
+    # Check for ARM64 Python - try 3.12 first, fallback to 3.11, 3.10
+    print_step "Checking for ARM64 Python..."
+
+    ARM_PYTHON=""
+
+    # Check existing Python versions (prefer 3.12 > 3.11 > 3.10)
+    for pyver in python3.12 python3.11 python3.10; do
+        PYPATH="/opt/homebrew/bin/$pyver"
+        if [ -f "$PYPATH" ]; then
+            PYTHON_ARCH=$(file "$PYPATH" 2>/dev/null | grep -o 'arm64' || echo "")
+            if [ "$PYTHON_ARCH" = "arm64" ]; then
+                print_success "ARM64 $pyver found"
+                ARM_PYTHON="$PYPATH"
+                break
+            fi
+        fi
+    done
+
+    # Install if not found
+    if [ -z "$ARM_PYTHON" ]; then
+        print_step "Installing ARM64 Python (with fallbacks)..."
+
+        # Try Python 3.12, fall back to 3.11, then 3.10
+        if brew_install_retry "$ARM_BREW" "python@3.12" "python@3.11 python@3.10"; then
+            # Find which version was installed
+            for pyver in python3.12 python3.11 python3.10; do
+                PYPATH="/opt/homebrew/bin/$pyver"
+                if [ -f "$PYPATH" ]; then
+                    ARM_PYTHON="$PYPATH"
+                    print_success "Installed $pyver"
+                    break
+                fi
+            done
+        fi
+    fi
+
+    if [ -z "$ARM_PYTHON" ] || [ ! -f "$ARM_PYTHON" ]; then
+        print_error "Failed to install ARM64 Python"
+        print_info "Try manually: /opt/homebrew/bin/brew install python@3.12"
+        return 1
+    fi
+
+    # Create ARM64 venv for MLX
+    MLX_VENV_DIR="$CONTEXT_DNA_DIR/venv-mlx"
+
+    if [ -d "$MLX_VENV_DIR" ]; then
+        # Check if existing venv is ARM64 and working
+        if "$MLX_VENV_DIR/bin/python3" -c "import platform; exit(0 if platform.machine() == 'arm64' else 1)" 2>/dev/null; then
+            print_success "ARM64 MLX venv already exists"
+        else
+            print_warning "Existing venv is broken or not ARM64 - recreating"
+            rm -rf "$MLX_VENV_DIR"
+            if ! "$ARM_PYTHON" -m venv "$MLX_VENV_DIR"; then
+                print_error "Failed to create venv"
+                return 1
+            fi
+        fi
+    else
+        print_step "Creating ARM64 virtual environment for MLX..."
+        if ! "$ARM_PYTHON" -m venv "$MLX_VENV_DIR"; then
+            print_error "Failed to create venv"
+            return 1
+        fi
+        print_success "ARM64 venv created at $MLX_VENV_DIR"
+    fi
+
+    # Upgrade pip with retry
+    print_step "Upgrading pip..."
+    retry_command 3 "'$MLX_VENV_DIR/bin/pip' install --upgrade pip -q"
+
+    # Install MLX with retry (this is the critical package)
+    print_step "Installing MLX framework (with retries)..."
+    if ! pip_install_retry "$MLX_VENV_DIR/bin/python3" "mlx mlx-lm"; then
+        print_error "Failed to install MLX"
+        print_info "Try manually: $MLX_VENV_DIR/bin/pip install mlx mlx-lm"
+        return 1
+    fi
+    print_success "MLX installed"
+
+    # Install all server dependencies with retry
+    print_step "Installing Local LLM server dependencies (with retries)..."
+    SERVER_DEPS="fastapi uvicorn httpx pyyaml rich platformdirs keyring cryptography pydantic"
+    if ! pip_install_retry "$MLX_VENV_DIR/bin/python3" "$SERVER_DEPS"; then
+        print_warning "Some dependencies failed, trying individually..."
+        # Try each package individually
+        for pkg in $SERVER_DEPS; do
+            if ! pip_install_retry "$MLX_VENV_DIR/bin/python3" "$pkg"; then
+                print_warning "Failed to install $pkg (may be optional)"
+            fi
+        done
+    fi
+    print_success "Server dependencies installed"
+
+    # Verify MLX installation
+    if "$MLX_VENV_DIR/bin/python3" -c "import mlx.core as mx; print('MLX version:', getattr(mx, '__version__', 'unknown')); assert mx.metal.is_available(), 'Metal not available'" 2>/dev/null; then
+        print_success "MLX installed and Metal GPU is available!"
+
+        # Export for later use
+        export MLX_PYTHON="$MLX_VENV_DIR/bin/python3"
+        export MLX_VENV_DIR="$MLX_VENV_DIR"
+
+        # Create symlink for easy access
+        ln -sf "$MLX_VENV_DIR/bin/python3" "$CONTEXT_DNA_DIR/mlx-python"
+        print_info "MLX Python available at: $CONTEXT_DNA_DIR/mlx-python"
+
+        echo ""
+        echo -e "${GREEN}${BOLD}✓ ARM64 Native Setup Complete${NC}"
+        echo "  • ARM64 Homebrew: /opt/homebrew/bin/brew"
+        echo "  • ARM64 Python: $ARM_PYTHON"
+        echo "  • MLX venv: $MLX_VENV_DIR"
+        echo "  • Metal GPU: Enabled"
+        echo ""
+
+        return 0
+    else
+        print_error "MLX installation failed or Metal not available"
+        print_info "Check: $MLX_VENV_DIR/bin/python3 -c 'import mlx.core as mx; print(mx.metal.is_available())'"
+        return 1
+    fi
+}
+
+# =============================================================================
+# Optional Dependencies
+# =============================================================================
+
+check_and_install_xbar() {
+    if [ "$OS_TYPE" != "Darwin" ]; then
+        print_info "xbar is only available on macOS (skipping)"
+        return 0
+    fi
+
+    print_header "xbar - Menu Bar Integration"
+
+    echo "xbar displays Context DNA stats in your macOS menu bar:"
+    echo "  • Active A/B tests and sample counts"
+    echo "  • Hook performance rates"
+    echo "  • Pattern evolution status"
+    echo "  • Quick access to management commands"
+    echo ""
+
+    # Check if xbar is installed
+    if [ -d "/Applications/xbar.app" ] || [ -d "$HOME/Applications/xbar.app" ]; then
+        print_success "xbar is already installed"
+        setup_xbar_plugin
+        return 0
+    fi
+
+    if ! prompt_yes_no "Would you like to install xbar for menu bar stats?"; then
+        print_info "Skipping xbar installation"
+        return 0
+    fi
+
+    if ! command -v brew &> /dev/null; then
+        print_warning "Homebrew not found - cannot install xbar automatically"
+        echo "Install manually from: https://xbarapp.com/"
+        return 1
+    fi
+
+    print_step "Installing xbar via Homebrew..."
+    brew install --cask xbar
+
+    if [ -d "/Applications/xbar.app" ]; then
+        print_success "xbar installed successfully"
+
+        # Launch xbar
+        if prompt_yes_no "Would you like to launch xbar now?"; then
+            open "/Applications/xbar.app"
+            echo ""
+            print_info "xbar is starting. You'll see it in your menu bar."
+            sleep 2
+        fi
+
+        setup_xbar_plugin
+    else
+        print_error "xbar installation may have failed"
+        return 1
+    fi
+
+    return 0
+}
+
+setup_xbar_plugin() {
+    print_step "Setting up Context DNA xbar plugin..."
+
+    XBAR_PLUGINS_DIR="$HOME/Library/Application Support/xbar/plugins"
+
+    # Create plugins directory if needed
+    mkdir -p "$XBAR_PLUGINS_DIR"
+
+    # Create the xbar plugin script
+    PLUGIN_FILE="$XBAR_PLUGINS_DIR/context-dna.5m.sh"
+
+    cat > "$PLUGIN_FILE" << 'XBAR_PLUGIN'
+#!/bin/bash
+# <xbar.title>Context DNA Stats</xbar.title>
+# <xbar.version>v1.0</xbar.version>
+# <xbar.author>Context DNA</xbar.author>
+# <xbar.desc>Shows Context DNA learning system stats</xbar.desc>
+# <xbar.var>string(CONTEXT_DNA_REPO=""): Path to Context DNA repo</xbar.var>
+
+# Configuration
+REPO_DIR="${CONTEXT_DNA_REPO:-$HOME/dev/er-simulator-superrepo}"
+PYTHON="${CONTEXT_DNA_PYTHON:-$REPO_DIR/.venv/bin/python3}"
+XBAR_SCRIPT="$REPO_DIR/context-dna/core/src/context_dna/xbar_hook_stats.py"
+
+# Fallback to memory location (legacy)
+if [ ! -f "$XBAR_SCRIPT" ]; then
+    XBAR_SCRIPT="$REPO_DIR/memory/xbar_hook_stats.py"
+fi
+
+# Check if script exists
+if [ ! -f "$XBAR_SCRIPT" ]; then
+    echo "🧬 ?"
+    echo "---"
+    echo "Context DNA not configured"
+    echo "Run install script | bash='$REPO_DIR/scripts/install-context-dna.sh'"
+    exit 0
+fi
+
+# Get stats
+STATS=$("$PYTHON" "$XBAR_SCRIPT" --xbar 2>/dev/null)
+
+if [ -z "$STATS" ]; then
+    echo "🧬 ⚠️"
+    echo "---"
+    echo "Error getting stats"
+    exit 0
+fi
+
+# Parse stats
+TESTS=$(echo "$STATS" | grep "^TESTS:" | cut -d: -f2)
+SAMPLES=$(echo "$STATS" | grep "^SAMPLES:" | cut -d: -f2)
+AVGRATE=$(echo "$STATS" | grep "^AVGRATE:" | cut -d: -f2)
+PATTERNS=$(echo "$STATS" | grep "^PATTERNS:" | cut -d: -f2)
+WISDOM=$(echo "$STATS" | grep "^WISDOM:" | cut -d: -f2)
+CONTEXTS=$(echo "$STATS" | grep "^CONTEXTS:" | cut -d: -f2)
+
+# Menu bar title
+if [ "$TESTS" -gt 0 ]; then
+    echo "🧬 ${TESTS}T ${SAMPLES}S ${AVGRATE}%"
+else
+    echo "🧬 ${PATTERNS}P"
+fi
+
+echo "---"
+echo "Context DNA Stats | size=14"
+echo "---"
+echo "🧪 Active Tests: $TESTS"
+echo "📊 Total Samples: $SAMPLES"
+echo "📈 Avg Success Rate: ${AVGRATE}%"
+echo "---"
+echo "📚 Active Patterns: $PATTERNS"
+echo "💡 Wisdom Injections: $WISDOM"
+echo "🎯 Contexts Learned: $CONTEXTS"
+echo "---"
+
+# Variants section
+VARIANTS=$(echo "$STATS" | grep "^VARIANT:")
+if [ -n "$VARIANTS" ]; then
+    echo "Hook Variants | size=12"
+    echo "$VARIANTS" | while IFS='|' read -r line; do
+        name=$(echo "$line" | cut -d: -f2 | cut -d'|' -f1)
+        group=$(echo "$line" | cut -d'|' -f2)
+        samples=$(echo "$line" | cut -d'|' -f3)
+        rate=$(echo "$line" | cut -d'|' -f4)
+        echo "  $name ($group): ${samples}s ${rate}%"
+    done
+    echo "---"
+fi
+
+# Actions
+echo "Open Menu | bash='$PYTHON' param1='$REPO_DIR/context-dna/core/src/context_dna/hook_manager.py' param2='menu' terminal=true"
+echo "Refresh | refresh=true"
+XBAR_PLUGIN
+
+    chmod +x "$PLUGIN_FILE"
+
+    print_success "xbar plugin installed at $PLUGIN_FILE"
+    print_info "The plugin refreshes every 5 minutes automatically"
+}
+
+check_and_install_vscode() {
+    print_header "VS Code - Recommended IDE"
+
+    echo "VS Code with Claude Code extension provides:"
+    echo "  • Integrated AI coding assistant"
+    echo "  • Automatic context injection from Context DNA"
+    echo "  • Hook triggers on every prompt"
+    echo ""
+
+    # Check if VS Code is installed
+    if command -v code &> /dev/null; then
+        print_success "VS Code is already installed"
+        check_claude_code_extension
+        return 0
+    fi
+
+    # Check common installation paths
+    if [ -d "/Applications/Visual Studio Code.app" ] || \
+       [ -d "$HOME/Applications/Visual Studio Code.app" ] || \
+       [ -d "/usr/share/code" ]; then
+        print_success "VS Code found"
+        check_claude_code_extension
+        return 0
+    fi
+
+    if ! prompt_yes_no "Would you like to install VS Code?"; then
+        print_info "Skipping VS Code installation"
+        print_warning "Note: Context DNA works best with VS Code + Claude Code extension"
+        return 0
+    fi
+
+    if [ "$OS_TYPE" = "Darwin" ]; then
+        if command -v brew &> /dev/null; then
+            print_step "Installing VS Code via Homebrew..."
+            brew install --cask visual-studio-code
+            print_success "VS Code installed"
+        else
+            echo ""
+            echo "Please download VS Code from: https://code.visualstudio.com/download"
+            wait_for_enter
+        fi
+    else
+        echo ""
+        echo "Please download VS Code from: https://code.visualstudio.com/download"
+        wait_for_enter
+    fi
+
+    check_claude_code_extension
+    return 0
+}
+
+check_claude_code_extension() {
+    print_step "Checking Claude Code extension..."
+
+    # Check if 'code' command is available
+    if ! command -v code &> /dev/null; then
+        # Try to add VS Code to PATH on macOS
+        if [ "$OS_TYPE" = "Darwin" ] && [ -d "/Applications/Visual Studio Code.app" ]; then
+            print_info "Adding VS Code to PATH..."
+            export PATH="$PATH:/Applications/Visual Studio Code.app/Contents/Resources/app/bin"
+        fi
+    fi
+
+    if command -v code &> /dev/null; then
+        # Check if Claude Code extension is installed
+        if code --list-extensions 2>/dev/null | grep -qi "anthropic\|claude"; then
+            print_success "Claude Code extension is installed"
+            return 0
+        fi
+
+        print_warning "Claude Code extension not found"
+
+        if prompt_yes_no "Would you like to install the Claude Code extension?"; then
+            print_step "Installing Claude Code extension..."
+
+            # Try different extension IDs (the actual ID may vary)
+            if code --install-extension anthropics.claude-code 2>/dev/null; then
+                print_success "Claude Code extension installed"
+            elif code --install-extension anthropic.claude-code 2>/dev/null; then
+                print_success "Claude Code extension installed"
+            else
+                print_warning "Could not install automatically"
+                echo ""
+                echo "To install manually:"
+                echo "  1. Open VS Code"
+                echo "  2. Press Cmd+Shift+X (or Ctrl+Shift+X)"
+                echo "  3. Search for 'Claude Code'"
+                echo "  4. Click Install"
+                echo ""
+                wait_for_enter
+            fi
+        fi
+    else
+        print_info "VS Code 'code' command not available"
+        echo ""
+        echo "To install Claude Code extension manually:"
+        echo "  1. Open VS Code"
+        echo "  2. Press Cmd+Shift+X (Extensions)"
+        echo "  3. Search for 'Claude Code'"
+        echo "  4. Click Install"
+        echo ""
+    fi
+
+    return 0
+}
+
+# =============================================================================
+# Core Installation Steps
+# =============================================================================
+
+create_directories() {
+    print_step "Creating Context DNA directories..."
+
+    mkdir -p "$CONTEXT_DNA_DIR"
+    mkdir -p "$CONTEXT_DNA_DIR/sessions"
+    mkdir -p "$CONTEXT_DNA_DIR/backups"
+    mkdir -p "$CONTEXT_DNA_DIR/cache"
+
+    print_success "Created $CONTEXT_DNA_DIR"
+}
+
+setup_venv() {
+    print_step "Setting up Python virtual environment..."
+
+    if [ ! -d "$VENV_DIR" ]; then
+        python3 -m venv "$VENV_DIR"
+        print_success "Created virtual environment at $VENV_DIR"
+    else
+        print_success "Virtual environment already exists"
+    fi
+
+    # Activate and install dependencies
+    source "$VENV_DIR/bin/activate"
+
+    print_step "Installing Python dependencies..."
+    pip install --quiet --upgrade pip
+
+    # Install core dependencies
+    pip install --quiet rich pyyaml requests
+
+    # Install Context DNA package in development mode (now at context-dna/core/)
+    if [ -f "$REPO_DIR/context-dna/core/pyproject.toml" ]; then
+        print_step "Installing Context DNA package..."
+        pip install --quiet -e "$REPO_DIR/context-dna/core"
+        print_success "Context DNA package installed"
+    fi
+
+    # Try to install acontext SDK (may not be available publicly)
+    if pip install --quiet acontext 2>/dev/null; then
+        print_success "Installed Context DNA SDK (acontext)"
+    else
+        print_info "Context DNA SDK not available - using local mode"
+    fi
+
+    print_success "Python dependencies installed"
+}
+
+# =============================================================================
+# Adaptive Hierarchy Analysis (The Foundation of Synaptic Intelligence)
+# =============================================================================
+
+run_hierarchy_analysis() {
+    print_step "Analyzing your codebase structure..."
+
+    # First, detect platform
+    echo ""
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    echo -e "${BOLD}🔍 Platform Detection${NC}"
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    echo ""
+
+    # Use hardware.py for platform detection (single source of truth)
+    PLATFORM_INFO=$("$VENV_DIR/bin/python3" -c "
+import sys
+sys.path.insert(0, '$REPO_DIR/context-dna')
+try:
+    from local_llm.hardware import get_recommended_setup
+    setup = get_recommended_setup()
+    p = setup['profile']
+    print(f'OS: {p.os}')
+    print(f'Arch: {p.arch}')
+    print(f'RAM: {p.ram_gb}GB')
+    if p.chip_name:
+        print(f'Chip: {p.chip_name}')
+    if p.is_apple_silicon:
+        print(f'Apple Silicon: Yes')
+    if p.is_rosetta:
+        print(f'Rosetta 2: Running under emulation')
+    print(f'Recommended Backend: {setup[\"backend\"]}')
+    print(f'Recommended Model: {setup[\"model_name\"]}')
+except Exception as e:
+    print(f'Platform detection fallback: {e}')
+" 2>/dev/null || echo "Platform: $OS_TYPE ($(uname -m))")
+
+    echo "$PLATFORM_INFO"
+    echo ""
+
+    # Now analyze codebase hierarchy
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    echo -e "${BOLD}🏗️  Codebase Structure Analysis${NC}"
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    echo ""
+
+    # Use HierarchyAnalyzer if available
+    HIERARCHY_RESULT=$("$VENV_DIR/bin/python3" -c "
+import sys
+sys.path.insert(0, '$REPO_DIR/context-dna/src')
+sys.path.insert(0, '$REPO_DIR/context-dna')
+try:
+    from context_dna.setup.hierarchy_analyzer import HierarchyAnalyzer
+    analyzer = HierarchyAnalyzer('$REPO_DIR')
+    profile = analyzer.analyze()
+
+    print(f'Repository Type: {profile.repo_type.value}')
+    print(f'')
+    print(f'Detected Services:')
+    for cat, loc in profile.locations.items():
+        framework = f' ({loc.framework})' if loc.framework else ''
+        print(f'  • {cat}: {loc.path}{framework}')
+
+    if profile.submodules:
+        print(f'')
+        print(f'Git Submodules:')
+        for sub in profile.submodules:
+            print(f'  • {sub.path}')
+
+    # Save profile to file for later use
+    import json
+    from pathlib import Path
+    profile_path = Path('$CONTEXT_DNA_DIR') / 'hierarchy_profile.json'
+    profile_path.parent.mkdir(parents=True, exist_ok=True)
+    profile_path.write_text(profile.to_json())
+    print(f'')
+    print(f'✓ Profile saved to: {profile_path}')
+
+except ImportError as e:
+    print(f'HierarchyAnalyzer not available yet: {e}')
+    print('Will use basic detection during installation.')
+except Exception as e:
+    print(f'Analysis error: {e}')
+    print('Continuing with default configuration.')
+" 2>/dev/null || echo "Codebase analysis will run after core installation")
+
+    echo "$HIERARCHY_RESULT"
+    echo ""
+
+    # Show what we'll do based on profile
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    echo -e "${BOLD}📋 Installation Plan${NC}"
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    echo ""
+
+    # Check if profile exists and show placement plan
+    if [ -f "$CONTEXT_DNA_DIR/hierarchy_profile.json" ]; then
+        PLACEMENT_PLAN=$("$VENV_DIR/bin/python3" -c "
+import sys
+sys.path.insert(0, '$REPO_DIR/context-dna/src')
+try:
+    from context_dna.setup.placement_engine import PlacementEngine
+    from context_dna.setup.models import HierarchyProfile
+    from pathlib import Path
+    import json
+
+    profile_data = json.loads(Path('$CONTEXT_DNA_DIR/hierarchy_profile.json').read_text())
+    profile = HierarchyProfile.from_dict(profile_data)
+
+    engine = PlacementEngine(profile)
+
+    # Get suggestions for key components
+    components = ['local_llm_client', 'celery_tasks', 'hooks_config']
+    for comp in components:
+        try:
+            suggestion = engine.suggest_placement(comp)
+            if suggestion:
+                print(f'  • {comp}: {suggestion.action} → {suggestion.path}')
+        except:
+            pass
+except Exception as e:
+    pass
+" 2>/dev/null)
+
+        if [ -n "$PLACEMENT_PLAN" ]; then
+            echo "Based on your codebase structure:"
+            echo "$PLACEMENT_PLAN"
+        else
+            echo "Using default installation paths"
+        fi
+    else
+        echo "Using default installation paths"
+    fi
+
+    echo ""
+    print_success "Hierarchy analysis complete"
+}
+
+# =============================================================================
+# Local LLM Backend Installation
+# =============================================================================
+
+install_llm_backend() {
+    print_header "Local LLM Backend"
+
+    echo "Context DNA can use a local LLM for intelligent features:"
+    echo "  • Smart context injection"
+    echo "  • Pattern analysis"
+    echo "  • Code understanding"
+    echo ""
+
+    # Detect architecture and show appropriate info
+    ARCH=$(uname -m)
+    if [ "$OS_TYPE" = "Darwin" ] && [ "$ARCH" = "arm64" ]; then
+        echo -e "${GREEN}${BOLD}Apple Silicon Detected!${NC}"
+        echo ""
+        echo "Your system will use ${CYAN}MLX${NC} - Apple's native ML framework:"
+        echo "  • Direct Metal GPU acceleration"
+        echo "  • Optimized for M1/M2/M3/M4/M5 chips"
+        echo "  • No Docker or external services needed"
+        echo "  • Models run at native speed on your GPU"
+        echo ""
+    else
+        echo "Your system will use ${CYAN}Ollama${NC} - cross-platform LLM runtime:"
+        echo "  • Works on Intel Macs, Linux, Windows"
+        echo "  • Easy model management"
+        echo "  • Wide model compatibility"
+        echo ""
+    fi
+
+    if ! prompt_yes_no "Would you like to install and start the local LLM backend?"; then
+        print_info "Skipping local LLM backend installation"
+        print_warning "You can install it later with: python -m context_dna.local_llm.mlx_installer"
+        return 0
+    fi
+
+    # Determine which Python/venv to use
+    MLX_VENV_DIR="$CONTEXT_DNA_DIR/venv-mlx"
+
+    if [ "$OS_TYPE" = "Darwin" ] && [ "$ARCH" = "arm64" ] && [ -d "$MLX_VENV_DIR" ]; then
+        # Apple Silicon: Use MLX venv (already set up in Phase 1)
+        LLM_PYTHON="$MLX_VENV_DIR/bin/python3"
+        print_step "Using MLX venv for Local LLM server..."
+
+        # Verify MLX is installed (with retry if needed)
+        if ! "$LLM_PYTHON" -c "import mlx" 2>/dev/null; then
+            print_step "Installing MLX in venv (with retries)..."
+            retry_command 3 "'$LLM_PYTHON' -m pip install --upgrade pip -q"
+            if ! pip_install_retry "$LLM_PYTHON" "mlx mlx-lm"; then
+                print_error "Failed to install MLX after retries"
+                return 1
+            fi
+        fi
+
+        # Ensure all server dependencies are installed (with retries)
+        print_step "Verifying Local LLM server dependencies..."
+        SERVER_DEPS="fastapi uvicorn httpx pyyaml rich platformdirs keyring cryptography pydantic"
+        pip_install_retry "$LLM_PYTHON" "$SERVER_DEPS" || true  # Non-fatal if some fail
+
+        print_success "MLX backend ready"
+
+    else
+        # Non-Apple Silicon: Use Ollama
+        print_step "Setting up Ollama backend..."
+
+        if command -v ollama &> /dev/null; then
+            print_success "Ollama already installed"
+        elif curl -s "http://127.0.0.1:11434/api/tags" &>/dev/null; then
+            print_success "Ollama service running"
+        else
+            if [ "$OS_TYPE" = "Darwin" ]; then
+                if command -v brew &> /dev/null; then
+                    print_step "Installing Ollama via Homebrew (with retries)..."
+                    if retry_command 3 "brew install ollama"; then
+                        print_success "Ollama installed"
+                    else
+                        print_warning "Failed to install Ollama"
+                        print_info "Install manually from: https://ollama.ai"
+                    fi
+                else
+                    print_warning "Install Ollama from: https://ollama.ai"
+                fi
+            else
+                print_warning "Install Ollama from: https://ollama.ai"
+            fi
+        fi
+
+        # Use main venv for Ollama backend
+        LLM_PYTHON="$VENV_DIR/bin/python3"
+
+        # Install server dependencies in main venv (with retries)
+        print_step "Installing Local LLM server dependencies..."
+        SERVER_DEPS="fastapi uvicorn httpx pyyaml rich platformdirs keyring cryptography pydantic"
+        pip_install_retry "$LLM_PYTHON" "$SERVER_DEPS" || true
+
+        print_success "Ollama backend ready"
+    fi
+
+    # Start the Local LLM server (with retries)
+    start_llm_server "$LLM_PYTHON"
+
+    return 0
+}
+
+# =============================================================================
+# Start Local LLM Server
+# =============================================================================
+
+start_llm_server() {
+    local LLM_PYTHON="${1:-$CONTEXT_DNA_DIR/venv-mlx/bin/python3}"
+    local SERVER_SCRIPT="$REPO_DIR/context-dna/local_llm/start_server.py"
+    local LOG_FILE="$CONTEXT_DNA_DIR/local-llm.log"
+    local PID_FILE="$CONTEXT_DNA_DIR/local-llm.pid"
+    local MAX_RETRIES=3
+    local retry=1
+
+    print_step "Starting Local LLM server (with retries)..."
+
+    while [ $retry -le $MAX_RETRIES ]; do
+        # Stop any existing server
+        if [ -f "$PID_FILE" ]; then
+            OLD_PID=$(cat "$PID_FILE" 2>/dev/null)
+            if [ -n "$OLD_PID" ] && kill -0 "$OLD_PID" 2>/dev/null; then
+                print_info "Stopping existing server (PID: $OLD_PID)..."
+                kill "$OLD_PID" 2>/dev/null || true
+                sleep 1
+            fi
+            rm -f "$PID_FILE"
+        fi
+
+        # Also kill any orphaned servers
+        pkill -f "start_server.py" 2>/dev/null || true
+        pkill -f "uvicorn.*api_server" 2>/dev/null || true
+        sleep 1
+
+        # Verify the server script exists
+        if [ ! -f "$SERVER_SCRIPT" ]; then
+            print_error "Server script not found: $SERVER_SCRIPT"
+            return 1
+        fi
+
+        # Verify Python works
+        if ! "$LLM_PYTHON" -c "print('ok')" &>/dev/null; then
+            print_error "Python interpreter not working: $LLM_PYTHON"
+            return 1
+        fi
+
+        # Start the server in background
+        print_info "Starting server attempt $retry/$MAX_RETRIES..."
+        nohup "$LLM_PYTHON" "$SERVER_SCRIPT" > "$LOG_FILE" 2>&1 &
+        SERVER_PID=$!
+        echo "$SERVER_PID" > "$PID_FILE"
+
+        # Wait for server to be ready (up to 15 seconds)
+        if wait_for_service "http://127.0.0.1:5043/health" 15; then
+            print_success "Local LLM server is running!"
+            echo ""
+            echo -e "${GREEN}  Server URL: http://127.0.0.1:5043${NC}"
+            echo -e "${GREEN}  Health:     http://127.0.0.1:5043/health${NC}"
+            echo -e "${GREEN}  API Docs:   http://127.0.0.1:5043/docs${NC}"
+            echo -e "${GREEN}  Log file:   $LOG_FILE${NC}"
+            echo ""
+
+            # Create a convenience script to manage the server
+            create_server_management_script "$LLM_PYTHON"
+
+            return 0
+        fi
+
+        # Check if process died
+        if ! kill -0 "$SERVER_PID" 2>/dev/null; then
+            print_warning "Server process died on attempt $retry"
+            if [ $retry -lt $MAX_RETRIES ]; then
+                print_info "Checking logs for error..."
+                tail -10 "$LOG_FILE" 2>/dev/null || true
+                sleep 2
+            fi
+        else
+            print_warning "Server running but not responding on attempt $retry"
+        fi
+
+        retry=$((retry + 1))
+    done
+
+    # All retries failed - show comprehensive diagnostics
+    print_error "Server failed to start after $MAX_RETRIES attempts"
+    echo ""
+    print_info "=== Diagnostics ==="
+    echo "Python: $LLM_PYTHON"
+    echo "Script: $SERVER_SCRIPT"
+    echo ""
+    print_info "=== Last 30 lines of log ==="
+    tail -30 "$LOG_FILE" 2>/dev/null || echo "(no log file)"
+    echo ""
+    print_info "=== Manual start command ==="
+    echo "$LLM_PYTHON $SERVER_SCRIPT"
+    echo ""
+    print_info "Full log: $LOG_FILE"
+
+    return 1
+}
+
+create_server_management_script() {
+    local LLM_PYTHON="$1"
+    local SCRIPT_PATH="$CONTEXT_DNA_DIR/local-llm"
+
+    cat > "$SCRIPT_PATH" << SERVER_SCRIPT
+#!/bin/bash
+# Context DNA Local LLM Server Management
+# Usage: local-llm [start|stop|status|restart|logs]
+
+PYTHON="$LLM_PYTHON"
+SERVER="$REPO_DIR/context-dna/local_llm/start_server.py"
+LOG="$CONTEXT_DNA_DIR/local-llm.log"
+PID_FILE="$CONTEXT_DNA_DIR/local-llm.pid"
+
+case "\${1:-status}" in
+    start)
+        if curl -s "http://127.0.0.1:5043/health" &>/dev/null; then
+            echo "Server already running"
+            exit 0
+        fi
+        pkill -f "start_server.py" 2>/dev/null || true
+        nohup "\$PYTHON" "\$SERVER" > "\$LOG" 2>&1 &
+        echo \$! > "\$PID_FILE"
+        sleep 2
+        if curl -s "http://127.0.0.1:5043/health" &>/dev/null; then
+            echo "Server started: http://127.0.0.1:5043"
+        else
+            echo "Failed to start. Check: \$LOG"
+        fi
+        ;;
+    stop)
+        pkill -f "start_server.py" 2>/dev/null || true
+        rm -f "\$PID_FILE"
+        echo "Server stopped"
+        ;;
+    restart)
+        "\$0" stop
+        sleep 1
+        "\$0" start
+        ;;
+    status)
+        if curl -s "http://127.0.0.1:5043/health" &>/dev/null; then
+            echo "Server running: http://127.0.0.1:5043"
+            curl -s "http://127.0.0.1:5043/health"
+            echo ""
+        else
+            echo "Server not running"
+        fi
+        ;;
+    logs)
+        tail -f "\$LOG"
+        ;;
+    *)
+        echo "Usage: local-llm [start|stop|status|restart|logs]"
+        ;;
+esac
+SERVER_SCRIPT
+
+    chmod +x "$SCRIPT_PATH"
+    print_info "Server management: $SCRIPT_PATH [start|stop|status|restart|logs]"
+}
+
+migrate_databases() {
+    print_step "Migrating databases to centralized location..."
+
+    # Check for existing databases in memory/
+    MEMORY_DIR="$REPO_DIR/memory"
+
+    if [ -f "$MEMORY_DIR/.pattern_evolution.db" ] && [ ! -L "$MEMORY_DIR/.pattern_evolution.db" ]; then
+        cp "$MEMORY_DIR/.pattern_evolution.db" "$CONTEXT_DNA_DIR/.pattern_evolution.db"
+        # Create symlink for backwards compatibility
+        rm "$MEMORY_DIR/.pattern_evolution.db"
+        ln -sf "$CONTEXT_DNA_DIR/.pattern_evolution.db" "$MEMORY_DIR/.pattern_evolution.db"
+        print_success "Migrated .pattern_evolution.db"
+    elif [ -L "$MEMORY_DIR/.pattern_evolution.db" ]; then
+        print_success ".pattern_evolution.db already migrated (symlink exists)"
+    fi
+
+    if [ -f "$MEMORY_DIR/.pattern_registry.db" ] && [ ! -L "$MEMORY_DIR/.pattern_registry.db" ]; then
+        cp "$MEMORY_DIR/.pattern_registry.db" "$CONTEXT_DNA_DIR/.pattern_registry.db"
+        rm "$MEMORY_DIR/.pattern_registry.db"
+        ln -sf "$CONTEXT_DNA_DIR/.pattern_registry.db" "$MEMORY_DIR/.pattern_registry.db"
+        print_success "Migrated .pattern_registry.db"
+    elif [ -L "$MEMORY_DIR/.pattern_registry.db" ]; then
+        print_success ".pattern_registry.db already migrated (symlink exists)"
+    fi
+}
+
+configure_hooks() {
+    print_step "Configuring Claude Code hooks..."
+
+    CLAUDE_CONFIG_DIR="$HOME/.claude"
+    HOOKS_FILE="$CLAUDE_CONFIG_DIR/settings.json"
+
+    # Create Claude config directory if needed
+    mkdir -p "$CLAUDE_CONFIG_DIR"
+
+    # Check if hooks are already configured
+    if [ -f "$HOOKS_FILE" ]; then
+        if grep -q "auto-memory-query.sh" "$HOOKS_FILE" 2>/dev/null; then
+            print_success "Claude Code hooks already configured"
+            return
+        fi
+
+        # Backup existing config
+        cp "$HOOKS_FILE" "$HOOKS_FILE.backup.$(date +%Y%m%d_%H%M%S)"
+        print_info "Backed up existing settings.json"
+    fi
+
+    # Create or update settings.json
+    cat > "$HOOKS_FILE" << EOF
+{
+  "hooks": {
+    "UserPromptSubmit": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "$REPO_DIR/scripts/auto-memory-query.sh"
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "$REPO_DIR/scripts/auto-capture-results.sh"
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "$REPO_DIR/scripts/auto-session-summary.sh"
+          }
+        ]
+      }
+    ]
+  }
+}
+EOF
+
+    print_success "Claude Code hooks configured in $HOOKS_FILE"
+}
+
+setup_environment() {
+    print_step "Setting up environment variables..."
+
+    # Create environment file
+    ENV_FILE="$CONTEXT_DNA_DIR/.env"
+
+    if [ ! -f "$ENV_FILE" ]; then
+        cat > "$ENV_FILE" << EOF
+# Context DNA Configuration
+# Generated by install-context-dna.sh on $(date)
+
+# Repository location
+CONTEXT_DNA_REPO=$REPO_DIR
+
+# User data directory
+CONTEXT_DNA_DIR=$CONTEXT_DNA_DIR
+
+# Python interpreter
+CONTEXT_DNA_PYTHON=$VENV_DIR/bin/python3
+
+# API Configuration (update these if using remote Context DNA server)
+CONTEXT_DNA_BASE_URL=http://localhost:8029/api/v1
+CONTEXT_DNA_API_KEY=sk-ac-your-root-api-bearer-token
+EOF
+        print_success "Created environment file at $ENV_FILE"
+    else
+        print_success "Environment file already exists"
+    fi
+
+    # Add to shell profile if not already there
+    SHELL_PROFILE=""
+    if [ -f "$HOME/.zshrc" ]; then
+        SHELL_PROFILE="$HOME/.zshrc"
+    elif [ -f "$HOME/.bashrc" ]; then
+        SHELL_PROFILE="$HOME/.bashrc"
+    fi
+
+    if [ -n "$SHELL_PROFILE" ]; then
+        if ! grep -q "CONTEXT_DNA" "$SHELL_PROFILE" 2>/dev/null; then
+            echo "" >> "$SHELL_PROFILE"
+            echo "# Context DNA" >> "$SHELL_PROFILE"
+            echo "export CONTEXT_DNA_REPO=\"$REPO_DIR\"" >> "$SHELL_PROFILE"
+            echo "export CONTEXT_DNA_DIR=\"$CONTEXT_DNA_DIR\"" >> "$SHELL_PROFILE"
+            echo "export CONTEXT_DNA_PYTHON=\"$VENV_DIR/bin/python3\"" >> "$SHELL_PROFILE"
+            print_success "Added environment variables to $SHELL_PROFILE"
+        else
+            print_success "Environment variables already in shell profile"
+        fi
+    fi
+}
+
+verify_installation() {
+    print_step "Verifying installation..."
+
+    ERRORS=0
+    WARNINGS=0
+
+    echo ""
+
+    # Check directories
+    if [ -d "$CONTEXT_DNA_DIR" ]; then
+        print_success "Context DNA directory exists"
+    else
+        print_error "Context DNA directory missing"
+        ERRORS=$((ERRORS + 1))
+    fi
+
+    # Check Python
+    if [ -f "$VENV_DIR/bin/python3" ]; then
+        print_success "Python virtual environment exists"
+    else
+        print_error "Python virtual environment missing"
+        ERRORS=$((ERRORS + 1))
+    fi
+
+    # Test imports
+    if "$VENV_DIR/bin/python3" -c "from context_dna.hook_evolution import HookEvolutionEngine" 2>/dev/null; then
+        print_success "Context DNA package imports successfully"
+    elif "$VENV_DIR/bin/python3" -c "from memory.hook_evolution import get_hook_evolution_engine" 2>/dev/null; then
+        print_success "Hook Evolution engine imports (via memory/)"
+    else
+        print_error "Hook Evolution engine import failed"
+        ERRORS=$((ERRORS + 1))
+    fi
+
+    if "$VENV_DIR/bin/python3" -c "from memory.brain import ArchitectureBrain" 2>/dev/null; then
+        print_success "Architecture Brain imports successfully"
+    else
+        print_warning "Architecture Brain import failed"
+        WARNINGS=$((WARNINGS + 1))
+    fi
+
+    # Check hooks configuration
+    if [ -f "$HOME/.claude/settings.json" ]; then
+        if grep -q "auto-memory-query.sh" "$HOME/.claude/settings.json" 2>/dev/null; then
+            print_success "Claude Code hooks configured"
+        else
+            print_warning "Claude Code hooks not fully configured"
+            WARNINGS=$((WARNINGS + 1))
+        fi
+    else
+        print_warning "Claude Code settings.json not found"
+        WARNINGS=$((WARNINGS + 1))
+    fi
+
+    # Check optional components
+    echo ""
+    echo "Optional Components:"
+
+    # xbar
+    if [ "$OS_TYPE" = "Darwin" ]; then
+        if [ -d "/Applications/xbar.app" ] || [ -d "$HOME/Applications/xbar.app" ]; then
+            print_success "xbar installed"
+        else
+            print_info "xbar not installed (optional)"
+        fi
+    fi
+
+    # VS Code
+    if command -v code &> /dev/null || [ -d "/Applications/Visual Studio Code.app" ]; then
+        print_success "VS Code installed"
+
+        # Claude Code extension
+        if command -v code &> /dev/null && code --list-extensions 2>/dev/null | grep -qi "claude\|anthropic"; then
+            print_success "Claude Code extension installed"
+        else
+            print_info "Claude Code extension not detected"
+        fi
+    else
+        print_info "VS Code not installed (optional)"
+    fi
+
+    # Local LLM Backend
+    echo ""
+    echo "Local LLM Backend:"
+
+    # Check if Local LLM server is running
+    if curl -s "http://127.0.0.1:5043/health" &>/dev/null; then
+        print_success "Local LLM server running at http://127.0.0.1:5043"
+    else
+        print_info "Local LLM server not running"
+        if [ -f "$CONTEXT_DNA_DIR/local-llm" ]; then
+            print_info "Start with: $CONTEXT_DNA_DIR/local-llm start"
+        fi
+    fi
+
+    # Check for MLX (Apple Silicon)
+    MLX_VENV_DIR="$CONTEXT_DNA_DIR/venv-mlx"
+    if [ "$OS_TYPE" = "Darwin" ]; then
+        ARCH=$(uname -m)
+        if [ "$ARCH" = "arm64" ]; then
+            if [ -f "$MLX_VENV_DIR/bin/python3" ] && "$MLX_VENV_DIR/bin/python3" -c "import mlx.core as mx; exit(0 if mx.metal.is_available() else 1)" 2>/dev/null; then
+                print_success "MLX backend installed with Metal GPU"
+            elif [ -f "$MLX_VENV_DIR/bin/python3" ] && "$MLX_VENV_DIR/bin/python3" -c "import mlx" 2>/dev/null; then
+                print_warning "MLX installed but Metal not available"
+            else
+                print_info "MLX not installed (recommended for Apple Silicon)"
+            fi
+        fi
+    fi
+
+    # Check for Ollama
+    if command -v ollama &> /dev/null; then
+        print_success "Ollama backend available"
+    elif curl -s "http://127.0.0.1:11434/api/tags" &>/dev/null; then
+        print_success "Ollama API responding"
+    else
+        if [ "$OS_TYPE" != "Darwin" ] || [ "$(uname -m)" != "arm64" ]; then
+            print_info "Ollama not detected (recommended for this system)"
+        fi
+    fi
+
+    echo ""
+    if [ $ERRORS -eq 0 ]; then
+        if [ $WARNINGS -eq 0 ]; then
+            print_success "Installation verified successfully! All systems go."
+        else
+            print_success "Installation verified with $WARNINGS warnings"
+        fi
+    else
+        print_error "$ERRORS verification checks failed"
+    fi
+
+    return $ERRORS
+}
+
+show_usage() {
+    echo "Context DNA Installation Wizard"
+    echo ""
+    echo "Usage: $0 [OPTIONS]"
+    echo ""
+    echo "Options:"
+    echo "  --quick         Skip optional dependencies (xbar, VS Code prompts)"
+    echo "  --hooks-only    Only configure Claude Code hooks"
+    echo "  --verify        Only verify existing installation"
+    echo "  --help          Show this help message"
+    echo ""
+    echo "Environment Variables:"
+    echo "  CONTEXT_DNA_DIR    User data directory (default: ~/.context-dna)"
+    echo "  CONTEXT_DNA_REPO   Repository path (auto-detected)"
+    echo ""
+}
+
+show_final_instructions() {
+    print_header "Installation Complete!"
+
+    echo -e "${GREEN}Context DNA is now installed and ready to use.${NC}"
+    echo ""
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    echo ""
+    echo -e "${BOLD}Quick Start:${NC}"
+    echo ""
+    echo "  1. Restart your terminal (or run: source ~/.zshrc)"
+    echo ""
+    echo "  2. Open VS Code in this repository:"
+    echo "     code $REPO_DIR"
+    echo ""
+    echo "  3. Start Claude Code (Cmd+Shift+P → 'Claude: Open')"
+    echo ""
+    echo "  4. Context DNA will automatically inject wisdom on every prompt!"
+    echo ""
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    echo ""
+    echo -e "${BOLD}Management Commands:${NC}"
+    echo ""
+    echo "  # Open the interactive menu"
+    echo "  $VENV_DIR/bin/python3 -m context_dna.hook_manager menu"
+    echo ""
+    echo "  # Query memory for a topic"
+    echo "  $VENV_DIR/bin/python3 memory/query.py 'docker deployment'"
+    echo ""
+    echo "  # Ask the Professor for guidance"
+    echo "  $VENV_DIR/bin/python3 memory/professor.py 'deploy to production'"
+    echo ""
+    echo "  # Record a success"
+    echo "  $VENV_DIR/bin/python3 memory/brain.py success 'task' 'what worked'"
+    echo ""
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    echo ""
+
+    # Show LLM backend status
+    echo -e "${BOLD}Local LLM Backend:${NC}"
+    if [ "$OS_TYPE" = "Darwin" ] && [ "$(uname -m)" = "arm64" ]; then
+        if "$VENV_DIR/bin/python3" -c "import mlx" 2>/dev/null; then
+            echo "  MLX backend installed (native Metal acceleration)"
+            echo "  Download a model: python -c \"from mlx_lm import load; load('mlx-community/Qwen2.5-Coder-7B-Instruct-4bit')\""
+        else
+            echo "  MLX not installed. Install with:"
+            echo "  $VENV_DIR/bin/python3 $REPO_DIR/context-dna/local_llm/mlx_installer.py"
+        fi
+    else
+        if command -v ollama &> /dev/null; then
+            echo "  Ollama backend available"
+            echo "  Pull a model: ollama pull qwen2.5-coder:7b"
+        else
+            echo "  Install Ollama from https://ollama.ai"
+        fi
+    fi
+    echo ""
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    echo ""
+
+    if [ "$OS_TYPE" = "Darwin" ] && [ -d "/Applications/xbar.app" ]; then
+        echo -e "${BOLD}Menu Bar:${NC}"
+        echo "  xbar shows Context DNA stats in your menu bar (🧬)"
+        echo ""
+    fi
+
+    echo -e "${MAGENTA}Documentation: $REPO_DIR/context-dna/README.md${NC}"
+    echo ""
+}
+
+# =============================================================================
+# Main
+# =============================================================================
+
+main() {
+    # Parse arguments
+    QUICK_MODE=false
+    HOOKS_ONLY=false
+    VERIFY_ONLY=false
+
+    for arg in "$@"; do
+        case $arg in
+            --quick)
+                QUICK_MODE=true
+                ;;
+            --hooks-only)
+                HOOKS_ONLY=true
+                ;;
+            --verify)
+                VERIFY_ONLY=true
+                ;;
+            --help|-h)
+                show_usage
+                exit 0
+                ;;
+        esac
+    done
+
+    print_banner
+
+    echo "Repository: $REPO_DIR"
+    echo "User Data:  $CONTEXT_DNA_DIR"
+    echo "OS:         $OS_TYPE"
+    echo ""
+
+    if [ "$VERIFY_ONLY" = true ]; then
+        print_header "Verifying Installation"
+        verify_installation
+        exit $?
+    fi
+
+    if [ "$HOOKS_ONLY" = true ]; then
+        configure_hooks
+        print_success "Hooks configuration complete!"
+        exit 0
+    fi
+
+    # ===========================================
+    # Phase 1: Prerequisites
+    # ===========================================
+    print_header "Phase 1: System Prerequisites"
+
+    if ! check_python; then
+        print_error "Python 3.8+ is required. Please install it and re-run this script."
+        exit 1
+    fi
+
+    if [ "$OS_TYPE" = "Darwin" ]; then
+        check_homebrew
+
+        # Setup ARM64 Homebrew + MLX for Apple Silicon (native Metal GPU)
+        ARCH=$(uname -m)
+        if [ "$ARCH" = "arm64" ]; then
+            setup_arm64_homebrew_and_mlx
+        fi
+    fi
+
+    # ===========================================
+    # Phase 2: Adaptive Hierarchy Analysis
+    # ===========================================
+    print_header "Phase 2: Analyzing Your Codebase Structure"
+
+    run_hierarchy_analysis
+
+    # ===========================================
+    # Phase 3: Optional Dependencies
+    # ===========================================
+    if [ "$QUICK_MODE" = false ]; then
+        print_header "Phase 3: Optional Dependencies"
+
+        check_and_install_xbar
+        check_and_install_vscode
+    else
+        print_header "Phase 3: Skipping Optional Dependencies (--quick mode)"
+    fi
+
+    # ===========================================
+    # Phase 4: Core Installation
+    # ===========================================
+    print_header "Phase 4: Core Installation"
+
+    create_directories
+    setup_venv
+    migrate_databases
+    configure_hooks
+    setup_environment
+
+    # ===========================================
+    # Phase 5: Local LLM Backend (uses hierarchy profile)
+    # ===========================================
+    if [ "$QUICK_MODE" = false ]; then
+        install_llm_backend
+    else
+        print_header "Phase 5: Skipping LLM Backend (--quick mode)"
+        print_info "Install later with: python -m context_dna.local_llm.mlx_installer"
+    fi
+
+    # ===========================================
+    # Phase 6: Verification
+    # ===========================================
+    print_header "Phase 5: Verification"
+
+    if verify_installation; then
+        show_final_instructions
+    else
+        echo ""
+        print_warning "Installation completed with some issues."
+        echo "Run '$0 --verify' to check status."
+    fi
+}
+
+main "$@"

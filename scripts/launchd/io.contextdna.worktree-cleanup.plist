@@ -1,0 +1,61 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  io.contextdna.worktree-cleanup
+  Daily 03:00 housekeeping for stale agent-created git worktrees.
+
+  Install:
+    cp scripts/launchd/io.contextdna.worktree-cleanup.plist ~/Library/LaunchAgents/
+    sed -i '' "s|__USER_HOME__|$HOME|g" ~/Library/LaunchAgents/io.contextdna.worktree-cleanup.plist
+    launchctl load ~/Library/LaunchAgents/io.contextdna.worktree-cleanup.plist
+
+  Logs: /tmp/contextdna-worktree-cleanup.log (stderr same path .err)
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>io.contextdna.worktree-cleanup</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/bash</string>
+        <string>__USER_HOME__/dev/er-simulator-superrepo/scripts/cleanup-stale-worktrees.sh</string>
+    </array>
+
+    <!-- Daily at 03:00 local time -->
+    <key>StartCalendarInterval</key>
+    <dict>
+        <key>Hour</key>
+        <integer>3</integer>
+        <key>Minute</key>
+        <integer>0</integer>
+    </dict>
+
+    <key>RunAtLoad</key>
+    <false/>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/usr/local/bin:/usr/bin:/bin:/opt/homebrew/bin</string>
+        <key>REPO_ROOT</key>
+        <string>__USER_HOME__/dev/er-simulator-superrepo</string>
+        <key>AGE_DAYS</key>
+        <string>7</string>
+    </dict>
+
+    <key>WorkingDirectory</key>
+    <string>__USER_HOME__/dev/er-simulator-superrepo</string>
+
+    <key>StandardOutPath</key>
+    <string>/tmp/contextdna-worktree-cleanup.log</string>
+    <key>StandardErrorPath</key>
+    <string>/tmp/contextdna-worktree-cleanup.err</string>
+
+    <key>ProcessType</key>
+    <string>Background</string>
+
+    <key>Nice</key>
+    <integer>10</integer>
+</dict>
+</plist>

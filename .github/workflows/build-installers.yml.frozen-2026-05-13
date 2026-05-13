@@ -1,0 +1,665 @@
+# Build Context DNA Installers
+# Builds Electron app for macOS, Windows, and Linux
+# Deploys to S3 for download
+#
+# Triggers:
+# - Push to main with changes to electron app or workflow
+# - Manual trigger via workflow_dispatch
+# - Tags starting with 'installer-v*'
+
+name: Build Installers
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'context-dna/clients/electron/**'
+      - '.github/workflows/build-installers.yml'
+    tags:
+      - 'installer-v*'
+  workflow_dispatch:
+    inputs:
+      deploy_to_s3:
+        description: 'Deploy to S3'
+        required: true
+        default: true
+        type: boolean
+      version:
+        description: 'Version tag (e.g., 1.0.0)'
+        required: false
+        default: ''
+        type: string
+
+env:
+  ELECTRON_APP_PATH: context-dna/clients/electron
+  S3_BUCKET: contextdna-installer
+  CLOUDFRONT_DISTRIBUTION_ID: ${{ secrets.CLOUDFRONT_DISTRIBUTION_ID }}
+
+jobs:
+  # ============================================
+  # Build macOS Installer (Universal - Intel + Apple Silicon)
+  # ============================================
+  build-macos:
+    name: Build macOS Installer
+    runs-on: macos-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+          cache-dependency-path: ${{ env.ELECTRON_APP_PATH }}/package-lock.json
+
+      - name: Install dependencies
+        working-directory: ${{ env.ELECTRON_APP_PATH }}
+        run: npm ci || npm install
+
+      - name: Verify icons exist
+        working-directory: ${{ env.ELECTRON_APP_PATH }}
+        run: |
+          echo "Checking for pre-generated icons..."
+
+          # Verify required icons exist (pre-generated and committed to repo)
+          MISSING=""
+          [ ! -f assets/icon.png ] && MISSING="$MISSING icon.png"
+          [ ! -f assets/icon.icns ] && MISSING="$MISSING icon.icns"
+          [ ! -f assets/tray-icon.png ] && MISSING="$MISSING tray-icon.png"
+
+          if [ -n "$MISSING" ]; then
+            echo "ERROR: Missing pre-generated icons:$MISSING"
+            echo "Icons should be committed to the repo. Run local icon generation script."
+            exit 1
+          fi
+
+          echo "✅ All required icons found!"
+          ls -la assets/
+
+      - name: Build Electron app
+        working-directory: ${{ env.ELECTRON_APP_PATH }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Code signing for macOS (optional) - only set if secret exists
+          CSC_LINK: ${{ secrets.MAC_CERT_P12_BASE64 || '' }}
+          CSC_KEY_PASSWORD: ${{ secrets.MAC_CERT_PASSWORD || '' }}
+          APPLE_ID: ${{ secrets.APPLE_ID || '' }}
+          APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD || '' }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID || '' }}
+          # Disable code signing if no certificate provided
+          CSC_IDENTITY_AUTO_DISCOVERY: ${{ secrets.MAC_CERT_P12_BASE64 && 'true' || 'false' }}
+        run: |
+          # Skip code signing if no certificate
+          if [ -z "$CSC_LINK" ]; then
+            echo "No code signing certificate, building unsigned..."
+            export CSC_IDENTITY_AUTO_DISCOVERY=false
+            unset CSC_LINK
+          fi
+          npm run build:mac
+
+      - name: List build output
+        working-directory: ${{ env.ELECTRON_APP_PATH }}
+        run: |
+          echo "=== Build Output ==="
+          ls -la dist/ || echo "No dist folder"
+          find dist -name "*.dmg" -o -name "*.pkg" -o -name "*.zip" 2>/dev/null || echo "No installers found"
+
+      - name: Upload macOS DMG
+        uses: actions/upload-artifact@v4
+        with:
+          name: macos-installer
+          path: |
+            ${{ env.ELECTRON_APP_PATH }}/dist/*.dmg
+            ${{ env.ELECTRON_APP_PATH }}/dist/*.zip
+          if-no-files-found: warn
+
+  # ============================================
+  # Build Windows Installer
+  # ============================================
+  build-windows:
+    name: Build Windows Installer
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+          cache-dependency-path: ${{ env.ELECTRON_APP_PATH }}/package-lock.json
+
+      - name: Install dependencies
+        working-directory: ${{ env.ELECTRON_APP_PATH }}
+        run: npm ci || npm install
+
+      - name: Verify icons exist
+        working-directory: ${{ env.ELECTRON_APP_PATH }}
+        shell: pwsh
+        run: |
+          Write-Host "Checking for pre-generated icons..."
+
+          $missing = @()
+          if (-not (Test-Path "assets/icon.png")) { $missing += "icon.png" }
+          if (-not (Test-Path "assets/icon.ico")) { $missing += "icon.ico" }
+          if (-not (Test-Path "assets/tray-icon.png")) { $missing += "tray-icon.png" }
+
+          if ($missing.Count -gt 0) {
+            Write-Host "ERROR: Missing pre-generated icons: $($missing -join ', ')" -ForegroundColor Red
+            Write-Host "Icons should be committed to the repo. Run local icon generation script."
+            exit 1
+          }
+
+          Write-Host "✅ All required icons found!" -ForegroundColor Green
+          Get-ChildItem assets/
+
+      - name: Build Electron app
+        working-directory: ${{ env.ELECTRON_APP_PATH }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # Only set code signing vars if secrets exist
+          # electron-builder fails if WIN_CSC_LINK is empty string
+          npm run build:win
+
+      - name: List build output
+        working-directory: ${{ env.ELECTRON_APP_PATH }}
+        shell: pwsh
+        run: |
+          Write-Host "=== Build Output ==="
+          Get-ChildItem -Path dist -Recurse -Include *.exe,*.msi 2>$null | ForEach-Object { $_.FullName }
+
+      - name: Upload Windows Installer
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-installer
+          path: |
+            ${{ env.ELECTRON_APP_PATH }}/dist/*.exe
+            ${{ env.ELECTRON_APP_PATH }}/dist/*.msi
+          if-no-files-found: warn
+
+  # ============================================
+  # Build Linux Installer
+  # ============================================
+  build-linux:
+    name: Build Linux Installer
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+          cache-dependency-path: ${{ env.ELECTRON_APP_PATH }}/package-lock.json
+
+      - name: Install dependencies
+        working-directory: ${{ env.ELECTRON_APP_PATH }}
+        run: npm ci || npm install
+
+      - name: Verify icons exist
+        working-directory: ${{ env.ELECTRON_APP_PATH }}
+        run: |
+          echo "Checking for pre-generated icons..."
+
+          MISSING=""
+          [ ! -f assets/icon.png ] && MISSING="$MISSING icon.png"
+          [ ! -f assets/tray-icon.png ] && MISSING="$MISSING tray-icon.png"
+
+          # Verify multi-size icons for Linux AppImage
+          for size in 16 32 48 64 128 256 512; do
+            [ ! -f assets/icons/${size}x${size}.png ] && MISSING="$MISSING icons/${size}x${size}.png"
+          done
+
+          if [ -n "$MISSING" ]; then
+            echo "ERROR: Missing pre-generated icons:$MISSING"
+            echo "Icons should be committed to the repo. Run local icon generation script."
+            exit 1
+          fi
+
+          echo "✅ All required icons found!"
+          ls -la assets/
+          ls -la assets/icons/
+
+      - name: Build Electron app
+        working-directory: ${{ env.ELECTRON_APP_PATH }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          npm run build:linux
+
+      - name: List build output
+        working-directory: ${{ env.ELECTRON_APP_PATH }}
+        run: |
+          echo "=== Build Output ==="
+          ls -la dist/ || echo "No dist folder"
+          find dist -name "*.AppImage" -o -name "*.deb" -o -name "*.sh" 2>/dev/null || echo "No installers found"
+
+      - name: Upload Linux Installer
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-installer
+          path: |
+            ${{ env.ELECTRON_APP_PATH }}/dist/*.AppImage
+            ${{ env.ELECTRON_APP_PATH }}/dist/*.deb
+          if-no-files-found: warn
+
+  # ============================================
+  # Deploy to S3
+  # ============================================
+  deploy-to-s3:
+    name: Deploy to S3
+    needs: [build-macos, build-windows, build-linux]
+    runs-on: ubuntu-latest
+    if: |
+      (github.event_name == 'push' && github.ref == 'refs/heads/main') ||
+      (github.event_name == 'workflow_dispatch' && github.event.inputs.deploy_to_s3 == 'true') ||
+      startsWith(github.ref, 'refs/tags/installer-v')
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Download macOS artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: macos-installer
+          path: installers/macos
+        continue-on-error: true
+
+      - name: Download Windows artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: windows-installer
+          path: installers/windows
+        continue-on-error: true
+
+      - name: Download Linux artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: linux-installer
+          path: installers/linux
+        continue-on-error: true
+
+      - name: List downloaded artifacts
+        run: |
+          echo "=== Downloaded Artifacts ==="
+          find installers -type f 2>/dev/null || echo "No artifacts found"
+
+      - name: Determine version
+        id: version
+        run: |
+          if [[ "${{ github.event.inputs.version }}" != "" ]]; then
+            VERSION="${{ github.event.inputs.version }}"
+          elif [[ "${{ github.ref }}" == refs/tags/installer-v* ]]; then
+            VERSION="${{ github.ref }}"
+            VERSION="${VERSION#refs/tags/installer-v}"
+          else
+            VERSION=$(date +%Y%m%d.%H%M%S)
+          fi
+          echo "VERSION=$VERSION" >> $GITHUB_OUTPUT
+          echo "Version: $VERSION"
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: us-east-1
+
+      - name: Create landing page
+        run: |
+          VERSION="${{ steps.version.outputs.VERSION }}"
+          cat > installers/install.html << 'HTMLEOF'
+          <!DOCTYPE html>
+          <html lang="en">
+          <head>
+            <meta charset="UTF-8">
+            <meta name="viewport" content="width=device-width, initial-scale=1.0">
+            <title>Context DNA - Download</title>
+            <style>
+              * { margin: 0; padding: 0; box-sizing: border-box; }
+              body {
+                font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+                background: linear-gradient(135deg, #0f172a 0%, #1e293b 100%);
+                min-height: 100vh;
+                color: #e2e8f0;
+                display: flex;
+                align-items: center;
+                justify-content: center;
+                padding: 20px;
+              }
+              .container {
+                max-width: 600px;
+                text-align: center;
+              }
+              .logo {
+                font-size: 64px;
+                margin-bottom: 20px;
+              }
+              h1 {
+                font-size: 2.5rem;
+                margin-bottom: 10px;
+                background: linear-gradient(135deg, #818cf8, #c084fc);
+                -webkit-background-clip: text;
+                -webkit-text-fill-color: transparent;
+              }
+              .tagline {
+                color: #94a3b8;
+                margin-bottom: 40px;
+                font-size: 1.1rem;
+              }
+              .download-section {
+                background: rgba(30, 41, 59, 0.8);
+                border-radius: 16px;
+                padding: 30px;
+                margin-bottom: 30px;
+                border: 1px solid rgba(148, 163, 184, 0.1);
+              }
+              .download-btn {
+                display: inline-block;
+                padding: 16px 32px;
+                margin: 10px;
+                background: linear-gradient(135deg, #6366f1, #8b5cf6);
+                color: white;
+                text-decoration: none;
+                border-radius: 12px;
+                font-weight: 600;
+                font-size: 1rem;
+                transition: transform 0.2s, box-shadow 0.2s;
+              }
+              .download-btn:hover {
+                transform: translateY(-2px);
+                box-shadow: 0 10px 40px rgba(99, 102, 241, 0.3);
+              }
+              .download-btn.secondary {
+                background: rgba(100, 116, 139, 0.3);
+                border: 1px solid rgba(148, 163, 184, 0.3);
+              }
+              .platform-icon { font-size: 24px; margin-right: 8px; }
+              .version { color: #64748b; font-size: 0.9rem; margin-top: 20px; }
+              .features {
+                display: grid;
+                grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+                gap: 20px;
+                margin-top: 30px;
+                text-align: left;
+              }
+              .feature {
+                background: rgba(30, 41, 59, 0.5);
+                padding: 20px;
+                border-radius: 12px;
+                border: 1px solid rgba(148, 163, 184, 0.1);
+              }
+              .feature-icon { font-size: 24px; margin-bottom: 10px; }
+              .feature h3 { font-size: 1rem; margin-bottom: 5px; color: #f1f5f9; }
+              .feature p { font-size: 0.85rem; color: #94a3b8; }
+              .cli-section {
+                background: rgba(15, 23, 42, 0.8);
+                border-radius: 12px;
+                padding: 20px;
+                margin-top: 30px;
+                text-align: left;
+              }
+              .cli-section h3 { margin-bottom: 15px; font-size: 1rem; }
+              .cli-code {
+                background: #0f172a;
+                padding: 15px;
+                border-radius: 8px;
+                font-family: 'SF Mono', Monaco, Consolas, monospace;
+                font-size: 0.9rem;
+                overflow-x: auto;
+                border: 1px solid rgba(148, 163, 184, 0.1);
+              }
+              .cli-code .comment { color: #64748b; }
+              .cli-code .cmd { color: #34d399; }
+            </style>
+          </head>
+          <body>
+            <div class="container">
+              <div class="logo">🧬</div>
+              <h1>Context DNA</h1>
+              <p class="tagline">The persistent forever memory your AI has been missing</p>
+
+              <div class="download-section">
+                <h2 style="margin-bottom: 20px;">Download Installer</h2>
+                <div>
+                  <a href="context-dna-installer.dmg" class="download-btn">
+                    <span class="platform-icon">🍎</span> macOS
+                  </a>
+                  <a href="context-dna-installer.exe" class="download-btn">
+                    <span class="platform-icon">🪟</span> Windows
+                  </a>
+                  <a href="context-dna-installer.AppImage" class="download-btn secondary">
+                    <span class="platform-icon">🐧</span> Linux
+                  </a>
+                </div>
+                <p class="version">Version: VERSIONPLACEHOLDER</p>
+              </div>
+
+              <div class="features">
+                <div class="feature">
+                  <div class="feature-icon">🧠</div>
+                  <h3>Forever Memory</h3>
+                  <p>Never lose a learning again</p>
+                </div>
+                <div class="feature">
+                  <div class="feature-icon">🔒</div>
+                  <h3>100% Local</h3>
+                  <p>Your data stays on your machine</p>
+                </div>
+                <div class="feature">
+                  <div class="feature-icon">⚡</div>
+                  <h3>Auto-Inject</h3>
+                  <p>Context flows automatically</p>
+                </div>
+              </div>
+
+              <div class="cli-section">
+                <h3>Or install via command line:</h3>
+                <div class="cli-code">
+                  <span class="comment"># macOS / Linux</span><br>
+                  <span class="cmd">curl -fsSL https://contextdna-installer.s3.amazonaws.com/install.sh | bash</span>
+                  <br><br>
+                  <span class="comment"># Windows (PowerShell)</span><br>
+                  <span class="cmd">irm https://contextdna-installer.s3.amazonaws.com/install.ps1 | iex</span>
+                </div>
+              </div>
+            </div>
+          </body>
+          </html>
+          HTMLEOF
+
+          # Replace version placeholder
+          sed -i "s/VERSIONPLACEHOLDER/$VERSION/g" installers/install.html
+
+      - name: Create CLI install scripts
+        run: |
+          # Create macOS/Linux install script
+          cat > installers/install.sh << 'SHEOF'
+          #!/bin/bash
+          set -e
+
+          echo "🧬 Context DNA Installer"
+          echo "========================"
+          echo ""
+
+          # Detect OS
+          OS="$(uname -s)"
+          ARCH="$(uname -m)"
+
+          case "$OS" in
+            Darwin)
+              echo "Detected: macOS ($ARCH)"
+              INSTALLER_URL="https://contextdna-installer.s3.amazonaws.com/context-dna-installer.dmg"
+              ;;
+            Linux)
+              echo "Detected: Linux ($ARCH)"
+              INSTALLER_URL="https://contextdna-installer.s3.amazonaws.com/context-dna-installer.AppImage"
+              ;;
+            *)
+              echo "Unsupported OS: $OS"
+              exit 1
+              ;;
+          esac
+
+          DOWNLOAD_DIR="${TMPDIR:-/tmp}"
+          FILENAME=$(basename "$INSTALLER_URL")
+
+          echo "Downloading installer..."
+          curl -fSL "$INSTALLER_URL" -o "$DOWNLOAD_DIR/$FILENAME"
+
+          if [ "$OS" = "Darwin" ]; then
+            echo "Opening installer..."
+            open "$DOWNLOAD_DIR/$FILENAME"
+          else
+            chmod +x "$DOWNLOAD_DIR/$FILENAME"
+            echo "Running installer..."
+            "$DOWNLOAD_DIR/$FILENAME"
+          fi
+
+          echo ""
+          echo "✅ Context DNA installation started!"
+          SHEOF
+
+          # Create Windows install script
+          cat > installers/install.ps1 << 'PS1EOF'
+          # Context DNA Windows Installer
+          Write-Host "🧬 Context DNA Installer" -ForegroundColor Cyan
+          Write-Host "========================" -ForegroundColor Cyan
+          Write-Host ""
+
+          $InstallerUrl = "https://contextdna-installer.s3.amazonaws.com/context-dna-installer.exe"
+          $TempDir = $env:TEMP
+          $InstallerPath = Join-Path $TempDir "context-dna-installer.exe"
+
+          Write-Host "Downloading installer..."
+          Invoke-WebRequest -Uri $InstallerUrl -OutFile $InstallerPath
+
+          Write-Host "Running installer..."
+          Start-Process -FilePath $InstallerPath -Wait
+
+          Write-Host ""
+          Write-Host "✅ Context DNA installation complete!" -ForegroundColor Green
+          PS1EOF
+
+      - name: Upload to S3
+        run: |
+          VERSION="${{ steps.version.outputs.VERSION }}"
+
+          # Upload landing page and scripts
+          aws s3 cp installers/install.html s3://${{ env.S3_BUCKET }}/install.html --content-type "text/html"
+          aws s3 cp installers/install.html s3://${{ env.S3_BUCKET }}/index.html --content-type "text/html"
+          aws s3 cp installers/install.sh s3://${{ env.S3_BUCKET }}/install.sh --content-type "text/plain"
+          aws s3 cp installers/install.ps1 s3://${{ env.S3_BUCKET }}/install.ps1 --content-type "text/plain"
+
+          # Upload macOS installers (handle multiple files from electron-builder)
+          # electron-builder creates: {name}-{version}.dmg AND {name}-{version}-arm64.dmg
+          DMG_UPLOADED=false
+          for dmg in installers/macos/*.dmg; do
+            if [ -f "$dmg" ]; then
+              filename=$(basename "$dmg")
+              echo "Uploading macOS DMG: $filename"
+              # Upload with original name to versions folder
+              aws s3 cp "$dmg" "s3://${{ env.S3_BUCKET }}/versions/$VERSION/$filename"
+              # Upload first DMG as the canonical download (prefer non-arm64 if available)
+              if [ "$DMG_UPLOADED" = false ] || [[ ! "$filename" == *"-arm64"* ]]; then
+                aws s3 cp "$dmg" "s3://${{ env.S3_BUCKET }}/context-dna-installer.dmg"
+                DMG_UPLOADED=true
+              fi
+            fi
+          done
+
+          for zip in installers/macos/*.zip; do
+            if [ -f "$zip" ]; then
+              filename=$(basename "$zip")
+              echo "Uploading macOS ZIP: $filename"
+              aws s3 cp "$zip" "s3://${{ env.S3_BUCKET }}/versions/$VERSION/$filename"
+              aws s3 cp "$zip" "s3://${{ env.S3_BUCKET }}/context-dna-macos.zip"
+            fi
+          done
+
+          # Upload Windows installers (handle multiple files)
+          EXE_UPLOADED=false
+          for exe in installers/windows/*.exe; do
+            if [ -f "$exe" ]; then
+              filename=$(basename "$exe")
+              echo "Uploading Windows EXE: $filename"
+              aws s3 cp "$exe" "s3://${{ env.S3_BUCKET }}/versions/$VERSION/$filename"
+              if [ "$EXE_UPLOADED" = false ]; then
+                aws s3 cp "$exe" "s3://${{ env.S3_BUCKET }}/context-dna-installer.exe"
+                EXE_UPLOADED=true
+              fi
+            fi
+          done
+
+          # Upload Linux installers (handle multiple files)
+          APPIMAGE_UPLOADED=false
+          for appimage in installers/linux/*.AppImage; do
+            if [ -f "$appimage" ]; then
+              filename=$(basename "$appimage")
+              echo "Uploading Linux AppImage: $filename"
+              aws s3 cp "$appimage" "s3://${{ env.S3_BUCKET }}/versions/$VERSION/$filename"
+              if [ "$APPIMAGE_UPLOADED" = false ]; then
+                aws s3 cp "$appimage" "s3://${{ env.S3_BUCKET }}/context-dna-installer.AppImage"
+                APPIMAGE_UPLOADED=true
+              fi
+            fi
+          done
+
+          for deb in installers/linux/*.deb; do
+            if [ -f "$deb" ]; then
+              filename=$(basename "$deb")
+              echo "Uploading Linux DEB: $filename"
+              aws s3 cp "$deb" "s3://${{ env.S3_BUCKET }}/versions/$VERSION/$filename"
+              aws s3 cp "$deb" "s3://${{ env.S3_BUCKET }}/context-dna-installer.deb"
+            fi
+          done
+
+          # Create version manifest
+          cat > version.json << EOF
+          {
+            "version": "$VERSION",
+            "date": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
+            "commit": "${{ github.sha }}",
+            "files": {
+              "macos": "context-dna-installer.dmg",
+              "windows": "context-dna-installer.exe",
+              "linux": "context-dna-installer.AppImage"
+            }
+          }
+          EOF
+          aws s3 cp version.json s3://${{ env.S3_BUCKET }}/version.json --content-type "application/json"
+          aws s3 cp version.json s3://${{ env.S3_BUCKET }}/versions/$VERSION/version.json --content-type "application/json"
+
+      - name: Invalidate CloudFront (if configured)
+        if: env.CLOUDFRONT_DISTRIBUTION_ID != ''
+        run: |
+          aws cloudfront create-invalidation \
+            --distribution-id ${{ env.CLOUDFRONT_DISTRIBUTION_ID }} \
+            --paths "/*"
+        continue-on-error: true
+
+      - name: Output download URLs
+        run: |
+          echo "============================================="
+          echo "🎉 DEPLOYMENT COMPLETE!"
+          echo "============================================="
+          echo ""
+          echo "Download URLs:"
+          echo "  Landing Page: https://${{ env.S3_BUCKET }}.s3.amazonaws.com/install.html"
+          echo "  macOS:        https://${{ env.S3_BUCKET }}.s3.amazonaws.com/context-dna-installer.dmg"
+          echo "  Windows:      https://${{ env.S3_BUCKET }}.s3.amazonaws.com/context-dna-installer.exe"
+          echo "  Linux:        https://${{ env.S3_BUCKET }}.s3.amazonaws.com/context-dna-installer.AppImage"
+          echo ""
+          echo "CLI Install:"
+          echo "  curl -fsSL https://${{ env.S3_BUCKET }}.s3.amazonaws.com/install.sh | bash"
+          echo ""
+          echo "Version: ${{ steps.version.outputs.VERSION }}"

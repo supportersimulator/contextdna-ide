@@ -36,8 +36,8 @@ ARCHIVE_DB_PATH = str(Path.home() / ".context-dna" / "session_archive.db")
 SESSIONS_DIR = Path.home() / ".claude" / "projects"
 # The main project sessions — adaptive: pick the dir with the most recent JSONL
 _SUPERREPO_CANDIDATES = [
-    "-Users-user-dev-er-simulator-superrepo",
-    "-Users-user-Documents-er-simulator-superrepo",
+    "-Users-aarontjomsland-dev-er-simulator-superrepo",
+    "-Users-aarontjomsland-Documents-er-simulator-superrepo",
 ]
 
 def _resolve_superrepo_key() -> str:
@@ -77,7 +77,7 @@ CODE_ARTIFACTS_DIR = Path.home() / ".context-dna" / "session_code_artifacts"
 # ─── Project Detection Map ────────────────────────────────────
 # Maps sub-projects to their directory prefixes and keyword signals.
 # Detection priority: code artifact file paths > gold text keywords.
-SUPERREPO_ROOT = "$HOME/dev/er-simulator-superrepo/"
+SUPERREPO_ROOT = "/Users/aarontjomsland/dev/er-simulator-superrepo/"
 
 PROJECT_MAP = {
     'context-dna': {
@@ -717,8 +717,8 @@ class SessionHistorian:
         # Detect and store project tag
         try:
             self._update_project_tag(session_id)
-        except Exception:
-            pass  # Non-critical
+        except Exception as _e:
+            logger.debug("_update_project_tag failed (non-critical): %s", _e)
 
         # Export summary to .projectdna/raw/sessions/ (vault integration)
         try:
@@ -809,8 +809,8 @@ class SessionHistorian:
                  "gold_kb": round(gold_kb, 1), "messages": user_msgs + asst_msgs,
                  "movement": 3},
             )
-        except Exception:
-            pass  # Fail-open — vault export is primary, event logging is secondary
+        except Exception as _e:
+            logger.debug("event logging failed (fail-open): %s", _e)
 
     def _store_gold_incremental(self, session_id: str, gold: dict, is_active: bool):
         """Append new gold to existing archive (incremental extraction)."""
@@ -908,8 +908,8 @@ class SessionHistorian:
         # Recompute project tag (based on all accumulated artifacts)
         try:
             self._update_project_tag(session_id)
-        except Exception:
-            pass  # Non-critical
+        except Exception as _e:
+            logger.debug("_update_project_tag failed (non-critical): %s", _e)
 
         # Export to vault: always on session death, throttled during active (~5min)
         should_export = not is_active
@@ -921,8 +921,8 @@ class SessionHistorian:
             try:
                 self._export_to_vault(session_id, gold)
                 self._last_vault_export[session_id] = time.monotonic()
-            except Exception:
-                pass  # Non-critical — vault export is best-effort
+            except Exception as _e:
+                logger.debug("vault export failed (best-effort): %s", _e)
 
     # ─── Progress Tracking ─────────────────────────────────────
 
@@ -1108,8 +1108,8 @@ Transcript:
 
             return summary, insights, score, json.dumps(topics)
 
-        except (json.JSONDecodeError, ValueError, KeyError):
-            pass  # Fall through to natural language extraction
+        except (json.JSONDecodeError, ValueError, KeyError) as _e:
+            logger.debug("JSON LLM parse failed, falling back to NL extraction: %s", _e)
 
         # === ATTEMPT 2: Extract from natural language response ===
         # Use first paragraph or first 200 chars as summary
@@ -1349,8 +1349,8 @@ Transcript:
                         user_turns, atlas_turns, now, total_chars,
                     ))
                     new_count += 1
-                except sqlite3.IntegrityError:
-                    pass  # UNIQUE constraint — segment already exists
+                except sqlite3.IntegrityError as _e:
+                    logger.debug("segment insert skipped (UNIQUE conflict): %s", _e)
 
             conn.commit()
             return new_count
@@ -1449,8 +1449,8 @@ Transcript:
                 ) / (1024 * 1024)
                 shutil.rmtree(subdir)
                 reclaimed += sub_mb
-            except Exception:
-                pass
+            except Exception as _e:
+                logger.debug("minor error (non-critical): %s", _e)
             deleted = True
 
         if deleted:
@@ -1553,8 +1553,8 @@ Transcript:
                     ) / (1024 * 1024)
                     shutil.rmtree(subdir)
                     reclaimed += sub_size
-                except Exception:
-                    pass
+                except Exception as _e:
+                    logger.debug("minor error (non-critical): %s", _e)
 
             logger.info(f"Cleaned trivial session {session_id[:8]} "
                        f"({stat.st_size}B JSONL)")
@@ -1725,8 +1725,8 @@ Transcript:
         # Detect project tag for newly created entries
         try:
             self._update_project_tag(parent_session_id)
-        except Exception:
-            pass
+        except Exception as _e:
+            logger.debug("_update_project_tag failed (non-critical): %s", _e)
 
     # ─── Helpers ───────────────────────────────────────────────
 
@@ -1750,8 +1750,8 @@ Transcript:
                     parts = line.split("--resume ")
                     if len(parts) > 1:
                         active.add(parts[1].split()[0].strip())
-        except Exception:
-            pass
+        except Exception as _e:
+            logger.debug("minor error (non-critical): %s", _e)
 
         # Method 2: Recently modified JSONL = tab still open
         # New tabs don't have --resume, but they DO write to JSONL files
@@ -1764,8 +1764,8 @@ Transcript:
                 try:
                     if jsonl.stat().st_mtime > tab_cutoff:
                         active.add(jsonl.stem)
-                except OSError:
-                    pass
+                except OSError as _e:
+                    logger.debug("stat failed (non-critical): %s", _e)
 
         return active
 
@@ -2492,6 +2492,7 @@ def main():
             # Parse flags
             full_mode = '--full' in sys.argv
             compact_mode = '--compact' in sys.argv
+            fast_mode = '--fast' in sys.argv
             project = None
             sid = None
             for i, arg in enumerate(sys.argv[2:], 2):
@@ -2499,6 +2500,19 @@ def main():
                     project = sys.argv[i + 1]
                 elif not arg.startswith('--') and not (i > 2 and sys.argv[i - 1] == '--project'):
                     sid = arg
+
+            # --fast: try Redis cache first (TTL 3600s), fall through on miss/error
+            if fast_mode and not full_mode:
+                _redis_cache_key = f"session:rehydrate:cache:{project or 'default'}"
+                try:
+                    import redis as _redis
+                    _rc = _redis.Redis(host='127.0.0.1', port=6379, decode_responses=True, socket_connect_timeout=1)
+                    _cached = _rc.get(_redis_cache_key)
+                    if _cached:
+                        print(_cached)
+                        import sys as _sys; _sys.exit(0)
+                except Exception as _e:
+                    logger.debug("--fast Redis cache read failed (fall through): %s", _e)
 
             if full_mode:
                 # Full mode: dump entire gold text
@@ -2510,6 +2524,14 @@ def main():
                 )
 
             if result:
+                # Populate Redis cache for future --fast runs (ZSF: ignore errors)
+                try:
+                    import redis as _redis
+                    _rc = _redis.Redis(host='127.0.0.1', port=6379, decode_responses=True, socket_connect_timeout=1)
+                    _cache_key = f"session:rehydrate:cache:{project or 'default'}"
+                    _rc.set(_cache_key, result, ex=3600)
+                except Exception as _e:
+                    logger.debug("--fast Redis cache write failed: %s", _e)
                 print(result)
             else:
                 msg = "[NO REHYDRATION DATA]"
@@ -2527,7 +2549,7 @@ def main():
         else:
             print(f"Unknown command: {cmd}")
             print("Usage: session_historian.py [stats|search|insights|run|run-fast|rehydrate|check]")
-            print("  rehydrate [session_id] [--full] [--compact] [--project <name>]")
+            print("  rehydrate [session_id] [--full] [--compact] [--fast] [--project <name>]")
             print("  Projects:", ", ".join(PROJECT_MAP.keys()))
     else:
         # Default: full run

@@ -1,0 +1,29 @@
+#!/bin/bash
+# Fleet's TCC-stable Python wrapper.
+#
+# WHY: macOS TCC (Transparency, Consent, Control) keys approvals to a binary's
+# code-signing identity + path. Each new Python version (3.14 -> 3.15 -> ...)
+# is a new binary at a new path, so every Homebrew upgrade re-prompts for
+# Apple Events / automation access. We tunnel everything through this thin
+# wrapper at a STABLE PATH with a STABLE ad-hoc signature so TCC sees one
+# identity forever.
+#
+# Approve THIS binary in macOS TCC once; it works across python3.14 / 3.15 /
+# 3.16 / etc. without re-approval.
+#
+# Install path: /usr/local/bin/python-fleet (symlinked from this repo via
+# scripts/install-python-fleet-wrapper.sh).
+
+set -e
+
+PYTHON_BIN="/usr/local/bin/python3"
+
+# ZSF: fail loudly if upstream python3 is missing — never silently succeed
+# with a broken target.
+if [ ! -x "$PYTHON_BIN" ]; then
+    echo "python-fleet: $PYTHON_BIN not found or not executable" >&2
+    echo "python-fleet: install python3 (e.g. 'brew install python@3.14') and retry" >&2
+    exit 127
+fi
+
+exec "$PYTHON_BIN" "$@"

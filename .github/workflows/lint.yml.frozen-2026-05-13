@@ -1,0 +1,119 @@
+# Lint — RACE R4 safety net
+#
+# Runs the same ZSF + import-smoke checks as the local pre-commit hook
+# (`scripts/git-hooks/pre-commit-zsf-smoke.sh`) on every PR and push to
+# main, so the gate still fires even if a contributor forgot to run
+# `bash scripts/install-hooks.sh` locally.
+#
+# This is intentionally a thin wrapper around the same shell script the
+# hook uses — single source of truth, no duplicated regex/AST logic.
+#
+# Secrets: NONE.
+
+name: lint (ZSF + import-smoke)
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'memory/**'
+      - 'multi-fleet/**'
+      - 'scripts/git-hooks/**'
+      - 'scripts/install-hooks.sh'
+      - '.github/workflows/lint.yml'
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: lint-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  zsf-import-smoke:
+    name: ZSF + import-smoke
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          # Need full history so we can diff PR HEAD against the merge base
+          # to discover the changed files the local hook would have seen.
+          fetch-depth: 0
+          submodules: false
+
+      - name: Setup Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install shellcheck
+        run: sudo apt-get update -y && sudo apt-get install -y shellcheck
+
+      # ----------------------------------------------------------------------
+      # Compute the diff range and stage every changed file in the index so
+      # `git diff --cached` (which the hook uses) returns the PR's changes.
+      # For PRs we diff against the merge-base of the base branch; for push
+      # events we diff against the previous commit.
+      # ----------------------------------------------------------------------
+      - name: Stage changed files for hook
+        id: stage
+        run: |
+          set -euo pipefail
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            BASE_SHA="${{ github.event.pull_request.base.sha }}"
+            HEAD_SHA="${{ github.event.pull_request.head.sha }}"
+          else
+            BASE_SHA="${{ github.event.before }}"
+            HEAD_SHA="${{ github.sha }}"
+          fi
+          # Defensive: if BASE_SHA is the all-zero sentinel (first push to a
+          # branch) fall back to HEAD~1.
+          if [ -z "$BASE_SHA" ] || [ "$BASE_SHA" = "0000000000000000000000000000000000000000" ]; then
+            BASE_SHA="$(git rev-parse "$HEAD_SHA^" 2>/dev/null || git rev-parse "$HEAD_SHA")"
+          fi
+          echo "Diff range: $BASE_SHA..$HEAD_SHA"
+          CHANGED=$(git diff --name-only --diff-filter=ACM "$BASE_SHA" "$HEAD_SHA" || true)
+          if [ -z "$CHANGED" ]; then
+            echo "No changed files — skipping gate."
+            echo "skip=1" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "$CHANGED" | sed 's/^/  /'
+          # Stage them so `git diff --cached` returns the same set the local
+          # hook sees pre-commit.
+          echo "$CHANGED" | xargs -r git add --intent-to-add --
+          # `--intent-to-add` makes `git diff --cached --name-only` list the
+          # files but `git add` proper is needed for the AST scan path.
+          echo "$CHANGED" | xargs -r git add --
+          echo "skip=0" >> "$GITHUB_OUTPUT"
+
+      - name: Run pre-commit ZSF + import-smoke gate
+        if: steps.stage.outputs.skip != '1'
+        run: |
+          chmod +x scripts/git-hooks/pre-commit-zsf-smoke.sh
+          ./scripts/git-hooks/pre-commit-zsf-smoke.sh
+
+      # ----------------------------------------------------------------------
+      # Verify the installer itself stays idempotent — guards against a
+      # future edit accidentally removing the RACE-Q3-DISPATCHER marker
+      # check.
+      # ----------------------------------------------------------------------
+      - name: Verify install-hooks.sh is idempotent
+        run: |
+          set -euo pipefail
+          chmod +x scripts/install-hooks.sh
+          bash scripts/install-hooks.sh
+          FIRST=$(sha256sum .git/hooks/pre-commit | awk '{print $1}')
+          bash scripts/install-hooks.sh
+          SECOND=$(sha256sum .git/hooks/pre-commit | awk '{print $1}')
+          if [ "$FIRST" != "$SECOND" ]; then
+            echo "install-hooks.sh is not idempotent: hook content changed on re-run"
+            exit 1
+          fi
+          echo "install-hooks.sh idempotency: OK"

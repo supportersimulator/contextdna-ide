@@ -1,0 +1,41 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>EnvironmentVariables</key>
+	<dict>
+		<key>HOME</key>
+		<string>__USER_HOME__</string>
+		<key>PATH</key>
+		<string>/usr/local/bin:/usr/bin:/bin:/opt/homebrew/bin</string>
+	</dict>
+	<key>KeepAlive</key>
+	<true/>
+	<key>Label</key>
+	<string>com.contextdna.llm</string>
+	<key>ProcessType</key>
+	<string>Background</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>__USER_HOME__/dev/er-simulator-superrepo/context-dna/local_llm/.venv-mlx/bin/python</string>
+		<string>-m</string>
+		<string>mlx_lm.server</string>
+		<string>--model</string>
+		<string>mlx-community/Qwen3-4B-4bit</string>
+		<string>--port</string>
+		<string>5044</string>
+		<string>--host</string>
+		<string>127.0.0.1</string>
+	</array>
+	<key>RunAtLoad</key>
+	<true/>
+	<key>StandardErrorPath</key>
+	<string>__USER_HOME__/dev/er-simulator-superrepo/logs/llm_server.log</string>
+	<key>StandardOutPath</key>
+	<string>__USER_HOME__/dev/er-simulator-superrepo/logs/llm_server.log</string>
+	<key>ThrottleInterval</key>
+	<integer>30</integer>
+	<key>WorkingDirectory</key>
+	<string>__USER_HOME__/dev/er-simulator-superrepo</string>
+</dict>
+</plist>

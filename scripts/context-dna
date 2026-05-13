@@ -1,0 +1,906 @@
+#!/bin/bash
+# =============================================================================
+# Context DNA CLI
+# =============================================================================
+#
+# ATTRIBUTION NOTICE
+# ------------------
+# This product includes software developed by the Acontext project
+# (https://github.com/memodb-io/Acontext) under the Apache License, Version 2.0.
+#
+# Modifications have been made to the original source code. These changes
+# are the responsibility of Context DNA (https://contextdna.io).
+#
+# Original License: Apache License, Version 2.0
+# See: https://www.apache.org/licenses/LICENSE-2.0
+#
+# =============================================================================
+
+set -e
+
+# Configuration
+# CONTEXT_DNA_INFRA_DIR: Docker infrastructure directory (docker-compose, .env, resource profiles)
+# Uses symlink context-dna-data -> context-dna/infra for backward compatibility
+CONTEXT_DNA_INFRA_DIR="${CONTEXT_DNA_INFRA_DIR:-$HOME/dev/er-simulator-superrepo/context-dna/infra}"
+COMPOSE_FILE="$CONTEXT_DNA_INFRA_DIR/docker-compose.yaml"
+RESOURCE_PROFILES="$CONTEXT_DNA_INFRA_DIR/resource-profiles.yaml"
+ENV_FILE="$CONTEXT_DNA_INFRA_DIR/.env"
+
+# Colors for output
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+RED='\033[0;31m'
+BLUE='\033[0;34m'
+CYAN='\033[0;36m'
+MAGENTA='\033[0;35m'
+BOLD='\033[1m'
+NC='\033[0m' # No Color
+
+# Banner
+show_banner() {
+    echo -e "${BLUE}"
+    cat << 'EOF'
+  ╔═══════════════════════════════════════════════════════════════╗
+  ║   ██████╗ ██████╗ ███╗   ██╗████████╗███████╗██╗  ██╗████████╗║
+  ║  ██╔════╝██╔═══██╗████╗  ██║╚══██╔══╝██╔════╝╚██╗██╔╝╚══██╔══╝║
+  ║  ██║     ██║   ██║██╔██╗ ██║   ██║   █████╗   ╚███╔╝    ██║   ║
+  ║  ██║     ██║   ██║██║╚██╗██║   ██║   ██╔══╝   ██╔██╗    ██║   ║
+  ║  ╚██████╗╚██████╔╝██║ ╚████║   ██║   ███████╗██╔╝ ██╗   ██║   ║
+  ║   ╚═════╝ ╚═════╝ ╚═╝  ╚═══╝   ╚═╝   ╚══════╝╚═╝  ╚═╝   ╚═╝   ║
+  ║                       ██████╗ ███╗   ██╗ █████╗               ║
+  ║                       ██╔══██╗████╗  ██║██╔══██╗              ║
+  ║                       ██║  ██║██╔██╗ ██║███████║              ║
+  ║                       ██║  ██║██║╚██╗██║██╔══██║              ║
+  ║                       ██████╔╝██║ ╚████║██║  ██║              ║
+  ║                       ╚═════╝ ╚═╝  ╚═══╝╚═╝  ╚═╝              ║
+  ║                                                               ║
+  ║         Autonomous Learning for AI Development Tools          ║
+  ║                   https://contextdna.io                       ║
+  ╚═══════════════════════════════════════════════════════════════╝
+EOF
+    echo -e "${NC}"
+}
+
+# =============================================================================
+# System Detection Functions (Cross-Platform: macOS + Windows/WSL)
+# =============================================================================
+
+# Detect operating system and version
+detect_os() {
+    local os_name=""
+    local os_version=""
+    local os_arch=""
+
+    case "$(uname -s)" in
+        Darwin)
+            os_name="macOS"
+            os_version=$(sw_vers -productVersion 2>/dev/null || echo "Unknown")
+            os_arch=$(uname -m)
+            ;;
+        Linux)
+            # Check if running in WSL
+            if grep -qi microsoft /proc/version 2>/dev/null; then
+                os_name="Windows (WSL)"
+                # Try to get Windows version from WSL
+                if command -v wslsys &>/dev/null; then
+                    os_version=$(wslsys -v 2>/dev/null | head -1 || echo "Unknown")
+                elif [ -f /proc/sys/fs/binfmt_misc/WSLInterop ]; then
+                    os_version="WSL2"
+                else
+                    os_version="WSL1"
+                fi
+            else
+                os_name="Linux"
+                if [ -f /etc/os-release ]; then
+                    os_version=$(grep -oP '(?<=VERSION_ID=").*(?=")' /etc/os-release 2>/dev/null || echo "Unknown")
+                fi
+            fi
+            os_arch=$(uname -m)
+            ;;
+        MINGW*|MSYS*|CYGWIN*)
+            os_name="Windows"
+            os_version=$(cmd.exe /c "ver" 2>/dev/null | grep -oP '\d+\.\d+\.\d+' | head -1 || echo "Unknown")
+            os_arch=$(uname -m)
+            ;;
+        *)
+            os_name="Unknown"
+            os_version="Unknown"
+            os_arch=$(uname -m)
+            ;;
+    esac
+
+    echo "$os_name|$os_version|$os_arch"
+}
+
+# Detect system resources (RAM in GB, CPU cores)
+detect_resources() {
+    local ram_gb=0
+    local cpu_cores=0
+
+    case "$(uname -s)" in
+        Darwin)
+            # macOS
+            local ram_bytes=$(sysctl -n hw.memsize 2>/dev/null || echo 0)
+            ram_gb=$((ram_bytes / 1073741824))
+            cpu_cores=$(sysctl -n hw.ncpu 2>/dev/null || echo 4)
+            ;;
+        Linux)
+            # Linux / WSL
+            local ram_kb=$(grep MemTotal /proc/meminfo 2>/dev/null | awk '{print $2}' || echo 0)
+            ram_gb=$((ram_kb / 1048576))
+            cpu_cores=$(nproc 2>/dev/null || grep -c processor /proc/cpuinfo 2>/dev/null || echo 4)
+            ;;
+        MINGW*|MSYS*|CYGWIN*)
+            # Windows native (Git Bash, etc.)
+            local ram_bytes=$(wmic OS get TotalVisibleMemorySize 2>/dev/null | grep -oP '\d+' | head -1 || echo 0)
+            ram_gb=$((ram_bytes / 1048576))
+            cpu_cores=$(wmic cpu get NumberOfCores 2>/dev/null | grep -oP '\d+' | head -1 || echo 4)
+            ;;
+    esac
+
+    echo "$ram_gb|$cpu_cores"
+}
+
+# Recommend resource profile based on system specs
+recommend_profile() {
+    local ram_gb=$1
+    local cpu_cores=$2
+
+    if [ "$ram_gb" -ge 24 ] && [ "$cpu_cores" -ge 10 ]; then
+        echo "heavy"
+    elif [ "$ram_gb" -ge 12 ] && [ "$cpu_cores" -ge 6 ]; then
+        echo "standard"
+    else
+        echo "light"
+    fi
+}
+
+# Get Docker version compatibility info
+get_docker_info() {
+    local docker_version=$(docker version --format '{{.Server.Version}}' 2>/dev/null || echo "Unknown")
+    local compose_version=$(docker compose version --short 2>/dev/null || echo "Unknown")
+    echo "$docker_version|$compose_version"
+}
+
+# Check if docker is running
+check_docker() {
+    if ! docker info &>/dev/null 2>&1; then
+        echo -e "${RED}Error: Docker is not running${NC}"
+        echo "Please start Docker Desktop and try again."
+        exit 1
+    fi
+}
+
+# Check if compose file exists
+check_compose() {
+    if [ ! -f "$COMPOSE_FILE" ]; then
+        echo -e "${RED}Error: docker-compose.yaml not found at $COMPOSE_FILE${NC}"
+        exit 1
+    fi
+}
+
+# Start services
+cmd_up() {
+    show_banner
+    check_docker
+    check_compose
+
+    local with_llm=false
+    local with_backup=false
+
+    # Parse flags
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --llm|--with-llm)
+                with_llm=true
+                shift
+                ;;
+            --backup|--with-backup)
+                with_backup=true
+                shift
+                ;;
+            *)
+                shift
+                ;;
+        esac
+    done
+
+    echo -e "${GREEN}Starting Context DNA services...${NC}"
+    cd "$CONTEXT_DNA_INFRA_DIR"
+
+    # Build profile flags
+    local profile_flags=""
+    if [ "$with_llm" = true ]; then
+        profile_flags="$profile_flags --profile llm"
+        echo -e "${CYAN}  Including: Local LLM (Ollama)${NC}"
+    fi
+    if [ "$with_backup" = true ]; then
+        profile_flags="$profile_flags --profile backup"
+        echo -e "${CYAN}  Including: S3 Backup${NC}"
+    fi
+
+    docker compose -f "$COMPOSE_FILE" $profile_flags up -d
+
+    echo ""
+    echo -e "${GREEN}✓ Context DNA is starting!${NC}"
+    echo ""
+    echo "  Dashboard:   http://localhost:3000"
+    echo "  API:         http://localhost:8029"
+    echo "  API Docs:    http://localhost:8029/swagger/index.html"
+    echo "  Health:      http://localhost:8029/health"
+    echo "  Tracing:     http://localhost:16686"
+    if [ "$with_llm" = true ]; then
+        echo "  Ollama LLM:  http://localhost:11434"
+    fi
+    echo ""
+    echo -e "Use ${YELLOW}context-dna status${NC} to check service health."
+}
+
+# Stop services
+cmd_down() {
+    show_banner
+    check_docker
+    check_compose
+
+    echo -e "${YELLOW}Stopping Context DNA services...${NC}"
+    cd "$CONTEXT_DNA_INFRA_DIR"
+    docker compose -f "$COMPOSE_FILE" down
+
+    echo -e "${GREEN}✓ Context DNA stopped${NC}"
+}
+
+# Show status
+cmd_status() {
+    show_banner
+    check_docker
+    check_compose
+
+    echo -e "${BLUE}Context DNA Service Status${NC}"
+    echo "========================================"
+    cd "$CONTEXT_DNA_INFRA_DIR"
+    docker compose -f "$COMPOSE_FILE" ps --format "table {{.Name}}\t{{.Status}}\t{{.Ports}}"
+}
+
+# Show logs
+cmd_logs() {
+    check_docker
+    check_compose
+
+    local service="${1:-}"
+    cd "$CONTEXT_DNA_INFRA_DIR"
+
+    if [ -n "$service" ]; then
+        docker compose -f "$COMPOSE_FILE" logs -f "$service"
+    else
+        docker compose -f "$COMPOSE_FILE" logs -f
+    fi
+}
+
+# Restart services
+cmd_restart() {
+    show_banner
+    check_docker
+    check_compose
+
+    echo -e "${YELLOW}Restarting Context DNA services...${NC}"
+    cd "$CONTEXT_DNA_INFRA_DIR"
+    docker compose -f "$COMPOSE_FILE" restart
+
+    echo -e "${GREEN}✓ Context DNA restarted${NC}"
+}
+
+# Pull latest images
+cmd_pull() {
+    show_banner
+    check_docker
+    check_compose
+
+    echo -e "${BLUE}Pulling latest Context DNA images...${NC}"
+    cd "$CONTEXT_DNA_INFRA_DIR"
+    docker compose -f "$COMPOSE_FILE" pull
+
+    echo -e "${GREEN}✓ Images updated${NC}"
+    echo "Run 'context-dna up' to apply updates."
+}
+
+# =============================================================================
+# Resource Management Commands
+# =============================================================================
+
+# Resources: detect system specs and recommend profile
+cmd_resources_detect() {
+    show_banner
+
+    echo -e "${BOLD}${CYAN}═══════════════════════════════════════════════════════════════${NC}"
+    echo -e "${BOLD}${CYAN}             SYSTEM DETECTION & RECOMMENDATIONS                ${NC}"
+    echo -e "${BOLD}${CYAN}═══════════════════════════════════════════════════════════════${NC}"
+    echo ""
+
+    # Detect OS
+    local os_info=$(detect_os)
+    local os_name=$(echo "$os_info" | cut -d'|' -f1)
+    local os_version=$(echo "$os_info" | cut -d'|' -f2)
+    local os_arch=$(echo "$os_info" | cut -d'|' -f3)
+
+    echo -e "${BOLD}🖥️  Operating System${NC}"
+    echo -e "   System:      ${GREEN}$os_name${NC}"
+    echo -e "   Version:     ${GREEN}$os_version${NC}"
+    echo -e "   Architecture:${GREEN} $os_arch${NC}"
+    echo ""
+
+    # Detect resources
+    local resources=$(detect_resources)
+    local ram_gb=$(echo "$resources" | cut -d'|' -f1)
+    local cpu_cores=$(echo "$resources" | cut -d'|' -f2)
+
+    echo -e "${BOLD}💾 System Resources${NC}"
+    echo -e "   RAM:         ${GREEN}${ram_gb}GB${NC}"
+    echo -e "   CPU Cores:   ${GREEN}${cpu_cores}${NC}"
+    echo ""
+
+    # Docker info
+    check_docker
+    local docker_info=$(get_docker_info)
+    local docker_version=$(echo "$docker_info" | cut -d'|' -f1)
+    local compose_version=$(echo "$docker_info" | cut -d'|' -f2)
+
+    echo -e "${BOLD}🐳 Docker Environment${NC}"
+    echo -e "   Docker:      ${GREEN}$docker_version${NC}"
+    echo -e "   Compose:     ${GREEN}$compose_version${NC}"
+    echo ""
+
+    # Recommendation
+    local recommended=$(recommend_profile "$ram_gb" "$cpu_cores")
+
+    echo -e "${BOLD}${CYAN}═══════════════════════════════════════════════════════════════${NC}"
+    echo -e "${BOLD}📊 RECOMMENDED PROFILE${NC}"
+    echo -e "${BOLD}${CYAN}═══════════════════════════════════════════════════════════════${NC}"
+    echo ""
+
+    case "$recommended" in
+        light)
+            echo -e "   Profile:     ${YELLOW}LIGHT${NC}"
+            echo -e "   Reason:      System has ${ram_gb}GB RAM / ${cpu_cores} cores"
+            echo -e "   Allocation:  ~7GB memory, ~8 CPU cores"
+            echo -e "   Best for:    Laptops, resource-constrained environments"
+            ;;
+        standard)
+            echo -e "   Profile:     ${GREEN}STANDARD${NC}"
+            echo -e "   Reason:      System has ${ram_gb}GB RAM / ${cpu_cores} cores"
+            echo -e "   Allocation:  ~14GB memory, ~10 CPU cores"
+            echo -e "   Best for:    Desktop development, most use cases"
+            ;;
+        heavy)
+            echo -e "   Profile:     ${MAGENTA}HEAVY${NC}"
+            echo -e "   Reason:      System has ${ram_gb}GB RAM / ${cpu_cores} cores"
+            echo -e "   Allocation:  ~28GB memory, ~18 CPU cores"
+            echo -e "   Best for:    Production-like development, multiple users"
+            ;;
+    esac
+    echo ""
+    echo -e "   ${BOLD}To apply:${NC} context-dna resources apply $recommended"
+    echo ""
+
+    # Version compatibility matrix
+    echo -e "${BOLD}${CYAN}═══════════════════════════════════════════════════════════════${NC}"
+    echo -e "${BOLD}🔧 SOFTWARE COMPATIBILITY${NC}"
+    echo -e "${BOLD}${CYAN}═══════════════════════════════════════════════════════════════${NC}"
+    echo ""
+    echo -e "   ${BOLD}Component           Installed    Recommended${NC}"
+    echo -e "   ─────────────────────────────────────────────"
+
+    # Docker Desktop version recommendations by OS
+    local docker_recommended="24.0+"
+    if [[ "$os_name" == "macOS" ]]; then
+        if [[ "$os_arch" == "arm64" ]]; then
+            docker_recommended="24.0+ (Apple Silicon optimized)"
+        fi
+    elif [[ "$os_name" == *"Windows"* ]]; then
+        docker_recommended="24.0+ (WSL2 backend)"
+    fi
+
+    echo -e "   Docker             $docker_version       $docker_recommended"
+    echo -e "   Docker Compose     $compose_version       2.20+"
+    echo ""
+
+    # Service versions from compose
+    echo -e "   ${BOLD}Service Images (Pinned Versions):${NC}"
+    echo -e "   ─────────────────────────────────────────────"
+    echo -e "   PostgreSQL+pgvector    pgvector/pgvector:pg16"
+    echo -e "   Redis                  redis:7.4.1"
+    echo -e "   RabbitMQ               rabbitmq:4.0-management"
+    echo -e "   OpenSearch             opensearchproject/opensearch:2.12.0"
+    echo -e "   Jaeger                 jaegertracing/all-in-one:1.64.0"
+    echo -e "   SeaweedFS              chrislusf/seaweedfs:3.80"
+    echo -e "   Ollama (optional)      ollama/ollama:0.5.4"
+    echo ""
+}
+
+# Resources: apply a profile
+cmd_resources_apply() {
+    local profile="${1:-}"
+
+    if [ -z "$profile" ]; then
+        echo -e "${RED}Error: Please specify a profile (light, standard, heavy)${NC}"
+        echo "Usage: context-dna resources apply <profile>"
+        exit 1
+    fi
+
+    if [[ ! "$profile" =~ ^(light|standard|heavy)$ ]]; then
+        echo -e "${RED}Error: Invalid profile '$profile'${NC}"
+        echo "Valid profiles: light, standard, heavy"
+        exit 1
+    fi
+
+    show_banner
+    echo -e "${BLUE}Applying resource profile: ${BOLD}$profile${NC}"
+    echo ""
+
+    # Define resource limits per profile
+    case "$profile" in
+        light)
+            PG_MEMORY="512m"; PG_CPUS="0.5"
+            REDIS_MEMORY="128m"; REDIS_CPUS="0.25"
+            RABBITMQ_MEMORY="256m"; RABBITMQ_CPUS="0.25"
+            SEAWEEDFS_MEMORY="256m"; SEAWEEDFS_CPUS="0.5"
+            OPENSEARCH_MEMORY="512m"; OPENSEARCH_CPUS="0.5"; OPENSEARCH_HEAP="256m"
+            JAEGER_MEMORY="256m"; JAEGER_CPUS="0.25"
+            CORE_MEMORY="512m"; CORE_CPUS="0.5"
+            API_MEMORY="256m"; API_CPUS="0.25"
+            UI_MEMORY="256m"; UI_CPUS="0.25"
+            HELPER_AGENT_MEMORY="256m"; HELPER_AGENT_CPUS="0.25"
+            OLLAMA_MEMORY="4g"; OLLAMA_CPUS="2"
+            ;;
+        standard)
+            PG_MEMORY="1g"; PG_CPUS="1"
+            REDIS_MEMORY="256m"; REDIS_CPUS="0.5"
+            RABBITMQ_MEMORY="512m"; RABBITMQ_CPUS="0.5"
+            SEAWEEDFS_MEMORY="512m"; SEAWEEDFS_CPUS="1"
+            OPENSEARCH_MEMORY="1g"; OPENSEARCH_CPUS="1"; OPENSEARCH_HEAP="512m"
+            JAEGER_MEMORY="512m"; JAEGER_CPUS="0.5"
+            CORE_MEMORY="1g"; CORE_CPUS="1"
+            API_MEMORY="512m"; API_CPUS="0.5"
+            UI_MEMORY="512m"; UI_CPUS="0.5"
+            HELPER_AGENT_MEMORY="512m"; HELPER_AGENT_CPUS="0.5"
+            OLLAMA_MEMORY="8g"; OLLAMA_CPUS="4"
+            ;;
+        heavy)
+            PG_MEMORY="2g"; PG_CPUS="2"
+            REDIS_MEMORY="512m"; REDIS_CPUS="1"
+            RABBITMQ_MEMORY="1g"; RABBITMQ_CPUS="1"
+            SEAWEEDFS_MEMORY="1g"; SEAWEEDFS_CPUS="2"
+            OPENSEARCH_MEMORY="2g"; OPENSEARCH_CPUS="2"; OPENSEARCH_HEAP="1g"
+            JAEGER_MEMORY="1g"; JAEGER_CPUS="1"
+            CORE_MEMORY="2g"; CORE_CPUS="2"
+            API_MEMORY="1g"; API_CPUS="1"
+            UI_MEMORY="1g"; UI_CPUS="1"
+            HELPER_AGENT_MEMORY="1g"; HELPER_AGENT_CPUS="1"
+            OLLAMA_MEMORY="16g"; OLLAMA_CPUS="6"
+            ;;
+    esac
+
+    # Create or update .env file
+    cat > "$ENV_FILE" << EOF
+# Context DNA Resource Configuration
+# Generated by: context-dna resources apply $profile
+# Date: $(date -Iseconds)
+# Profile: $profile
+
+# PostgreSQL
+PG_MEMORY=$PG_MEMORY
+PG_CPUS=$PG_CPUS
+
+# Redis
+REDIS_MEMORY=$REDIS_MEMORY
+REDIS_CPUS=$REDIS_CPUS
+
+# RabbitMQ
+RABBITMQ_MEMORY=$RABBITMQ_MEMORY
+RABBITMQ_CPUS=$RABBITMQ_CPUS
+
+# SeaweedFS
+SEAWEEDFS_MEMORY=$SEAWEEDFS_MEMORY
+SEAWEEDFS_CPUS=$SEAWEEDFS_CPUS
+
+# OpenSearch
+OPENSEARCH_MEMORY=$OPENSEARCH_MEMORY
+OPENSEARCH_CPUS=$OPENSEARCH_CPUS
+OPENSEARCH_HEAP=$OPENSEARCH_HEAP
+
+# Jaeger
+JAEGER_MEMORY=$JAEGER_MEMORY
+JAEGER_CPUS=$JAEGER_CPUS
+
+# Context DNA Core
+CORE_MEMORY=$CORE_MEMORY
+CORE_CPUS=$CORE_CPUS
+
+# Context DNA API
+API_MEMORY=$API_MEMORY
+API_CPUS=$API_CPUS
+
+# Context DNA UI
+UI_MEMORY=$UI_MEMORY
+UI_CPUS=$UI_CPUS
+
+# Helper Agent
+HELPER_AGENT_MEMORY=$HELPER_AGENT_MEMORY
+HELPER_AGENT_CPUS=$HELPER_AGENT_CPUS
+
+# Ollama (Local LLM)
+OLLAMA_MEMORY=$OLLAMA_MEMORY
+OLLAMA_CPUS=$OLLAMA_CPUS
+EOF
+
+    # Update resource-profiles.yaml with active profile
+    if [ -f "$RESOURCE_PROFILES" ]; then
+        sed -i.bak "s/^active_profile:.*/active_profile: $profile/" "$RESOURCE_PROFILES" 2>/dev/null || \
+            sed -i '' "s/^active_profile:.*/active_profile: $profile/" "$RESOURCE_PROFILES"
+        rm -f "${RESOURCE_PROFILES}.bak" 2>/dev/null
+    fi
+
+    echo -e "${GREEN}✓ Resource profile '$profile' applied to .env${NC}"
+    echo ""
+    echo -e "${BOLD}Resource Limits:${NC}"
+    echo "  ┌────────────────────┬──────────┬──────────┐"
+    echo "  │ Service            │ Memory   │ CPUs     │"
+    echo "  ├────────────────────┼──────────┼──────────┤"
+    printf "  │ %-18s │ %-8s │ %-8s │\n" "PostgreSQL" "$PG_MEMORY" "$PG_CPUS"
+    printf "  │ %-18s │ %-8s │ %-8s │\n" "Redis" "$REDIS_MEMORY" "$REDIS_CPUS"
+    printf "  │ %-18s │ %-8s │ %-8s │\n" "RabbitMQ" "$RABBITMQ_MEMORY" "$RABBITMQ_CPUS"
+    printf "  │ %-18s │ %-8s │ %-8s │\n" "SeaweedFS" "$SEAWEEDFS_MEMORY" "$SEAWEEDFS_CPUS"
+    printf "  │ %-18s │ %-8s │ %-8s │\n" "OpenSearch" "$OPENSEARCH_MEMORY" "$OPENSEARCH_CPUS"
+    printf "  │ %-18s │ %-8s │ %-8s │\n" "Jaeger" "$JAEGER_MEMORY" "$JAEGER_CPUS"
+    printf "  │ %-18s │ %-8s │ %-8s │\n" "Core" "$CORE_MEMORY" "$CORE_CPUS"
+    printf "  │ %-18s │ %-8s │ %-8s │\n" "API" "$API_MEMORY" "$API_CPUS"
+    printf "  │ %-18s │ %-8s │ %-8s │\n" "UI" "$UI_MEMORY" "$UI_CPUS"
+    printf "  │ %-18s │ %-8s │ %-8s │\n" "Helper Agent" "$HELPER_AGENT_MEMORY" "$HELPER_AGENT_CPUS"
+    printf "  │ %-18s │ %-8s │ %-8s │\n" "Ollama (LLM)" "$OLLAMA_MEMORY" "$OLLAMA_CPUS"
+    echo "  └────────────────────┴──────────┴──────────┘"
+    echo ""
+    echo -e "${YELLOW}Note:${NC} Run 'context-dna restart' to apply new limits."
+}
+
+# Resources: show current usage vs limits
+cmd_resources_status() {
+    show_banner
+    check_docker
+    check_compose
+
+    echo -e "${BOLD}${CYAN}═══════════════════════════════════════════════════════════════${NC}"
+    echo -e "${BOLD}${CYAN}             RESOURCE USAGE STATUS                             ${NC}"
+    echo -e "${BOLD}${CYAN}═══════════════════════════════════════════════════════════════${NC}"
+    echo ""
+
+    # Get current profile
+    local current_profile="(not set)"
+    if [ -f "$RESOURCE_PROFILES" ]; then
+        current_profile=$(grep "^active_profile:" "$RESOURCE_PROFILES" 2>/dev/null | cut -d: -f2 | tr -d ' ' || echo "(not set)")
+    fi
+    echo -e "${BOLD}Active Profile:${NC} ${GREEN}$current_profile${NC}"
+    echo ""
+
+    # Show docker stats
+    echo -e "${BOLD}Live Resource Usage:${NC}"
+    cd "$CONTEXT_DNA_INFRA_DIR"
+    docker stats --no-stream --format "table {{.Name}}\t{{.CPUPerc}}\t{{.MemUsage}}\t{{.MemPerc}}" 2>/dev/null | \
+        grep -E "^(NAME|contextdna)" || echo "No running Context DNA containers"
+    echo ""
+
+    # Show configured limits from .env if exists
+    if [ -f "$ENV_FILE" ]; then
+        echo -e "${BOLD}Configured Limits (from .env):${NC}"
+        grep -E "^(PG_|REDIS_|RABBITMQ_|SEAWEEDFS_|OPENSEARCH_|JAEGER_|CORE_|API_|UI_|HELPER_|OLLAMA_)(MEMORY|CPUS|HEAP)=" "$ENV_FILE" 2>/dev/null | \
+            sed 's/_MEMORY=/ Memory: /g; s/_CPUS=/ CPUs: /g; s/_HEAP=/ Heap: /g' | \
+            column -t -s'=' 2>/dev/null || cat
+    else
+        echo -e "${YELLOW}No .env file found. Using docker-compose defaults.${NC}"
+        echo "Run 'context-dna resources apply <profile>' to set resource limits."
+    fi
+}
+
+# Resources: main dispatcher
+cmd_resources() {
+    local subcmd="${1:-}"
+    shift || true
+
+    case "$subcmd" in
+        detect|info)
+            cmd_resources_detect "$@"
+            ;;
+        apply|set)
+            cmd_resources_apply "$@"
+            ;;
+        status|show)
+            cmd_resources_status "$@"
+            ;;
+        ""|help)
+            echo -e "${BOLD}Resource Management Commands${NC}"
+            echo ""
+            echo "Usage: context-dna resources <command>"
+            echo ""
+            echo "Commands:"
+            echo "  detect    Detect system specs and recommend profile"
+            echo "  apply     Apply a resource profile (light|standard|heavy)"
+            echo "  status    Show current resource usage vs limits"
+            echo ""
+            echo "Examples:"
+            echo "  context-dna resources detect"
+            echo "  context-dna resources apply standard"
+            echo "  context-dna resources status"
+            ;;
+        *)
+            echo -e "${RED}Unknown resources command: $subcmd${NC}"
+            echo "Run 'context-dna resources help' for usage."
+            exit 1
+            ;;
+    esac
+}
+
+# =============================================================================
+# Local LLM (Ollama) Commands
+# =============================================================================
+
+# LLM: enable local LLM profile
+cmd_llm_enable() {
+    show_banner
+    check_docker
+    check_compose
+
+    echo -e "${BLUE}Enabling local LLM (Ollama) profile...${NC}"
+    echo ""
+
+    # Check if .env exists
+    if [ ! -f "$ENV_FILE" ]; then
+        echo -e "${YELLOW}No .env file found. Creating with default standard profile...${NC}"
+        cmd_resources_apply "standard" > /dev/null
+    fi
+
+    # Add LLM enabled flag
+    if grep -q "^LLM_ENABLED=" "$ENV_FILE" 2>/dev/null; then
+        sed -i.bak 's/^LLM_ENABLED=.*/LLM_ENABLED=true/' "$ENV_FILE" 2>/dev/null || \
+            sed -i '' 's/^LLM_ENABLED=.*/LLM_ENABLED=true/' "$ENV_FILE"
+    else
+        echo "" >> "$ENV_FILE"
+        echo "# Local LLM" >> "$ENV_FILE"
+        echo "LLM_ENABLED=true" >> "$ENV_FILE"
+    fi
+    rm -f "${ENV_FILE}.bak" 2>/dev/null
+
+    echo -e "${GREEN}✓ Local LLM profile enabled${NC}"
+    echo ""
+    echo "To start with LLM:"
+    echo "  context-dna up --llm"
+    echo ""
+    echo "Or start Ollama separately:"
+    echo "  cd $CONTEXT_DNA_INFRA_DIR && docker compose --profile llm up -d contextdna-ollama"
+}
+
+# LLM: pull a model
+cmd_llm_pull() {
+    local model="${1:-qwen2.5:7b}"
+
+    check_docker
+
+    echo -e "${BLUE}Pulling model: ${BOLD}$model${NC}"
+    echo ""
+
+    # Check if Ollama is running
+    if ! docker ps --format '{{.Names}}' | grep -q "contextdna-ollama"; then
+        echo -e "${YELLOW}Ollama is not running. Starting it first...${NC}"
+        cd "$CONTEXT_DNA_INFRA_DIR"
+        docker compose --profile llm up -d contextdna-ollama
+        echo "Waiting for Ollama to be ready..."
+        sleep 5
+    fi
+
+    # Pull the model
+    docker exec -it contextdna-ollama ollama pull "$model"
+
+    echo ""
+    echo -e "${GREEN}✓ Model '$model' pulled successfully${NC}"
+}
+
+# LLM: list available models
+cmd_llm_list() {
+    check_docker
+
+    echo -e "${BOLD}${CYAN}Available Ollama Models${NC}"
+    echo ""
+
+    # Check if Ollama is running
+    if ! docker ps --format '{{.Names}}' | grep -q "contextdna-ollama"; then
+        echo -e "${YELLOW}Ollama is not running.${NC}"
+        echo "Start it with: context-dna up --llm"
+        echo ""
+        echo -e "${BOLD}Recommended models for Context DNA:${NC}"
+        echo "  qwen2.5:3b     (~2GB)  Fast, good for simple tasks"
+        echo "  qwen2.5:7b     (~4GB)  Balanced, recommended"
+        echo "  llama3.2:3b    (~2GB)  Good for conversation"
+        echo "  mistral:7b     (~4GB)  Great for code"
+        return
+    fi
+
+    echo -e "${BOLD}Installed models:${NC}"
+    docker exec contextdna-ollama ollama list 2>/dev/null || echo "  (none)"
+    echo ""
+    echo -e "${BOLD}Pull new models with:${NC}"
+    echo "  context-dna llm pull qwen2.5:7b"
+}
+
+# LLM: check status
+cmd_llm_status() {
+    check_docker
+
+    echo -e "${BOLD}${CYAN}Local LLM Status${NC}"
+    echo ""
+
+    # Check if Ollama is running
+    if docker ps --format '{{.Names}}' | grep -q "contextdna-ollama"; then
+        echo -e "Status:     ${GREEN}Running${NC}"
+
+        # Get container stats
+        local stats=$(docker stats --no-stream --format "{{.CPUPerc}}\t{{.MemUsage}}" contextdna-ollama 2>/dev/null)
+        local cpu=$(echo "$stats" | cut -f1)
+        local mem=$(echo "$stats" | cut -f2)
+
+        echo -e "CPU:        $cpu"
+        echo -e "Memory:     $mem"
+        echo -e "API:        http://localhost:11434"
+        echo ""
+
+        # List models
+        echo -e "${BOLD}Loaded models:${NC}"
+        docker exec contextdna-ollama ollama list 2>/dev/null || echo "  (none)"
+    else
+        echo -e "Status:     ${YELLOW}Not running${NC}"
+        echo ""
+        echo "Start with: context-dna up --llm"
+    fi
+}
+
+# LLM: main dispatcher
+cmd_llm() {
+    local subcmd="${1:-}"
+    shift || true
+
+    case "$subcmd" in
+        enable)
+            cmd_llm_enable "$@"
+            ;;
+        pull|download)
+            cmd_llm_pull "$@"
+            ;;
+        list|ls|models)
+            cmd_llm_list "$@"
+            ;;
+        status)
+            cmd_llm_status "$@"
+            ;;
+        ""|help)
+            echo -e "${BOLD}Local LLM (Ollama) Commands${NC}"
+            echo ""
+            echo "Usage: context-dna llm <command>"
+            echo ""
+            echo "Commands:"
+            echo "  enable    Enable local LLM profile"
+            echo "  pull      Pull/download a model (default: qwen2.5:7b)"
+            echo "  list      List installed models"
+            echo "  status    Show Ollama status and resources"
+            echo ""
+            echo "Examples:"
+            echo "  context-dna llm enable"
+            echo "  context-dna llm pull qwen2.5:7b"
+            echo "  context-dna llm list"
+            echo "  context-dna up --llm"
+            ;;
+        *)
+            echo -e "${RED}Unknown llm command: $subcmd${NC}"
+            echo "Run 'context-dna llm help' for usage."
+            exit 1
+            ;;
+    esac
+}
+
+# Show help
+cmd_help() {
+    show_banner
+    echo "Usage: context-dna <command> [options]"
+    echo ""
+    echo -e "${BOLD}Core Commands:${NC}"
+    echo "  up [--llm]    Start Context DNA services (--llm includes local LLM)"
+    echo "  down          Stop Context DNA services"
+    echo "  status        Show service status"
+    echo "  logs          Show service logs (optionally specify service name)"
+    echo "  restart       Restart all services"
+    echo "  pull          Pull latest images"
+    echo ""
+    echo -e "${BOLD}Resource Management:${NC}"
+    echo "  resources detect     Auto-detect system specs and recommend profile"
+    echo "  resources apply      Apply a profile (light|standard|heavy)"
+    echo "  resources status     Show current resource usage vs limits"
+    echo ""
+    echo -e "${BOLD}Local LLM (Ollama):${NC}"
+    echo "  llm enable           Enable local LLM profile"
+    echo "  llm pull [model]     Pull/download a model"
+    echo "  llm list             List installed models"
+    echo "  llm status           Show Ollama status"
+    echo ""
+    echo -e "${BOLD}Examples:${NC}"
+    echo "  context-dna resources detect      # Check system & get recommendation"
+    echo "  context-dna resources apply heavy # Apply heavy profile"
+    echo "  context-dna up                    # Start all services"
+    echo "  context-dna up --llm              # Start with local LLM"
+    echo "  context-dna llm pull qwen2.5:7b   # Download a model"
+    echo "  context-dna status                # Check health of services"
+    echo "  context-dna logs contextdna-api   # View API logs"
+    echo ""
+    echo -e "${BOLD}Quick Start:${NC}"
+    echo "  1. context-dna resources detect   # See your system specs"
+    echo "  2. context-dna resources apply    # Apply recommended profile"
+    echo "  3. context-dna up                 # Start services"
+    echo ""
+    echo "Environment Variables:"
+    echo "  CONTEXT_DNA_INFRA_DIR    Path to context-dna/infra directory"
+    echo "                     Default: ~/dev/er-simulator-superrepo/context-dna/infra"
+    echo ""
+    echo "Attribution:"
+    echo "  Powered by open-source components from Acontext"
+    echo "  (https://github.com/memodb-io/Acontext)"
+    echo "  Licensed under Apache License, Version 2.0"
+}
+
+# Version info
+cmd_version() {
+    echo "Context DNA CLI v1.0.0"
+    echo ""
+    echo "Powered by open-source components from Acontext"
+    echo "(https://github.com/memodb-io/Acontext)"
+    echo "Licensed under Apache License, Version 2.0"
+}
+
+# Main command dispatcher
+main() {
+    local cmd="${1:-help}"
+    shift || true
+
+    case "$cmd" in
+        up|start)
+            cmd_up "$@"
+            ;;
+        down|stop)
+            cmd_down "$@"
+            ;;
+        status|ps)
+            cmd_status "$@"
+            ;;
+        logs)
+            cmd_logs "$@"
+            ;;
+        restart)
+            cmd_restart "$@"
+            ;;
+        pull|update)
+            cmd_pull "$@"
+            ;;
+        resources|res)
+            cmd_resources "$@"
+            ;;
+        llm|ollama)
+            cmd_llm "$@"
+            ;;
+        help|--help|-h)
+            cmd_help
+            ;;
+        version|--version|-v)
+            cmd_version
+            ;;
+        *)
+            echo -e "${RED}Unknown command: $cmd${NC}"
+            echo "Run 'context-dna help' for usage information."
+            exit 1
+            ;;
+    esac
+}
+
+main "$@"

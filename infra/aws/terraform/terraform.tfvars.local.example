@@ -1,0 +1,12 @@
+# Copy this file to terraform.tfvars.local and fill in your actual values
+# terraform.tfvars.local is gitignored for security
+
+aws_access_key_id     = "YOUR_AWS_ACCESS_KEY_ID_HERE"
+aws_secret_access_key = "YOUR_AWS_SECRET_ACCESS_KEY_HERE"
+
+# Override the default db_password
+db_password = "YOUR_SECURE_DB_PASSWORD_HERE"
+
+# LiveKit credentials for self-hosted voice stack
+secret_livekit_api_key    = "YOUR_LIVEKIT_API_KEY"
+secret_livekit_api_secret = "YOUR_LIVEKIT_API_SECRET"

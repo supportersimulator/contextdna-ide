@@ -202,7 +202,7 @@ class EvidenceHandler(BaseHTTPRequestHandler):
             try:
                 self._send_json({"error": "internal"}, 500)
             except Exception:
-                pass
+                _bump("evidence_response_write_errors")  # zsf-allow: socket already broken, nothing to do
 
     def _handle_sse(self):
         """SSE: poll DB every SSE_POLL_INTERVAL seconds, push new rows."""
@@ -230,7 +230,7 @@ class EvidenceHandler(BaseHTTPRequestHandler):
                     last_id = row[0]
                 conn.close()
         except Exception:
-            pass
+            _bump("sse_init_errors")  # zsf-allow: SSE last_id lookup failed — stream starts from head
 
         # Send initial heartbeat comment
         try:
@@ -375,7 +375,7 @@ def _run_mcp_stdio() -> None:
         except json.JSONDecodeError:
             _mcp_error("Parse error", None, -32700)
         except Exception:
-            pass  # ZSF — never crash the stdio loop
+            _bump("stdio_loop_errors")  # zsf-allow: stdio loop must not crash — error counted
 
 
 # ── Entry point ───────────────────────────────────────────────────────────────

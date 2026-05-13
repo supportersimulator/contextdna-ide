@@ -1,0 +1,173 @@
+name: Roadmap - weekly orphan reconcile + report
+
+on:
+  schedule:
+    # Mondays 9am Pacific (17:00 UTC standard; DST shifts, but good enough for weekly cadence)
+    - cron: "0 17 * * 1"
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+  issues: write
+
+# Freeze gate (CI budget=$0 directive 2026-05-06, lift ~2026-05-13).
+# When repo variable FLEET_PUSH_FREEZE='1' (default), the reconcile job is skipped.
+# Toggle: gh variable set FLEET_PUSH_FREEZE --body "0"   # or via Actions UI
+# See scripts/lift-freeze.sh / scripts/restore-freeze.sh and
+# .fleet/audits/2026-05-04-N3-ci-freeze-lift-prep.md for full context.
+
+jobs:
+  reconcile:
+    if: ${{ vars.FLEET_PUSH_FREEZE != '1' }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Reconcile roadmap-labeled items into Master Roadmap + report
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.PROJECTS_TOKEN }}
+          script: |
+            const OWNER = 'supportersimulator';
+            const PROJECT_ID = process.env.PROJECT_ID;
+            const ROADMAP_LABEL = 'roadmap';
+
+            const repos = [
+              'er-simulator-app-frontend',
+              'er-simulator-superrepo',
+              'er-sim-monitor',
+              'v0-er-sim-admin',
+              'er-simulator-landing-page',
+              'ersim-nasa-control-panel',
+            ];
+
+            async function graphql(query, variables) {
+              const res = await github.graphql(query, variables);
+              return res;
+            }
+
+            async function searchRoadmapItems(repo) {
+              // Use Search API because it's the simplest way to query label:roadmap across both Issues + PRs.
+              // Note: Search API is rate-limited; we keep it small (these repos have low volume).
+              const q = `repo:${OWNER}/${repo} label:${ROADMAP_LABEL}`;
+              const items = [];
+              let page = 1;
+              while (true) {
+                const resp = await github.rest.search.issuesAndPullRequests({ q, per_page: 100, page });
+                items.push(...resp.data.items);
+                if (resp.data.items.length < 100) break;
+                page += 1;
+                if (page > 10) break; // hard stop safety
+              }
+              return items;
+            }
+
+            async function getProjectItemIdForContent(contentNodeId) {
+              const data = await graphql(
+                `
+                query($contentId:ID!){
+                  node(id:$contentId){
+                    __typename
+                    ... on Issue { projectItems(first:50){ nodes { id project { id } } } }
+                    ... on PullRequest { projectItems(first:50){ nodes { id project { id } } } }
+                  }
+                }`,
+                { contentId: contentNodeId }
+              );
+              const nodes = data?.node?.projectItems?.nodes ?? [];
+              const match = nodes.find(n => n?.project?.id === PROJECT_ID);
+              return match?.id ?? null;
+            }
+
+            async function addToProject(contentNodeId) {
+              const data = await graphql(
+                `
+                mutation($projectId:ID!, $contentId:ID!){
+                  addProjectV2ItemById(input:{projectId:$projectId, contentId:$contentId}) {
+                    item { id }
+                  }
+                }`,
+                { projectId: PROJECT_ID, contentId: contentNodeId }
+              );
+              return data?.addProjectV2ItemById?.item?.id ?? null;
+            }
+
+            async function upsertReportIssue(body) {
+              const title = 'Weekly Roadmap Orphans Report';
+              // Find existing open report issue (by title).
+              const existing = await github.rest.search.issuesAndPullRequests({
+                q: `repo:${OWNER}/${context.repo.repo} is:issue is:open in:title \"${title}\"`,
+                per_page: 5,
+              });
+              const found = (existing.data.items || []).find(i => i.title === title);
+              if (found) {
+                await github.rest.issues.update({
+                  owner: OWNER,
+                  repo: context.repo.repo,
+                  issue_number: found.number,
+                  body,
+                });
+                return found.html_url;
+              }
+              const created = await github.rest.issues.create({
+                owner: OWNER,
+                repo: context.repo.repo,
+                title,
+                body,
+              });
+              return created.data.html_url;
+            }
+
+            const now = new Date().toISOString();
+            const added = [];
+            const alreadyIn = [];
+            const failed = [];
+
+            for (const repo of repos) {
+              const items = await searchRoadmapItems(repo);
+              for (const it of items) {
+                const contentNodeId = it.node_id;
+                if (!contentNodeId) continue;
+                try {
+                  let itemId = await getProjectItemIdForContent(contentNodeId);
+                  if (itemId) {
+                    alreadyIn.push({ repo, url: it.html_url, title: it.title });
+                    continue;
+                  }
+                  itemId = await addToProject(contentNodeId);
+                  if (itemId) {
+                    added.push({ repo, url: it.html_url, title: it.title });
+                  } else {
+                    failed.push({ repo, url: it.html_url, title: it.title, error: 'addToProject returned null' });
+                  }
+                } catch (e) {
+                  failed.push({ repo, url: it.html_url, title: it.title, error: String(e?.message ?? e) });
+                }
+              }
+            }
+
+            const lines = [];
+            lines.push(`Generated: ${now}`);
+            lines.push('');
+            lines.push(`Master Roadmap Project ID: \`${PROJECT_ID}\``);
+            lines.push('');
+
+            lines.push(`## Added to Project (${added.length})`);
+            if (added.length === 0) lines.push('- (none)');
+            for (const a of added) lines.push(`- ${a.repo}: ${a.title} (${a.url})`);
+            lines.push('');
+
+            lines.push(`## Already in Project (${alreadyIn.length})`);
+            if (alreadyIn.length === 0) lines.push('- (none)');
+            else lines.push('- (omitted for brevity)');
+            lines.push('');
+
+            lines.push(`## Failures (${failed.length})`);
+            if (failed.length === 0) lines.push('- (none)');
+            for (const f of failed) lines.push(`- ${f.repo}: ${f.title} (${f.url}) — ${f.error}`);
+            lines.push('');
+
+            const reportUrl = await upsertReportIssue(lines.join('\n'));
+            core.info(`Report updated: ${reportUrl}`);
+        env:
+          PROJECT_ID: PVT_kwHODj9o384BLGah
+
+

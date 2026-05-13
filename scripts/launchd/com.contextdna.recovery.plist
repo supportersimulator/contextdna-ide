@@ -1,0 +1,54 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.contextdna.recovery</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>__USER_HOME__/dev/er-simulator-superrepo/.venv/bin/python3</string>
+        <string>__USER_HOME__/dev/er-simulator-superrepo/scripts/startup_recovery.py</string>
+    </array>
+
+    <!-- Run at login -->
+    <key>RunAtLoad</key>
+    <true/>
+
+    <!-- Also run when waking from sleep (Docker often needs recovery) -->
+    <key>StartOnMount</key>
+    <true/>
+
+    <!-- Environment -->
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PYTHONPATH</key>
+        <string>__USER_HOME__/dev/er-simulator-superrepo:__USER_HOME__/dev/er-simulator-superrepo/context-dna/src</string>
+        <key>PATH</key>
+        <string>/usr/local/bin:/usr/bin:/bin:/opt/homebrew/bin</string>
+    </dict>
+
+    <!-- Logging -->
+    <key>StandardOutPath</key>
+    <string>/tmp/contextdna-recovery.log</string>
+    <key>StandardErrorPath</key>
+    <string>/tmp/contextdna-recovery.err</string>
+
+    <!-- Resource limits -->
+    <key>ProcessType</key>
+    <string>Background</string>
+
+    <key>Nice</key>
+    <integer>10</integer>
+
+    <!-- Retry on failure -->
+    <key>KeepAlive</key>
+    <dict>
+        <key>SuccessfulExit</key>
+        <false/>
+    </dict>
+
+    <key>ThrottleInterval</key>
+    <integer>300</integer>
+</dict>
+</plist>

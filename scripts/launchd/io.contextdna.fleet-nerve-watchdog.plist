@@ -1,0 +1,57 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <!--
+    FLEET-NERVE WATCHDOG — Liveness probe + auto-respawn trigger.
+
+    WHY: launchd KeepAlive=true on io.contextdna.fleet-nats respawns CRASHES
+    but cannot detect a HUNG daemon (process alive, /health socket dead).
+    This watchdog probes /health every 60s, SIGKILLs the daemon after 3
+    consecutive failures (= ~3 minutes of unresponsiveness), and lets
+    KeepAlive bring it back fresh.
+
+    Counter: watchdog_kicks_total persists in /tmp/fleet-nerve-watchdog.state
+    Logs:    /tmp/fleet-nerve-watchdog.log (one line per probe outcome)
+
+    Install (idempotent):
+        bash scripts/install-launchd-plists.sh fleet-nerve-watchdog
+
+    Bootout / uninstall:
+        launchctl bootout gui/$(id -u) ~/Library/LaunchAgents/io.contextdna.fleet-nerve-watchdog.plist
+        rm ~/Library/LaunchAgents/io.contextdna.fleet-nerve-watchdog.plist
+    -->
+
+    <key>Label</key>
+    <string>io.contextdna.fleet-nerve-watchdog</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/bash</string>
+        <string>__USER_HOME__/dev/er-simulator-superrepo/scripts/fleet-nerve-watchdog.sh</string>
+    </array>
+
+    <key>StartInterval</key>
+    <integer>60</integer>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>StandardOutPath</key>
+    <string>/tmp/fleet-nerve-watchdog.stdout.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>/tmp/fleet-nerve-watchdog.stderr.log</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin</string>
+        <key>HOME</key>
+        <string>__USER_HOME__</string>
+    </dict>
+
+    <key>ThrottleInterval</key>
+    <integer>60</integer>
+</dict>
+</plist>

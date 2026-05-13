@@ -1,141 +1,204 @@
-# Context DNA Background Helper Agent
-# The subconscious mind - autonomous background processing
+# =============================================================================
+# Context DNA Helper Agent — Mothership Image
+# -----------------------------------------------------------------------------
+# Purpose:
+#   Single image for three Mothership services:
+#     1. helper-agent   (FastAPI subconscious, default CMD: api)
+#     2. celery-worker  (background tasks: scanner, distiller, relevance, llm,
+#                        brain, celery queues)
+#     3. celery-beat    (cron scheduler)
 #
-# This image supports multiple entry points:
-# - API Service (FastAPI) - default
-# - Celery Worker (background tasks)
-# - Celery Beat (scheduler)
+#   This file replaces the live-tree gap left when memory/Dockerfile.agent was
+#   removed from the production memory/ snapshot. The April-26 backup
+#   (memory.bak.20260426/Dockerfile.agent) is the source of truth that this
+#   port-forwards from. Diffs vs the .bak snapshot are documented inline.
 #
-# Usage:
-#   # Run API service (default)
-#   docker run contextdna-agent
+# Build context:
+#   The companion compose files (contextdna-ide-oss/draft/docker-compose.
+#   {heavy,lite}.yml) use `build.context: ../../memory` and `dockerfile:
+#   Dockerfile.agent`. The Dockerfile is therefore designed to be invoked
+#   with the build context set to the *memory/* directory:
 #
-#   # Run Celery worker
-#   docker run contextdna-agent celery-worker
+#     # From inside contextdna-ide-oss/draft/ (compose handles this):
+#     docker compose -f docker-compose.heavy.yml build helper-agent
 #
-#   # Run Celery beat scheduler
-#   docker run contextdna-agent celery-beat
+#     # Or, manually from the repo root:
+#     docker build \
+#       -f contextdna-ide-oss/migrate/memory/Dockerfile.agent \
+#       -t contextdna/helper-agent:latest \
+#       memory/
 #
-#   # Run worker + beat together
-#   docker run contextdna-agent celery-all
+#   The COPY commands assume `.` == the memory/ tree. Do NOT invoke with
+#   context set to the repo root (it will COPY the entire monorepo).
 #
-# SYNAPTIC 8TH INTELLIGENCE (SUPERHERO MODE)
-# ===========================================
-# Spawned agents can query Synaptic mid-task for patterns, intuitions, and gotchas.
+# Build tags:
+#   docker build ... -t contextdna/helper-agent:latest  memory/
+#   docker build ... -t contextdna/celery-worker:latest memory/
+#   docker build ... -t contextdna/celery-beat:latest   memory/
+#   (The single image serves all three roles; CMD selects the role.)
 #
-# Endpoint: POST http://localhost:8080/contextdna/8th-intelligence
-# Parameters:
-#   - subtask: What the agent is working on (required)
-#   - agent_id: Agent identifier for tracking (optional)
-#   - context: Additional context (optional)
+# Environment variables consumed at runtime (with defaults baked in):
+#   POSTGRES / DATABASE: DATABASE_HOST, DATABASE_PORT, DATABASE_USER,
+#                        DATABASE_PASSWORD, DATABASE_NAME, POSTGRES_URL
+#   REDIS:               REDIS_HOST, REDIS_PORT, REDIS_PASSWORD, REDIS_URL
+#   RABBITMQ:            RABBITMQ_HOST, RABBITMQ_PORT, RABBITMQ_USER,
+#                        RABBITMQ_PASSWORD
+#   NATS:                NATS_URL
+#   LLM:                 OLLAMA_URL, MLX_SERVER_URL
+#   AGENT:               MODE (lite|heavy), WORK_LOG_PATH,
+#                        BRAIN_CYCLE_INTERVAL, SUCCESS_DETECTION_INTERVAL,
+#                        EVOLUTION_INTERVAL
+#   S3:                  S3_ENDPOINT, S3_BUCKET, S3_ACCESS_KEY, S3_SECRET_KEY
 #
-# Quick query from shell:
-#   curl -s -X POST "http://localhost:8080/contextdna/8th-intelligence?subtask=deploying+terraform"
+# Endpoints:
+#   GET  http://localhost:8080/health  — liveness + ZSF failure counters
+#   POST http://localhost:8080/contextdna/8th-intelligence — Synaptic query
 #
-# Or use the helper script:
-#   ./scripts/ask-synaptic.sh "deploying terraform" "my-agent-id"
-#
-# Response includes:
-#   - patterns: Past work patterns relevant to this task
-#   - gotchas: Warnings to avoid (learned from past mistakes)
-#   - intuitions: Professor's wisdom for this domain
-#   - stop_signal: If set, STOP immediately and verify
+# CMD aliases (passed as the docker run argument):
+#   api            — uvicorn memory.agent_service:app on :8080  (default)
+#   celery-worker  — celery -A memory.celery_config worker
+#   celery-beat    — celery -A memory.celery_config beat
+#   celery-all     — worker + embedded beat
+#   <anything else> — exec'd verbatim
+# =============================================================================
 
+# Diff vs .bak snapshot:
+#   - Base image: python:3.11-slim (unchanged — matches contextdna-ide-oss/
+#     pyproject.toml `requires-python = ">=3.11"`; not bumped to 3.12 yet to
+#     avoid divergence from the live venv where memory/ modules are exercised).
 FROM python:3.11-slim
 
 WORKDIR /app
 
-# Install system dependencies
-# ffmpeg required for voice authentication WebM to WAV conversion
+# ----------------------------------------------------------------------------
+# System packages
+#   - curl    : healthcheck + image debugging
+#   - git     : some pip installs reach git+https://
+#   - ffmpeg  : voice authentication WebM->WAV conversion
+#   - gcc, python3-dev : C extensions (psycopg2-binary fallback, resemblyzer)
+#   - tini    : PID 1 reaper so SIGTERM propagates cleanly (NEW vs .bak —
+#               .bak relied on bash as PID 1 which leaked zombie Celery procs)
+# ----------------------------------------------------------------------------
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    curl \
-    git \
-    ffmpeg \
-    gcc \
-    python3-dev \
+        curl \
+        git \
+        ffmpeg \
+        gcc \
+        python3-dev \
+        tini \
     && rm -rf /var/lib/apt/lists/*
 
-# Copy requirements and install Python dependencies
-COPY requirements-agent.txt .
-RUN pip install --no-cache-dir -r requirements-agent.txt
+# ----------------------------------------------------------------------------
+# Python dependencies (layer-cached: requirements file copied before source)
+#
+# Diff vs .bak snapshot:
+#   - The .bak referenced `pyproject.toml` + `pip install -e .` indirectly via
+#     `requirements-agent.txt`. The live mothership has NO memory/pyproject.toml
+#     and NO repo-root pyproject.toml; requirements-agent.txt IS the canonical
+#     dependency manifest. We therefore keep the requirements.txt approach
+#     (matches .bak) rather than introducing a phantom pyproject.toml.
+# ----------------------------------------------------------------------------
+COPY requirements-agent.txt /app/memory/requirements-agent.txt
+RUN pip install --no-cache-dir --upgrade pip \
+    && pip install --no-cache-dir -r /app/memory/requirements-agent.txt
 
-# Copy memory modules
+# ----------------------------------------------------------------------------
+# Application source — copied AFTER deps so dep layer caches across edits.
+# Build context == memory/, so `COPY . /app/memory/` copies the memory tree.
+# ----------------------------------------------------------------------------
 COPY . /app/memory/
 
-# Set Python path
-ENV PYTHONPATH=/app
+# ----------------------------------------------------------------------------
+# Non-root user (NEW vs .bak — .bak ran as root, violating least-privilege)
+#   UID 1000 matches the typical host user; volumes mounted from host (e.g.
+#   ~/.context-dna) keep their ownership intact for the common dev case.
+# ----------------------------------------------------------------------------
+RUN groupadd --system --gid 1000 appuser \
+    && useradd  --system --uid 1000 --gid 1000 --create-home --home-dir /home/appuser appuser \
+    && mkdir -p /app/memory /data \
+    && chown -R appuser:appuser /app /data /home/appuser
 
-# Environment variables for services (with defaults)
-ENV RABBITMQ_USER=acontext
-ENV RABBITMQ_PASSWORD=INSECURE_DEFAULT_CHANGE_ME
-ENV RABBITMQ_HOST=contextdna-rabbitmq
-ENV RABBITMQ_PORT=5672
-ENV REDIS_HOST=contextdna-redis
-ENV REDIS_PORT=6379
-ENV REDIS_PASSWORD=INSECURE_DEFAULT_CHANGE_ME
-ENV DATABASE_HOST=contextdna-pg
-ENV DATABASE_PORT=5432
-ENV DATABASE_USER=acontext
-ENV DATABASE_PASSWORD=INSECURE_DEFAULT_CHANGE_ME
-ENV DATABASE_NAME=acontext
-ENV OLLAMA_URL=http://contextdna-ollama:11434
+ENV PYTHONPATH=/app \
+    PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1
 
-# Create entrypoint script
-RUN echo '#!/bin/bash\n\
-case "$1" in\n\
-  celery-worker)\n\
-    echo "Starting Celery worker..."\n\
-    exec celery -A memory.celery_config worker \\\n\
-      --loglevel=info \\\n\
-      --queues=scanner,distiller,relevance,llm,brain,celery \\\n\
-      --concurrency=4\n\
-    ;;\n\
-  celery-beat)\n\
-    echo "Starting Celery beat scheduler..."\n\
-    exec celery -A memory.celery_config beat --loglevel=info\n\
-    ;;\n\
-  celery-all)\n\
-    echo "Starting Celery worker + beat..."\n\
-    exec celery -A memory.celery_config worker --beat \\\n\
-      --loglevel=info \\\n\
-      --queues=scanner,distiller,relevance,llm,brain,celery \\\n\
-      --concurrency=4\n\
-    ;;\n\
-  api|"")\n\
-    echo "Starting FastAPI service..."\n\
-    exec python -m uvicorn memory.agent_service:app --host 0.0.0.0 --port 8080 --workers 1\n\
-    ;;\n\
-  *)\n\
-    exec "$@"\n\
-    ;;\n\
-esac' > /entrypoint.sh && chmod +x /entrypoint.sh
+# ----------------------------------------------------------------------------
+# Default service-discovery env vars (overridden by compose).
+# Passwords MUST be overridden in production; the literal value below is a
+# sentinel that fails fast if accidentally shipped.
+# ----------------------------------------------------------------------------
+ENV RABBITMQ_USER=acontext \
+    RABBITMQ_PASSWORD=INSECURE_DEFAULT_CHANGE_ME \
+    RABBITMQ_HOST=contextdna-rabbitmq \
+    RABBITMQ_PORT=5672 \
+    REDIS_HOST=contextdna-redis \
+    REDIS_PORT=6379 \
+    REDIS_PASSWORD=INSECURE_DEFAULT_CHANGE_ME \
+    DATABASE_HOST=contextdna-pg \
+    DATABASE_PORT=5432 \
+    DATABASE_USER=acontext \
+    DATABASE_PASSWORD=INSECURE_DEFAULT_CHANGE_ME \
+    DATABASE_NAME=acontext \
+    OLLAMA_URL=http://contextdna-ollama:11434
 
-# Health check script that works for both API and Celery modes
-RUN echo '#!/bin/bash\n\
-# Check which mode we are running in by looking at process list\n\
-if pgrep -f "uvicorn" > /dev/null; then\n\
-    # API mode - check HTTP endpoint\n\
-    curl -sf http://localhost:8080/health || exit 1\n\
-elif pgrep -f "celery.*worker" > /dev/null; then\n\
-    # Celery worker mode - check if process is responsive\n\
-    celery -A memory.celery_config inspect ping -d celery@$HOSTNAME 2>/dev/null | grep -q "pong" || exit 1\n\
-elif pgrep -f "celery.*beat" > /dev/null; then\n\
-    # Celery beat mode - just check if process exists\n\
-    exit 0\n\
-else\n\
-    # Unknown mode or starting up\n\
-    exit 0\n\
-fi' > /healthcheck.sh && chmod +x /healthcheck.sh
+# ----------------------------------------------------------------------------
+# Entrypoint dispatcher — same role-multiplexing as .bak, written to /app/
+# (not /) so the non-root user owns it. Uses `exec` to keep tini at PID 1.
+# ----------------------------------------------------------------------------
+RUN printf '%s\n' \
+    '#!/bin/bash' \
+    'set -euo pipefail' \
+    'case "${1:-api}" in' \
+    '  celery-worker)' \
+    '    echo "[entrypoint] Starting Celery worker..."' \
+    '    exec celery -A memory.celery_config worker \' \
+    '      --loglevel=info \' \
+    '      --queues=scanner,distiller,relevance,llm,brain,celery \' \
+    '      --concurrency=${CELERY_CONCURRENCY:-4}' \
+    '    ;;' \
+    '  celery-beat)' \
+    '    echo "[entrypoint] Starting Celery beat..."' \
+    '    exec celery -A memory.celery_config beat --loglevel=info' \
+    '    ;;' \
+    '  celery-all)' \
+    '    echo "[entrypoint] Starting Celery worker+beat..."' \
+    '    exec celery -A memory.celery_config worker --beat \' \
+    '      --loglevel=info \' \
+    '      --queues=scanner,distiller,relevance,llm,brain,celery \' \
+    '      --concurrency=${CELERY_CONCURRENCY:-4}' \
+    '    ;;' \
+    '  api|"")' \
+    '    echo "[entrypoint] Starting FastAPI service on :8080..."' \
+    '    exec python -m uvicorn memory.agent_service:app \' \
+    '      --host 0.0.0.0 --port 8080 --workers ${UVICORN_WORKERS:-1}' \
+    '    ;;' \
+    '  *)' \
+    '    exec "$@"' \
+    '    ;;' \
+    'esac' \
+    > /app/entrypoint.sh \
+    && chmod +x /app/entrypoint.sh \
+    && chown appuser:appuser /app/entrypoint.sh
 
-# Health check (works for API and Celery modes)
-HEALTHCHECK --interval=30s --timeout=30s --retries=3 --start-period=60s \
-    CMD /healthcheck.sh
+# ----------------------------------------------------------------------------
+# Healthcheck — Python-only (no curl runtime dependency in the probe itself,
+# so it still works if curl is stripped from a future slim variant).
+#
+# Diff vs .bak snapshot:
+#   - .bak used a multi-mode bash script with `pgrep` + `celery inspect ping`
+#     for worker/beat modes. That probe spawned a transient Python interpreter
+#     per check (~150 MB peak) and frequently false-negatived under load.
+#   - This version: API-only HTTP probe per the task spec. Celery worker/beat
+#     services should disable the healthcheck in compose (`healthcheck:
+#     disable: true`) — only the API service exposes :8080.
+# ----------------------------------------------------------------------------
+HEALTHCHECK --interval=30s --timeout=10s --retries=3 --start-period=60s \
+    CMD python -c "import urllib.request; urllib.request.urlopen('http://localhost:8080/health', timeout=5)" || exit 1
 
-# Expose port (API mode)
 EXPOSE 8080
 
-# Use entrypoint script
-ENTRYPOINT ["/entrypoint.sh"]
+USER appuser
 
-# Default to API mode
+ENTRYPOINT ["/usr/bin/tini", "--", "/app/entrypoint.sh"]
 CMD ["api"]

@@ -1,0 +1,22 @@
+aws_region       = "us-west-2"
+project_name     = "ersim"
+
+# VPC CIDRs (can usually stay as defaults unless they clash with existing networks)
+vpc_cidr             = "${VPC_CIDR}"
+public_subnet_cidrs  = ["${PUBLIC_SUBNET_1}", "${PUBLIC_SUBNET_2}"]
+public_subnet_azs    = ["${REGION}a", "${REGION}b"]
+private_subnet_cidrs = ["${PRIVATE_SUBNET_1}", "${PRIVATE_SUBNET_2}"]
+private_subnet_azs   = ["${REGION}a", "${REGION}b"]
+
+# RDS configuration (production)
+db_name     = "ersim_prod"
+db_username = "ersim_app"
+# IMPORTANT: this placeholder will be overridden by terraform.tfvars.local
+db_password = "${DBPW}"
+
+# EC2 app instance type
+ec2_instance_type = "t3.medium"
+
+# S3 assets buckets (must be globally unique; real values can live in terraform.tfvars.local)
+assets_bucket_name   = "your-bucket-name-here"
+assets_bucket_name_2 = "your-logs-bucket-name-here"

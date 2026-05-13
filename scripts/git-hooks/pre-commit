@@ -1,0 +1,37 @@
+#!/usr/bin/env bash
+# pre-commit multiplexer — runs all repo pre-commit gates in order.
+# WaveG (2026-05-12): added conflict-marker gate FIRST so it blocks the
+# bandaid pattern before any other check runs.
+
+set -uo pipefail
+
+# Resolve real script location through any symlink (macOS lacks readlink -f)
+# so sibling hooks under scripts/git-hooks/ are found when invoked via
+# .git/hooks/pre-commit symlink. WaveI 2026-05-12 fix.
+_src="$0"
+while [ -L "$_src" ]; do
+    _dir="$(cd "$(dirname "$_src")" && pwd)"
+    _src="$(readlink "$_src")"
+    case "$_src" in /*) ;; *) _src="$_dir/$_src" ;; esac
+done
+HOOKS_DIR="$(cd "$(dirname "$_src")" && pwd)"
+
+FAIL=0
+for hook in \
+    "$HOOKS_DIR/pre-commit-conflict-markers.sh" \
+    "$HOOKS_DIR/pre-commit-critical-symbols.sh" \
+    "$HOOKS_DIR/../pre-commit-secrets-check.sh" \
+    "$HOOKS_DIR/pre-commit-zsf-smoke.sh" \
+    "$HOOKS_DIR/pre-commit-webhook-guard.sh" \
+    "$HOOKS_DIR/pre-commit-cascade-bypass.sh"
+do
+    [ -x "$hook" ] || continue
+    "$hook" || FAIL=1
+done
+
+# North-star drift: advisory only, never blocks.
+if [ -x "$HOOKS_DIR/pre-commit-north-star.sh" ]; then
+    "$HOOKS_DIR/pre-commit-north-star.sh" || true
+fi
+
+exit "$FAIL"

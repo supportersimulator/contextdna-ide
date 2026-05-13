@@ -161,6 +161,79 @@ fi
 
 [ -n "$DASH" ] && echo "$DASH"
 
+# ── New /health fields: self-heal, cap KV stale peers, SSH recover stats ──
+_HEALTH_JSON=$(python3 -c "
+import urllib.request, json, sys
+try:
+    h = json.loads(urllib.request.urlopen('http://127.0.0.1:${PORT}/health', timeout=5).read())
+    print(json.dumps(h))
+except Exception as e:
+    sys.exit(0)
+" 2>/dev/null || true)
+
+if [ -n "$_HEALTH_JSON" ]; then
+    # Self-heal: show peers with active heal or cooldowns
+    _heal_lines=$(python3 -c "
+import json, sys
+h = json.loads(sys.argv[1])
+obs = h.get('self_heal_observability', {})
+peers = obs.get('peers', {})
+out = []
+for peer, info in peers.items():
+    if info.get('self_heal_active') or info.get('repair_in_progress') or info.get('cooldowns_active'):
+        parts = []
+        if info.get('self_heal_active'):
+            parts.append('heal_active')
+        rip = info.get('repair_in_progress')
+        if rip:
+            parts.append(f'repair_in_progress(L{rip.get(\"level\",\"?\")})')
+        cds = info.get('cooldowns_active', [])
+        if cds:
+            parts.append(f'cooldowns={cds}')
+        out.append(f'{peer}: {\" \".join(parts)}')
+global_cds = obs.get('heal_cooldowns_active', [])
+if global_cds:
+    out.append(f'global cooldowns: {global_cds}')
+print('\n'.join(out))
+" "$_HEALTH_JSON" 2>/dev/null || true)
+    if [ -n "$_heal_lines" ]; then
+        echo "🔧 self-heal:"
+        echo "$_heal_lines" | while IFS= read -r line; do echo "   $line"; done
+    fi
+
+    # Cap KV stale peers
+    _stale_peers=$(python3 -c "
+import json, sys
+h = json.loads(sys.argv[1])
+stale = h.get('cap_kv_stale_peers', [])
+if stale:
+    print(' '.join(stale))
+" "$_HEALTH_JSON" 2>/dev/null || true)
+    [ -n "$_stale_peers" ] && echo "⚠️  cap_kv stale peers: $_stale_peers"
+
+    # SSH recover stats
+    _ssh_stats=$(python3 -c "
+import json, sys
+h = json.loads(sys.argv[1])
+stats = h.get('stats', {})
+attempts = stats.get('ssh_recover_attempts_total', 0)
+success = stats.get('ssh_recover_success_total', 0)
+if attempts and int(attempts) > 0:
+    print(f'attempts={attempts} success={success}')
+" "$_HEALTH_JSON" 2>/dev/null || true)
+    [ -n "$_ssh_stats" ] && echo "🔑 ssh-recover: $_ssh_stats"
+
+    # Peers dict missing but reachable (genuine invariant violations)
+    _missing_reachable=$(python3 -c "
+import json, sys
+h = json.loads(sys.argv[1])
+mv = h.get('peers_dict_missing_but_reachable_current', [])
+if mv:
+    print(' '.join(mv))
+" "$_HEALTH_JSON" 2>/dev/null || true)
+    [ -n "$_missing_reachable" ] && echo "🚨 peers_dict missing+reachable: $_missing_reachable"
+fi
+
 # ── Green-light pool status ──
 _GL_FILE="${_REPO_ROOT}/.fleet/priorities/green-light.md"
 if [ -f "$_GL_FILE" ]; then

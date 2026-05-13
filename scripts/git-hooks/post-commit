@@ -1,0 +1,55 @@
+#!/usr/bin/env bash
+# Fleet-upgrading post-commit hook.
+#
+# Runs the Python helper that writes our git HEAD into NATS KV
+# fleet.capability. Best-effort: if anything fails, the commit succeeds
+# anyway (we exit 0). The fleet-upgrading protocol just gossips a slightly
+# stale view until the next commit succeeds.
+#
+# Hook is invoked by git from $REPO_ROOT.
+
+set +e  # NEVER fail the commit
+
+REPO_ROOT="$(git rev-parse --show-toplevel 2>/dev/null)"
+if [ -z "$REPO_ROOT" ]; then
+  exit 0
+fi
+
+# Find a usable python (in order: venv, multi-fleet venv, system).
+for PY in \
+    "$REPO_ROOT/.venv/bin/python" \
+    "$REPO_ROOT/multi-fleet/.venv/bin/python" \
+    "$(command -v python3)"; do
+  if [ -x "$PY" ]; then
+    PYBIN="$PY"
+    break
+  fi
+done
+
+if [ -z "$PYBIN" ]; then
+  exit 0
+fi
+
+# Dispatch in background so the hook returns instantly. The publish has
+# its own 3s NATS connect timeout — so even if NATS is dead we never block
+# the user. nohup + disown so the commit's tty close doesn't kill us.
+HOOK_LOG="$REPO_ROOT/.fleet-state/post-commit.log"
+mkdir -p "$REPO_ROOT/.fleet-state"
+
+nohup "$PYBIN" "$REPO_ROOT/tools/fleet_capability_publish.py" \
+    >> "$HOOK_LOG" 2>&1 < /dev/null &
+disown 2>/dev/null || true
+
+# RACE U3 — mirror dev/ tree to the Documents/ bind-mount used by Stack-B
+# containers. Background + nohup so the commit returns instantly. Opt-out
+# via DEV_TO_DOCKER_SYNC=0 (e.g. in CI or on hosts that have no Documents/
+# tree). The script itself is a safe no-op when nothing changed.
+if [ "${DEV_TO_DOCKER_SYNC:-1}" != "0" ] && \
+   [ -x "$REPO_ROOT/scripts/sync-to-docker-mount.sh" ] && \
+   [ -d "$HOME/Documents/er-simulator-superrepo" ]; then
+  nohup bash "$REPO_ROOT/scripts/sync-to-docker-mount.sh" --quiet \
+      >> /tmp/dev-to-docker-sync.log 2>&1 < /dev/null &
+  disown 2>/dev/null || true
+fi
+
+exit 0

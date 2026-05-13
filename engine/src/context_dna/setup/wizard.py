@@ -692,7 +692,7 @@ volumes:
                 print("✅ PostgreSQL started")
                 print()
                 print("Add to your .env:")
-                print('  CONTEXT_DNA_POSTGRES_URL="postgresql://context_dna:context_dna_local@localhost:5432/context_dna"')
+                print('  CONTEXT_DNA_POSTGRES_URL="postgresql://context_dna:YOUR_PASSWORD@localhost:5432/context_dna"')
                 return True
             else:
                 print(f"❌ Failed: {result.stderr.decode()}")

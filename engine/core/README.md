@@ -257,7 +257,7 @@ OPENAI_API_KEY=sk-...
 ANTHROPIC_API_KEY=sk-ant-...
 
 # Database (defaults work for Docker)
-CONTEXT_DNA_POSTGRES_URL=postgresql://context_dna:context_dna_dev@localhost:5432/context_dna
+CONTEXT_DNA_POSTGRES_URL=postgresql://context_dna:YOUR_PASSWORD@localhost:5432/context_dna
 CONTEXT_DNA_REDIS_URL=redis://localhost:6379
 
 # Override provider selection

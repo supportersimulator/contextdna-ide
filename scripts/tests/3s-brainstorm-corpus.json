@@ -1,0 +1,75 @@
+{
+  "version": 2,
+  "description": "Regression corpus for the 3s answer-brainstorm loop. Mix of well-formed questions that should converge, plus failure-mode tests with stubbed surgeons. v2: O5 added consensus-then-tiebreak strategy + vague-Q penalty assertions.",
+  "budget_total_usd": 0.20,
+  "default_threshold": 0.7,
+  "default_max_iters": 3,
+  "tests": [
+    {
+      "id": "T1-sqlite-vs-postgres",
+      "topic": "For a fleet metrics store at <100k rows/day with low write contention, should we use SQLite or Postgres? Decide and justify.",
+      "expect_convergence": true,
+      "judge_strategy": "consensus-then-tiebreak",
+      "max_iters": 3,
+      "threshold": 0.7
+    },
+    {
+      "id": "T2-event-vs-poll",
+      "topic": "When choosing between event-driven and poll-driven architectures for a daemon-to-daemon health check, which is preferable when both daemons are reachable on a LAN?",
+      "expect_convergence": true,
+      "judge_strategy": "consensus-then-tiebreak",
+      "max_iters": 3,
+      "threshold": 0.7
+    },
+    {
+      "id": "T3-ambiguous-no-context",
+      "topic": "What is the right answer?",
+      "expect_convergence": false,
+      "expect_under_specified": true,
+      "judge_strategy": "consensus-then-tiebreak",
+      "max_iters": 2,
+      "threshold": 0.7,
+      "note": "Vague question — judge prompt's vague-Q penalty must score <=0.3 every iter; final_status MUST be under_specified_question. Fails if it converges."
+    },
+    {
+      "id": "T4-cardio-bias-control",
+      "topic": "Should a daemon use exponential backoff or linear retry for transient network failures on a local mesh?",
+      "expect_convergence": true,
+      "judge_strategy": "cardio",
+      "max_iters": 2,
+      "threshold": 0.7,
+      "note": "Cardio judges its own + neuro answers — used for self-bias delta measurement (kept for back-compat baseline)."
+    },
+    {
+      "id": "T5-neuro-bias-control",
+      "topic": "Should a daemon use exponential backoff or linear retry for transient network failures on a local mesh?",
+      "expect_convergence": true,
+      "judge_strategy": "neuro",
+      "max_iters": 2,
+      "threshold": 0.7,
+      "note": "Mirror of T4 with neuro as judge — measures judge-bias delta vs T4 (kept for back-compat baseline)."
+    },
+    {
+      "id": "F1-cardio-down",
+      "topic": "Should we adopt SQLite for a low-write fleet metrics store?",
+      "expect_convergence": true,
+      "judge_strategy": "alternate",
+      "max_iters": 2,
+      "threshold": 0.7,
+      "stub_cardio": true,
+      "expect_final_is_stub": false,
+      "note": "Cardio stubbed — graceful fallback: loop must converge on the surviving (neuro) surgeon's answer; final_answer must NOT contain [STUB:...]."
+    },
+    {
+      "id": "F2-neuro-down",
+      "topic": "Should we adopt SQLite for a low-write fleet metrics store?",
+      "expect_convergence": true,
+      "judge_strategy": "alternate",
+      "max_iters": 2,
+      "threshold": 0.7,
+      "stub_neuro": true,
+      "expect_final_is_stub": false,
+      "note": "Neuro stubbed — graceful fallback: final_answer must NOT contain [STUB:...]."
+    }
+  ]
+}

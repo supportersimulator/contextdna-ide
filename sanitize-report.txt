@@ -1,0 +1,36 @@
+# sanitize-report.txt
+# generated: 2026-05-13T20:13:26Z
+# target:    /private/tmp/cdna-mothership-build
+# format:    rule	file	line	replacement-applied
+# ---------------------------------------------------------------
+RULE3_DB_URL	infra/aws/terraform/README.md	96	postgres://ersim_app:YOUR_PASSWORD@ersim-prod-db.<RDS-ENDPOINT-HASH>.us-west-2.rds.amazonaws.com:5432
+RULE5_NATS_URL	tools/tests/test_webhook_offsite_watchdog.py	57	nats://localhost:4222
+RULE5_NATS_URL	tools/tests/test_webhook_offsite_watchdog.py	170	nats://localhost:4222
+RULE5_NATS_URL	tools/tests/test_webhook_offsite_watchdog.py	174	nats://localhost:4222
+RULE3_DB_URL	memory/celery_config.py	56	amqp://{RABBITMQ_USER}:YOUR_PASSWORD@{RABBITMQ_HOST}:{RABBITMQ_PORT}
+RULE3_DB_URL	memory/postgres_storage.py	75	postgresql://{DATABASE_USER}:YOUR_PASSWORD@{DATABASE_HOST}:{DATABASE_PORT}
+RULE4_EMAIL	pyproject.toml	13	your@email.com
+RULE3_DB_URL	docker-compose.heavy.yml	312	postgresql://${POSTGRES_USER:YOUR_PASSWORD@postgres:5432
+RULE3_DB_URL	docker-compose.heavy.yml	353	postgresql://${POSTGRES_USER:YOUR_PASSWORD@postgres:5432
+RULE3_DB_URL	docker-compose.heavy.yml	415	postgresql://${POSTGRES_USER:YOUR_PASSWORD@postgres:5432
+RULE4_EMAIL	docs/plans/contextdna-ide-open-source-plan.md	89	your@email.com
+RULE4_EMAIL	docs/plans/contextdna-ide-open-source-plan.md	110	your@email.com
+RULE3_DB_URL	docker-compose.lite.yml	182	postgresql://${POSTGRES_USER:YOUR_PASSWORD@postgres:5432
+RULE3_DB_URL	docker-compose.lite.yml	222	postgresql://${POSTGRES_USER:YOUR_PASSWORD@postgres:5432
+RULE3_DB_URL	scripts/pre-commit-secrets-guard.sh	135	postgres://.*:YOUR_PASSWORD@|mysql:
+RULE3_DB_URL	scripts/pre-commit-secrets-guard.sh	135	mongodb://.*:YOUR_PASSWORD@';
+UNHANDLED_SECRET	scripts/tests/test-competition-submission-gate.sh	130	sk-1234567890abcdefghij1234567890abcdefghij
+RULE3_DB_URL	engine/core/README.md	260	postgresql://context_dna:YOUR_PASSWORD@localhost:5432
+RULE3_DB_URL	engine/core/src/context_dna/setup/wizard.py	695	postgresql://context_dna:YOUR_PASSWORD@localhost:5432
+RULE3_DB_URL	engine/README.md	268	postgresql://context_dna:YOUR_PASSWORD@localhost:5432
+RULE3_DB_URL	engine/src/context_dna/setup/wizard.py	695	postgresql://context_dna:YOUR_PASSWORD@localhost:5432
+
+# ---- summary ----
+# files_scanned=1010
+# SANITIZED_API_KEYS=0
+# SANITIZED_TOKENS=0
+# SANITIZED_DB_URLS=14
+# SANITIZED_EMAILS=3
+# SANITIZED_NATS_URLS=3
+# SANITIZED_AWS_ARNS=0
+# UNHANDLED_PATTERNS=1

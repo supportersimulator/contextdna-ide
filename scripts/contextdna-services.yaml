@@ -1,0 +1,241 @@
+# =============================================================================
+# CONTEXT DNA SERVICE MANIFEST — Single Source of Truth
+# =============================================================================
+#
+# Every service, every port, every URL — defined ONCE.
+# Python, TypeScript, shell scripts ALL read from this file.
+#
+# RULES:
+#   1. ONE manifest file — never duplicate port/host in code
+#   2. get_service_url(name) is the ONLY way to get a service URL
+#   3. Health checks MUST use the manifest's health_path
+#   4. New services MUST be added here BEFORE code references them
+#   5. Unix domain sockets will replace TCP ports in Electron phase
+#
+# USAGE:
+#   Python:  from memory.service_registry import get_service_url
+#            url = get_service_url("helper_agent")  # "http://127.0.0.1:8080"
+#
+#   Shell:   source scripts/service-urls.sh
+#            curl "$HELPER_AGENT_URL/health"
+#
+#   TypeScript: import { getServiceUrl } from '@/lib/api/service-registry'
+#               const url = getServiceUrl('helper_agent')
+#
+# =============================================================================
+
+# ---------------------------------------------------------------------------
+# Core Python Services
+# ---------------------------------------------------------------------------
+services:
+  helper_agent:
+    description: "Agent service (FastAPI) — orchestrates webhooks, A/B, learnings"
+    host: "127.0.0.1"
+    port: 8080
+    health_path: "/health"
+    protocol: "http"
+    managed_by: "manual"  # Will be "supervisor" in Electron phase
+    # future_socket: "/tmp/contextdna-helper.sock"
+
+  local_llm:
+    description: "vllm-mlx — Qwen3-14B local inference (OpenAI-compatible)"
+    host: "127.0.0.1"
+    port: 5044
+    health_path: "/v1/models"
+    protocol: "http"
+    managed_by: "manual"
+    # future_socket: "/tmp/contextdna-llm.sock"
+
+  memory_api:
+    description: "Context DNA Python API (memory queries, context)"
+    host: "127.0.0.1"
+    port: 3456
+    health_path: "/health"
+    protocol: "http"
+    managed_by: "manual"
+
+# ---------------------------------------------------------------------------
+# Data Stores
+# ---------------------------------------------------------------------------
+  redis:
+    description: "context-dna-redis — session cache, pub/sub, lockout"
+    host: "127.0.0.1"
+    port: 6379
+    health_path: null
+    protocol: "redis"
+    managed_by: "docker"
+    auth: false
+    notes: "NO password. context-dna-redis container (NOT contextdna-redis on 16379)"
+
+  postgres:
+    description: "context-dna-postgres — context_dna database (primary)"
+    host: "127.0.0.1"
+    port: 5432
+    health_path: null
+    protocol: "postgresql"
+    managed_by: "docker"
+    database: "context_dna"
+    notes: "Stack 1: context-dna-postgres. Also hosts 'contextdna' DB."
+
+  postgres_upstream:
+    description: "contextdna-pg — acontext database (GHCR upstream)"
+    host: "127.0.0.1"
+    port: 15432
+    health_path: null
+    protocol: "postgresql"
+    managed_by: "docker"
+    database: "acontext"
+    notes: "Stack 2: contextdna-pg (separate from primary PG)"
+
+# ---------------------------------------------------------------------------
+# Frontend / Dashboard
+# ---------------------------------------------------------------------------
+  admin_dashboard:
+    description: "admin.contextdna.io — Next.js IDE dashboard"
+    host: "127.0.0.1"
+    port: 3000
+    health_path: "/"
+    protocol: "http"
+    managed_by: "manual"
+
+# ---------------------------------------------------------------------------
+# Backend / Django
+# ---------------------------------------------------------------------------
+  django_backend:
+    description: "Django REST backend for ER Simulator"
+    host: "127.0.0.1"
+    port: 8000
+    health_path: "/api/health/"
+    protocol: "http"
+    managed_by: "manual"
+    # future_socket: "/tmp/contextdna-django.sock"
+
+# ---------------------------------------------------------------------------
+# Synaptic Voice (Context DNA's own voice — NOT ER Simulator)
+# ---------------------------------------------------------------------------
+  synaptic_chat:
+    description: "Synaptic Chat Server v5.5 — text + voice modes, memory-injected"
+    host: "127.0.0.1"
+    port: 8888
+    health_path: "/health"
+    protocol: "http"
+    managed_by: "manual"
+    # future_socket: "/tmp/contextdna-synaptic-chat.sock"
+    notes: "Mode 1: text, Mode 3: voice (FastAPI+edge-tts+mlx-whisper), Mode 4: phone browser (WS audio)"
+
+# ---------------------------------------------------------------------------
+# ER Simulator Voice Pipeline (SEPARATE PRODUCT — ersim-voice-stack/)
+#
+# These services power ER Simulator patient voice simulation.
+# They are NOT part of Context DNA's Synaptic voice system.
+# Managed via: ersim-voice-stack/docker-compose.yml
+# ---------------------------------------------------------------------------
+  ersim_livekit:
+    description: "ER Sim — LiveKit SFU (WebRTC signaling + media relay)"
+    host: "127.0.0.1"
+    port: 7880
+    health_path: null
+    protocol: "http"
+    managed_by: "docker"
+    product: "er-simulator"
+    extra_ports:
+      tcp: 7881
+      udp: 7882
+    notes: "WebRTC needs direct UDP. Cloudflare DNS must be proxied=false."
+
+  ersim_stt:
+    description: "ER Sim — Faster Whisper STT (speech-to-text, GPU)"
+    host: "127.0.0.1"
+    port: 8081
+    health_path: null
+    protocol: "http"
+    managed_by: "docker"
+    product: "er-simulator"
+    notes: "Model: large-v3, NVIDIA CUDA float16. POST /transcribe"
+
+  ersim_tts:
+    description: "ER Sim — Chatterbox TTS (text-to-speech, voice cloning)"
+    host: "127.0.0.1"
+    port: 8082
+    health_path: null
+    protocol: "http"
+    managed_by: "docker"
+    product: "er-simulator"
+    internal_port: 8000
+    notes: "External 8082, internal 8000. Turbo mode, voice cloning via reference WAV."
+
+  ersim_llm_proxy:
+    description: "ER Sim — OpenAI-compatible LLM proxy to AWS Bedrock"
+    host: "127.0.0.1"
+    port: 8090
+    health_path: null
+    protocol: "http"
+    managed_by: "docker"
+    product: "er-simulator"
+    notes: "Routes to Bedrock Claude. Requires AWS credentials."
+
+  ersim_livekit_cloud:
+    description: "ER Sim — LiveKit cloud/production WebSocket URL"
+    host: "voice.ersimulator.com"
+    port: 443
+    health_path: null
+    protocol: "wss"
+    managed_by: "external"
+    product: "er-simulator"
+    notes: "Production LiveKit. Used by Django backend for session tokens."
+
+# ---------------------------------------------------------------------------
+# WebSocket endpoints (on existing services)
+# ---------------------------------------------------------------------------
+websockets:
+  injection_ws:
+    service: "helper_agent"
+    path: "/ws/injections"
+    description: "Real-time injection updates"
+
+  events_ws:
+    service: "helper_agent"
+    path: "/ws/events"
+    description: "General event stream"
+
+  agent_task_ws:
+    service: "helper_agent"
+    path: "/ws/agent-tasks/{session_id}"
+    description: "Agent task output streaming"
+
+  badges_ws:
+    service: "helper_agent"
+    path: "/ws/badges"
+    description: "Real-time activity bar badge counts"
+
+  synaptic_voice_ws:
+    service: "synaptic_chat"
+    path: "/voice"
+    description: "Phone browser audio WebSocket (STT → LLM → TTS)"
+
+  synaptic_chat_ws:
+    service: "synaptic_chat"
+    path: "/ws/chat"
+    description: "Synaptic text chat WebSocket"
+
+# ---------------------------------------------------------------------------
+# Deprecated / Legacy (DO NOT USE — here for documentation only)
+# ---------------------------------------------------------------------------
+deprecated:
+  redis_contextdna:
+    description: "contextdna-redis — WRONG Redis. Has password. Port 16379."
+    host: "127.0.0.1"
+    port: 16379
+    reason: "Python code uses context-dna-redis (6379, no auth)"
+
+  port_8029:
+    description: "Old helper_agent port — REPLACED by 8080"
+    host: "127.0.0.1"
+    port: 8029
+    reason: "Port changed to 8080. All references updated 2026-02-11."
+
+  port_5043:
+    description: "Legacy api_server.py (NOT running). LLM is mlx_lm.server on 5044."
+    host: "127.0.0.1"
+    port: 5043
+    reason: "api_server.py wrapper deprecated. synaptic_chat_server has graceful fallback. install-context-dna.sh still references."

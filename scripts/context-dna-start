@@ -1,0 +1,279 @@
+#!/bin/bash
+#
+# CONTEXT DNA UNIFIED LAUNCHER
+#
+# Single command to start the entire Context DNA system.
+# Handles both Lite mode (SQLite only) and Heavy mode (Docker + Postgres).
+#
+# Usage:
+#   ./scripts/context-dna-start           # Start in auto mode (detects Docker)
+#   ./scripts/context-dna-start lite      # Force lite mode (no Docker)
+#   ./scripts/context-dna-start heavy     # Force heavy mode (requires Docker)
+#   ./scripts/context-dna-start voice     # Include voice server
+#   ./scripts/context-dna-start status    # Check status
+#   ./scripts/context-dna-start stop      # Stop all services
+#
+# What gets started:
+#   1. agent_service.py (Port 8080) - ALWAYS (core memory processing)
+#   2. synaptic_chat_server.py (Port 8888) - OPTIONAL (voice/phone control)
+#   3. Docker containers - OPTIONAL (PostgreSQL, Redis for heavy mode)
+#
+
+set -e
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(dirname "$SCRIPT_DIR")"
+MEMORY_DIR="$REPO_ROOT/memory"
+LOGS_DIR="$REPO_ROOT/logs"
+PIDS_DIR="$REPO_ROOT/.pids"
+
+# Colors
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+RED='\033[0;31m'
+BLUE='\033[0;34m'
+NC='\033[0m' # No Color
+
+# Create directories
+mkdir -p "$LOGS_DIR" "$PIDS_DIR"
+
+# =============================================================================
+# HELPER FUNCTIONS
+# =============================================================================
+
+print_header() {
+    echo ""
+    echo -e "${BLUE}╔══════════════════════════════════════════════════════════════╗${NC}"
+    echo -e "${BLUE}║${NC}           ${GREEN}CONTEXT DNA${NC} - Unified Launcher                    ${BLUE}║${NC}"
+    echo -e "${BLUE}╚══════════════════════════════════════════════════════════════╝${NC}"
+    echo ""
+}
+
+check_docker() {
+    if command -v docker &> /dev/null && docker info &> /dev/null; then
+        return 0
+    else
+        return 1
+    fi
+}
+
+check_port() {
+    local port=$1
+    if lsof -i :$port &> /dev/null; then
+        return 0  # Port in use
+    else
+        return 1  # Port free
+    fi
+}
+
+start_agent_service() {
+    echo -e "${YELLOW}Starting agent_service.py (Port 8080)...${NC}"
+
+    if check_port 8080; then
+        echo -e "${GREEN}  ✓ Already running on port 8080${NC}"
+        return 0
+    fi
+
+    cd "$REPO_ROOT"
+    source .venv/bin/activate 2>/dev/null || true
+
+    nohup python -m uvicorn memory.agent_service:app \
+        --host 0.0.0.0 \
+        --port 8080 \
+        > "$LOGS_DIR/agent_service.log" 2>&1 &
+
+    echo $! > "$PIDS_DIR/agent_service.pid"
+    sleep 2
+
+    if check_port 8080; then
+        echo -e "${GREEN}  ✓ agent_service started (PID: $(cat $PIDS_DIR/agent_service.pid))${NC}"
+        echo -e "${GREEN}    Loops: work_log, brain_cycle, evolution, sync, health, heartbeat${NC}"
+    else
+        echo -e "${RED}  ✗ Failed to start agent_service${NC}"
+        return 1
+    fi
+}
+
+start_voice_server() {
+    echo -e "${YELLOW}Starting synaptic_chat_server.py (Port 8888)...${NC}"
+
+    if check_port 8888; then
+        echo -e "${GREEN}  ✓ Already running on port 8888${NC}"
+        return 0
+    fi
+
+    cd "$REPO_ROOT"
+    source .venv/bin/activate 2>/dev/null || true
+
+    nohup python -m uvicorn memory.synaptic_chat_server:app \
+        --host 0.0.0.0 \
+        --port 8888 \
+        > "$LOGS_DIR/synaptic_chat_server.log" 2>&1 &
+
+    echo $! > "$PIDS_DIR/synaptic_chat_server.pid"
+    sleep 2
+
+    if check_port 8888; then
+        echo -e "${GREEN}  ✓ synaptic_chat_server started (PID: $(cat $PIDS_DIR/synaptic_chat_server.pid))${NC}"
+        echo -e "${GREEN}    Features: voice, cognitive_control, task_heartbeat${NC}"
+    else
+        echo -e "${RED}  ✗ Failed to start synaptic_chat_server${NC}"
+        return 1
+    fi
+}
+
+start_docker() {
+    echo -e "${YELLOW}Starting Docker containers (Heavy Mode)...${NC}"
+
+    if ! check_docker; then
+        echo -e "${RED}  ✗ Docker not available${NC}"
+        return 1
+    fi
+
+    cd "$REPO_ROOT"
+    if [ -f "docker-compose.yml" ]; then
+        docker-compose up -d postgres redis 2>/dev/null || true
+        echo -e "${GREEN}  ✓ Docker containers started${NC}"
+    else
+        echo -e "${YELLOW}  ⚠ No docker-compose.yml found${NC}"
+    fi
+}
+
+stop_all() {
+    echo -e "${YELLOW}Stopping Context DNA services...${NC}"
+
+    # Stop agent_service
+    if [ -f "$PIDS_DIR/agent_service.pid" ]; then
+        kill $(cat "$PIDS_DIR/agent_service.pid") 2>/dev/null || true
+        rm "$PIDS_DIR/agent_service.pid"
+        echo -e "${GREEN}  ✓ agent_service stopped${NC}"
+    fi
+
+    # Stop synaptic_chat_server
+    if [ -f "$PIDS_DIR/synaptic_chat_server.pid" ]; then
+        kill $(cat "$PIDS_DIR/synaptic_chat_server.pid") 2>/dev/null || true
+        rm "$PIDS_DIR/synaptic_chat_server.pid"
+        echo -e "${GREEN}  ✓ synaptic_chat_server stopped${NC}"
+    fi
+
+    # Also try to kill by port
+    lsof -ti :8080 | xargs kill 2>/dev/null || true
+    lsof -ti :8888 | xargs kill 2>/dev/null || true
+
+    echo -e "${GREEN}All services stopped${NC}"
+}
+
+show_status() {
+    echo -e "${BLUE}Context DNA Status${NC}"
+    echo ""
+
+    # agent_service
+    if check_port 8080; then
+        echo -e "  agent_service (8080):        ${GREEN}● Running${NC}"
+        curl -s http://localhost:8080/health | python -c "import sys,json; d=json.load(sys.stdin); print(f'    Mode: {d.get(\"current_mode\", \"unknown\")}')" 2>/dev/null || true
+    else
+        echo -e "  agent_service (8080):        ${RED}○ Stopped${NC}"
+    fi
+
+    # synaptic_chat_server
+    if check_port 8888; then
+        echo -e "  synaptic_chat_server (8888): ${GREEN}● Running${NC}"
+    else
+        echo -e "  synaptic_chat_server (8888): ${YELLOW}○ Not running (optional)${NC}"
+    fi
+
+    # Docker
+    if check_docker; then
+        echo -e "  Docker:                      ${GREEN}● Available${NC}"
+        # Check postgres container
+        if docker ps | grep -q postgres; then
+            echo -e "    PostgreSQL:                ${GREEN}● Running${NC}"
+        else
+            echo -e "    PostgreSQL:                ${YELLOW}○ Not running (Lite mode)${NC}"
+        fi
+    else
+        echo -e "  Docker:                      ${YELLOW}○ Not available (Lite mode only)${NC}"
+    fi
+
+    echo ""
+}
+
+# =============================================================================
+# MAIN
+# =============================================================================
+
+print_header
+
+case "${1:-auto}" in
+    lite)
+        echo -e "${BLUE}Mode: LITE (SQLite only, no Docker)${NC}"
+        echo ""
+        export SYNC_ENABLED=false
+        start_agent_service
+        ;;
+
+    heavy)
+        echo -e "${BLUE}Mode: HEAVY (Docker + PostgreSQL)${NC}"
+        echo ""
+        start_docker
+        sleep 3
+        export SYNC_ENABLED=true
+        start_agent_service
+        ;;
+
+    voice)
+        echo -e "${BLUE}Mode: AUTO + VOICE${NC}"
+        echo ""
+        if check_docker; then
+            start_docker
+            sleep 3
+            export SYNC_ENABLED=true
+        else
+            export SYNC_ENABLED=false
+        fi
+        start_agent_service
+        start_voice_server
+        ;;
+
+    auto)
+        echo -e "${BLUE}Mode: AUTO (detecting Docker...)${NC}"
+        echo ""
+        if check_docker; then
+            echo -e "${GREEN}Docker detected - starting in Heavy mode${NC}"
+            start_docker
+            sleep 3
+            export SYNC_ENABLED=true
+        else
+            echo -e "${YELLOW}Docker not available - starting in Lite mode${NC}"
+            export SYNC_ENABLED=false
+        fi
+        start_agent_service
+        ;;
+
+    status)
+        show_status
+        ;;
+
+    stop)
+        stop_all
+        ;;
+
+    *)
+        echo "Usage: $0 [auto|lite|heavy|voice|status|stop]"
+        echo ""
+        echo "Commands:"
+        echo "  auto    - Auto-detect Docker, start agent_service (default)"
+        echo "  lite    - Force Lite mode (SQLite only)"
+        echo "  heavy   - Force Heavy mode (Docker required)"
+        echo "  voice   - Auto mode + voice server"
+        echo "  status  - Show service status"
+        echo "  stop    - Stop all services"
+        exit 1
+        ;;
+esac
+
+echo ""
+echo -e "${GREEN}════════════════════════════════════════════════════════════════${NC}"
+show_status
+echo -e "${GREEN}Logs: $LOGS_DIR/${NC}"
+echo -e "${GREEN}════════════════════════════════════════════════════════════════${NC}"

@@ -1,0 +1,136 @@
+# =============================================================================
+# bootstrap-verify.yml — End-to-end mothership bootstrap verification
+# -----------------------------------------------------------------------------
+# WHAT THIS GATES:
+#   Runs scripts/bootstrap-verify.sh --profile lite inside an ephemeral CI
+#   environment. The script provisions the ContextDNA mothership stack from
+#   scratch (containerised), starts the daemon, exercises a minimal end-to-end
+#   smoke path, and prints BOOTSTRAP-VERIFIED on success.
+#
+#   This is the "delete laptop + AWS = still works" check. If a developer with
+#   only the repo + the documented secrets cannot bring the mothership up,
+#   the operational invariance has regressed.
+#
+# WHAT FAILURE MEANS:
+#   The mothership cannot be bootstrapped from a clean state. This is a P0
+#   regression — fix the bootstrap path (Dockerfile, compose, env handling,
+#   migration script, etc.) before merging anything else. Container logs are
+#   uploaded as artifacts to aid post-mortem.
+#
+# WHY REQUIRED ON PUSH + NIGHTLY:
+#   - Push to main: catches regressions immediately when code lands.
+#   - Nightly cron: catches drift from external dependencies (base images,
+#     pip indices, model endpoints) that a code diff alone won't surface.
+# =============================================================================
+
+name: bootstrap-verify
+
+on:
+  push:
+    branches: [main]
+  schedule:
+    # Daily at 09:00 UTC. Catches dependency drift before working hours.
+    - cron: '0 9 * * *'
+  workflow_dispatch:
+    inputs:
+      profile:
+        description: 'Bootstrap profile (lite = fast smoke, heavy = full stack)'
+        required: true
+        default: lite
+        type: choice
+        options:
+          - lite
+          - heavy
+      teardown:
+        description: 'Tear down containers after run (set false to debug live state)'
+        required: true
+        default: 'true'
+        type: choice
+        options:
+          - 'true'
+          - 'false'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  # Push-to-main and scheduled runs always complete; manual dispatches do not cancel each other on different refs.
+  cancel-in-progress: false
+
+jobs:
+  bootstrap-verify:
+    name: bootstrap-verify (${{ github.event.inputs.profile || 'lite' }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      # Defaults for scheduled/push runs; workflow_dispatch overrides via inputs.
+      BOOTSTRAP_PROFILE: ${{ github.event.inputs.profile || 'lite' }}
+      BOOTSTRAP_TEARDOWN: ${{ github.event.inputs.teardown || 'true' }}
+    steps:
+      - name: Checkout (with submodules)
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 1
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Materialise .env from MOTHERSHIP_TEST_ENV secret
+        env:
+          MOTHERSHIP_TEST_ENV: ${{ secrets.MOTHERSHIP_TEST_ENV }}
+        run: |
+          set -euo pipefail
+          if [ -z "${MOTHERSHIP_TEST_ENV:-}" ]; then
+            echo "::error::Secret MOTHERSHIP_TEST_ENV is empty or unset."
+            echo "::error::Configure it in repo Settings → Secrets and variables → Actions."
+            echo "::error::ZSF: failing loudly rather than booting with silent defaults."
+            exit 1
+          fi
+          # Write secret contents verbatim to .env at repo root.
+          printf '%s\n' "$MOTHERSHIP_TEST_ENV" > .env
+          chmod 600 .env
+          echo "Wrote .env ($(wc -l < .env) lines) from MOTHERSHIP_TEST_ENV secret."
+
+      - name: Run bootstrap-verify (--profile ${{ env.BOOTSTRAP_PROFILE }})
+        id: bootstrap
+        run: |
+          set -euo pipefail
+          chmod +x scripts/bootstrap-verify.sh
+          ARGS=(--profile "${BOOTSTRAP_PROFILE}")
+          if [ "${BOOTSTRAP_TEARDOWN}" = "false" ]; then
+            ARGS+=(--no-teardown)
+          fi
+          bash scripts/bootstrap-verify.sh "${ARGS[@]}"
+
+      - name: Capture container logs on failure
+        if: failure()
+        run: |
+          set +e
+          mkdir -p /tmp/bootstrap-logs
+          echo "=== docker ps -a ===" > /tmp/bootstrap-logs/00-docker-ps.txt
+          docker ps -a >> /tmp/bootstrap-logs/00-docker-ps.txt 2>&1
+          # Dump logs for every container (running or exited) launched in this job.
+          for cid in $(docker ps -aq); do
+            name=$(docker inspect --format='{{.Name}}' "$cid" 2>/dev/null | sed 's|^/||' | tr -c 'A-Za-z0-9._-' '_')
+            : "${name:=$cid}"
+            docker logs --timestamps "$cid" > "/tmp/bootstrap-logs/${name}.log" 2>&1
+            docker inspect "$cid" > "/tmp/bootstrap-logs/${name}.inspect.json" 2>&1
+          done
+          # If compose was used, also dump its consolidated view.
+          if command -v docker compose >/dev/null 2>&1; then
+            docker compose ps > /tmp/bootstrap-logs/01-compose-ps.txt 2>&1 || true
+            docker compose logs --no-color --timestamps > /tmp/bootstrap-logs/02-compose-logs.txt 2>&1 || true
+          fi
+          ls -la /tmp/bootstrap-logs/
+        shell: bash
+
+      - name: Upload container logs artifact (on failure)
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: bootstrap-verify-logs-${{ github.run_id }}-${{ github.run_attempt }}
+          path: /tmp/bootstrap-logs/
+          if-no-files-found: warn
+          retention-days: 7

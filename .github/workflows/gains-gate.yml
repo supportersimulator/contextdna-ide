@@ -1,0 +1,68 @@
+# =============================================================================
+# gains-gate.yml — Post-Phase Gains Gate (17-check operational invariance)
+# -----------------------------------------------------------------------------
+# WHAT THIS GATES:
+#   Runs scripts/gains-gate.sh — a 17-check, ~30s suite that asserts the
+#   operational invariants of the ContextDNA mothership (webhook plumbing,
+#   3-surgeon interlock defaults, ZSF wiring, import-smoke, etc.). The gate
+#   protects the core property "delete laptop + AWS = still works": every PR
+#   and every push to main must show that the invariants still hold.
+#
+# WHAT FAILURE MEANS:
+#   At least one critical invariant regressed. DO NOT MERGE. Fix the failing
+#   check at its root (do not silence the gate). Re-run after fix.
+#
+# WHY REQUIRED:
+#   Gains gate is the cheapest, fastest signal that the system is still
+#   coherent. Skipping it = trusting agents to not break invariants, which
+#   has historically been a bad bet.
+# =============================================================================
+
+name: gains-gate
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  # Only cancel in-progress runs on PR branches; main pushes always run to completion.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  gains-gate:
+    name: gains-gate (17-check invariance)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout (with submodules)
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 1
+
+      - name: Setup Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+
+      - name: Install project (pyproject.toml)
+        run: |
+          python -m pip install --upgrade pip
+          # Editable install pulls deps declared in pyproject.toml.
+          # If extras are required for gains-gate, prefer [dev] or [test].
+          if [ -f pyproject.toml ]; then
+            pip install -e ".[dev]" || pip install -e .
+          else
+            echo "::error::pyproject.toml not found at repo root — gains-gate cannot install deps"
+            exit 1
+          fi
+
+      - name: Run gains-gate (17 checks, ~30s)
+        run: bash scripts/gains-gate.sh

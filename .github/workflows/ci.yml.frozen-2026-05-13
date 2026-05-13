@@ -1,0 +1,128 @@
+# Multi-fleet CI
+#
+# Runs the multi-fleet test suite + the pre-publish gate (Race S) on every
+# push to main and every PR targeting main. Matrix covers Python 3.10–3.13 on
+# Ubuntu and macOS. Windows is intentionally skipped here — see race/b2 for
+# Windows-specific test coverage.
+#
+# Secrets: NONE. PyPI publication is Aaron-only and lives in release.yml.
+
+name: multi-fleet CI
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'multi-fleet/**'
+      - '.github/workflows/ci.yml'
+  pull_request:
+    branches: [main]
+    paths:
+      - 'multi-fleet/**'
+      - '.github/workflows/ci.yml'
+  workflow_dispatch:
+
+# Cancel in-flight runs of the same ref when a new push lands — saves CI
+# minutes on rapid pushes (common for race/* branches).
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: pytest (${{ matrix.os }} / py${{ matrix.python-version }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 25
+
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        python-version: ['3.10', '3.11', '3.12', '3.13']
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          # Submodules off — multi-fleet is self-contained and we don't want
+          # to pull in 3-surgeons/admin.contextdna.io for OSS CI.
+          submodules: false
+
+      - name: Setup Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+          cache-dependency-path: |
+            multi-fleet/pyproject.toml
+
+      # ----------------------------------------------------------------------
+      # nats-server is a runtime dependency of the integration tests
+      # (test_nats_client*, test_jetstream*, test_chief_*). Ubuntu uses the
+      # official .deb from the NATS GitHub releases; macOS uses Homebrew.
+      # ----------------------------------------------------------------------
+      - name: Install nats-server (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          set -euo pipefail
+          NATS_VERSION="2.10.22"
+          curl -fsSL -o /tmp/nats-server.deb \
+            "https://github.com/nats-io/nats-server/releases/download/v${NATS_VERSION}/nats-server-v${NATS_VERSION}-amd64.deb"
+          sudo dpkg -i /tmp/nats-server.deb
+          nats-server --version
+
+      - name: Install nats-server (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          set -euo pipefail
+          brew install nats-server
+          nats-server --version
+
+      - name: Install multi-fleet (editable, with dev extras)
+        working-directory: multi-fleet
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+
+      - name: Show installed environment
+        working-directory: multi-fleet
+        run: |
+          python --version
+          pip list
+
+      - name: Run pytest
+        working-directory: multi-fleet
+        run: |
+          pytest tests/ -q --tb=short
+
+      # ----------------------------------------------------------------------
+      # Pre-publish gate — Race S shipped this. Runs secret scan, full pytest,
+      # no-polling AST grep, ZSF bare-except scan, build, and twine check.
+      # We run it on Linux/3.12 only — it duplicates the matrix above and
+      # Race S guarantees identical behaviour across OSes.
+      # ----------------------------------------------------------------------
+      - name: Pre-publish gate
+        if: runner.os == 'Linux' && matrix.python-version == '3.12'
+        working-directory: multi-fleet
+        run: |
+          # build + twine are required by pre-publish.sh (steps 5 + 6).
+          pip install build twine
+          chmod +x scripts/pre-publish.sh
+          ./scripts/pre-publish.sh
+
+      # ----------------------------------------------------------------------
+      # Coverage upload is guarded — pytest-cov is not currently in the dev
+      # extras. The step is a no-op until coverage.xml is produced; once
+      # pytest-cov + --cov flags are added the upload starts working with no
+      # further wiring.
+      # ----------------------------------------------------------------------
+      - name: Upload coverage (if present)
+        if: always() && runner.os == 'Linux' && matrix.python-version == '3.12'
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-${{ matrix.os }}-py${{ matrix.python-version }}
+          path: multi-fleet/coverage.xml
+          if-no-files-found: ignore

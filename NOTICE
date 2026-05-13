@@ -1,0 +1,93 @@
+ContextDNA IDE
+Copyright (c) 2026 Aaron Tjomsland
+
+Licensed under the MIT License (see LICENSE).
+
+================================================================================
+Bundled engines (each governed by its own LICENSE inside the submodule)
+================================================================================
+
+This repository wires several first-party engines as git submodules. Each
+submodule ships its own LICENSE file; consult it for the authoritative terms.
+
+  - engines/context-dna           — Context DNA engine (MIT)
+                                    https://github.com/supportersimulator/context-dna
+  - engines/3-surgeons            — 3-Surgeons multi-model consensus (MIT)
+                                    https://github.com/supportersimulator/3-surgeons
+  - engines/multi-fleet           — Multi-Fleet transport (MIT)
+                                    https://github.com/supportersimulator/multi-fleet
+  - apps/ide-shell                — Admin / IDE Shell panel substrate (MIT)
+                                    https://github.com/supportersimulator/admin.contextdna.io
+
+The bootstrap script (scripts/bootstrap-from-scratch.sh) clones these submodules
+verbatim. Their copyright notices remain with their respective authors.
+
+
+================================================================================
+Third-party Python dependencies
+================================================================================
+
+This software depends on the following Python packages at runtime. Their
+licenses are reproduced and distributed under their own terms; this NOTICE
+records attribution.
+
+  - pydantic            (MIT)        https://github.com/pydantic/pydantic
+  - httpx               (BSD-3)      https://github.com/encode/httpx
+  - nats-py             (Apache-2.0) https://github.com/nats-io/nats.py
+  - redis-py            (MIT)        https://github.com/redis/redis-py
+  - sqlalchemy          (MIT)        https://github.com/sqlalchemy/sqlalchemy
+  - click               (BSD-3)      https://github.com/pallets/click
+  - rich                (MIT)        https://github.com/Textualize/rich
+
+Optional extras (installed only when requested):
+
+  - mlx-lm              (MIT)        https://github.com/ml-explore/mlx-examples
+  - openai-python       (Apache-2.0) https://github.com/openai/openai-python
+  - anthropic-sdk       (MIT)        https://github.com/anthropics/anthropic-sdk-python
+  - ollama-python       (MIT)        https://github.com/ollama/ollama-python
+  - pytest              (MIT)        https://github.com/pytest-dev/pytest
+  - black               (MIT)        https://github.com/psf/black
+  - ruff                (MIT)        https://github.com/astral-sh/ruff
+  - mypy                (MIT)        https://github.com/python/mypy
+
+
+================================================================================
+Third-party JavaScript / TypeScript dependencies (panel substrate)
+================================================================================
+
+The IDE shell at apps/ide-shell/ links the following major libraries. Full
+license texts are bundled with each package via npm/yarn install.
+
+  - React                  (MIT)        https://github.com/facebook/react
+  - Next.js                (MIT)        https://github.com/vercel/next.js
+  - DockView               (MIT)        https://github.com/mathuo/dockview
+  - TanStack Query         (MIT)        https://github.com/TanStack/query
+  - TypeScript             (Apache-2.0) https://github.com/microsoft/TypeScript
+  - Tailwind CSS           (MIT)        https://github.com/tailwindlabs/tailwindcss
+
+
+================================================================================
+Infrastructure
+================================================================================
+
+Docker images pulled by docker-compose.heavy.yml / docker-compose.lite.yml
+remain under the licenses set by their upstream maintainers:
+
+  - postgres        (PostgreSQL License)  https://www.postgresql.org/
+  - redis           (BSD-3 / RSAL-1.1)    https://redis.io/
+  - nats            (Apache-2.0)          https://nats.io/
+  - rabbitmq        (MPL-2.0)             https://www.rabbitmq.com/
+  - prometheus      (Apache-2.0)          https://prometheus.io/
+  - grafana         (AGPL-3.0)            https://grafana.com/
+  - jaeger          (Apache-2.0)          https://www.jaegertracing.io/
+  - ollama          (MIT)                 https://ollama.com/
+  - seaweedfs       (Apache-2.0)          https://github.com/seaweedfs/seaweedfs
+
+
+================================================================================
+Trademarks
+================================================================================
+
+"Claude" and "Claude Code" are trademarks of Anthropic, PBC. "OpenAI" and
+"GPT" are trademarks of OpenAI, OpCo, LLC. All other trademarks belong to
+their respective owners. No endorsement is implied.

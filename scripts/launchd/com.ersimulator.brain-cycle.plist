@@ -1,0 +1,31 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.ersimulator.brain-cycle</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Users/aarontjomsland/dev/er-simulator-superrepo/.venv/bin/python3</string>
+        <string>/Users/aarontjomsland/dev/er-simulator-superrepo/context-dna/src/context_dna/brain.py</string>
+        <string>cycle</string>
+    </array>
+    <key>StartInterval</key>
+    <integer>3600</integer>
+    <key>WorkingDirectory</key>
+    <string>/Users/aarontjomsland/dev/er-simulator-superrepo</string>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PYTHONPATH</key>
+        <string>/Users/aarontjomsland/dev/er-simulator-superrepo:/Users/aarontjomsland/dev/er-simulator-superrepo/context-dna/src</string>
+        <key>PATH</key>
+        <string>/usr/local/bin:/usr/bin:/bin:/opt/homebrew/bin</string>
+    </dict>
+    <key>StandardOutPath</key>
+    <string>/tmp/brain-cycle.log</string>
+    <key>StandardErrorPath</key>
+    <string>/tmp/brain-cycle.err</string>
+    <key>RunAtLoad</key>
+    <true/>
+</dict>
+</plist>

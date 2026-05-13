@@ -1,0 +1,343 @@
+{
+  "counter_snapshot": {
+    "bogus_root": 0,
+    "folder_missing": 0,
+    "git_log_failures": 0,
+    "git_parse_failures": 0,
+    "index_write_failures": 0,
+    "rebuild_calls": 1,
+    "total_scanned": 46
+  },
+  "docs": {
+    "docs/dao/contextdna-product-boundaries.md": {
+      "current_level": "L4",
+      "ever_in": [
+        "L4"
+      ],
+      "transitions": []
+    },
+    "docs/dao/corrigibility-loop-algorithm.md": {
+      "current_level": "L4",
+      "ever_in": [
+        "L4"
+      ],
+      "transitions": []
+    },
+    "docs/dao/multifleet-channel-priority.md": {
+      "current_level": "L4",
+      "ever_in": [
+        "L4"
+      ],
+      "transitions": []
+    },
+    "docs/dao/rejected-considerations-archive.md": {
+      "current_level": "L4",
+      "ever_in": [
+        "L4"
+      ],
+      "transitions": []
+    },
+    "docs/dao/risklane-orthogonality.md": {
+      "current_level": "L4",
+      "ever_in": [
+        "L4"
+      ],
+      "transitions": []
+    },
+    "docs/dao/trialbench-adjudication.md": {
+      "current_level": "L4",
+      "ever_in": [
+        "L4"
+      ],
+      "transitions": []
+    },
+    "docs/dao/trialbench-blinding.md": {
+      "current_level": "L4",
+      "ever_in": [
+        "L4"
+      ],
+      "transitions": []
+    },
+    "docs/dao/trialbench-claim-language.md": {
+      "current_level": "L4",
+      "ever_in": [
+        "L4"
+      ],
+      "transitions": []
+    },
+    "docs/dao/trialbench-endpoints.md": {
+      "current_level": "L4",
+      "ever_in": [
+        "L4"
+      ],
+      "transitions": []
+    },
+    "docs/dao/trialbench-protocol.md": {
+      "current_level": "L4",
+      "ever_in": [
+        "L4"
+      ],
+      "transitions": []
+    },
+    "docs/dao/trialbench-randomization.md": {
+      "current_level": "L4",
+      "ever_in": [
+        "L4"
+      ],
+      "transitions": []
+    },
+    "docs/dao/trialbench-sap.md": {
+      "current_level": "L4",
+      "ever_in": [
+        "L4"
+      ],
+      "transitions": []
+    },
+    "docs/inbox/2026-05-04-trialbench-proposal.md": {
+      "current_level": "L1",
+      "ever_in": [
+        "L1"
+      ],
+      "transitions": []
+    },
+    "docs/inbox/chained-commands-vision.md": {
+      "current_level": "L1",
+      "ever_in": [
+        "L1"
+      ],
+      "transitions": []
+    },
+    "docs/inbox/images/README.md": {
+      "current_level": "L1",
+      "ever_in": [
+        "L1"
+      ],
+      "transitions": []
+    },
+    "docs/reflect/2026-04-25-discord-audit.md": {
+      "current_level": "L3",
+      "ever_in": [
+        "L3"
+      ],
+      "transitions": []
+    },
+    "docs/reflect/2026-04-25-discord-code-audit.md": {
+      "current_level": "L3",
+      "ever_in": [
+        "L3"
+      ],
+      "transitions": []
+    },
+    "docs/reflect/2026-04-25-discord-integration-audit.md": {
+      "current_level": "L3",
+      "ever_in": [
+        "L3"
+      ],
+      "transitions": []
+    },
+    "docs/reflect/2026-04-25-merge-3s-consensus.md": {
+      "current_level": "L3",
+      "ever_in": [
+        "L3"
+      ],
+      "transitions": []
+    },
+    "docs/reflect/2026-04-25-merge-ide-alignment.md": {
+      "current_level": "L3",
+      "ever_in": [
+        "L3"
+      ],
+      "transitions": []
+    },
+    "docs/reflect/2026-04-25-merge-risk-assessment.md": {
+      "current_level": "L3",
+      "ever_in": [
+        "L3"
+      ],
+      "transitions": []
+    },
+    "docs/reflect/2026-04-25-merge-topology.md": {
+      "current_level": "L3",
+      "ever_in": [
+        "L3"
+      ],
+      "transitions": []
+    },
+    "docs/reflect/2026-04-26-3s-priorities.md": {
+      "current_level": "L3",
+      "ever_in": [
+        "L3"
+      ],
+      "transitions": []
+    },
+    "docs/reflect/2026-04-26-cross-cutting-priorities.md": {
+      "current_level": "L3",
+      "ever_in": [
+        "L3"
+      ],
+      "transitions": []
+    },
+    "docs/reflect/2026-04-26-discord-priorities.md": {
+      "current_level": "L3",
+      "ever_in": [
+        "L3"
+      ],
+      "transitions": []
+    },
+    "docs/reflect/2026-04-26-fcc-fleet-verification.md": {
+      "current_level": "L3",
+      "ever_in": [
+        "L3"
+      ],
+      "transitions": []
+    },
+    "docs/reflect/2026-04-26-ide-priorities.md": {
+      "current_level": "L3",
+      "ever_in": [
+        "L3"
+      ],
+      "transitions": []
+    },
+    "docs/reflect/2026-04-26-mf-3s-coordination-proof.md": {
+      "current_level": "L3",
+      "ever_in": [
+        "L3"
+      ],
+      "transitions": []
+    },
+    "docs/reflect/2026-04-26-mf-priorities.md": {
+      "current_level": "L3",
+      "ever_in": [
+        "L3"
+      ],
+      "transitions": []
+    },
+    "docs/reflect/2026-05-04-3s-consult-bridge-tool-use.md": {
+      "current_level": "L3",
+      "ever_in": [
+        "L3"
+      ],
+      "transitions": []
+    },
+    "docs/reflect/2026-05-04-3s-priorities.md": {
+      "current_level": "L3",
+      "ever_in": [
+        "L3"
+      ],
+      "transitions": []
+    },
+    "docs/reflect/2026-05-04-B5-fleet-burst-alignment.md": {
+      "current_level": "L3",
+      "ever_in": [
+        "L3"
+      ],
+      "transitions": []
+    },
+    "docs/reflect/2026-05-04-bridge-gap-rerank.md": {
+      "current_level": "L3",
+      "ever_in": [
+        "L3"
+      ],
+      "transitions": []
+    },
+    "docs/reflect/2026-05-04-cross-cutting-northstar.md": {
+      "current_level": "L3",
+      "ever_in": [
+        "L3"
+      ],
+      "transitions": []
+    },
+    "docs/reflect/2026-05-04-ide-alignment-audit.md": {
+      "current_level": "L3",
+      "ever_in": [
+        "L3"
+      ],
+      "transitions": []
+    },
+    "docs/reflect/2026-05-04-mf-priorities.md": {
+      "current_level": "L3",
+      "ever_in": [
+        "L3"
+      ],
+      "transitions": []
+    },
+    "docs/reflect/2026-05-04-sprint-final-summary.md": {
+      "current_level": "L3",
+      "ever_in": [
+        "L3"
+      ],
+      "transitions": []
+    },
+    "docs/reflect/2026-05-05-B5b-round-7-alignment.md": {
+      "current_level": "L3",
+      "ever_in": [
+        "L3"
+      ],
+      "transitions": []
+    },
+    "docs/reflect/2026-05-06-trialbench-roadmap-audit.md": {
+      "current_level": "L3",
+      "ever_in": [
+        "L3"
+      ],
+      "transitions": []
+    },
+    "docs/reflect/2026-05-06-v3-design-decisions.md": {
+      "current_level": "L3",
+      "ever_in": [
+        "L3"
+      ],
+      "transitions": []
+    },
+    "docs/vision/2026-05-04-trialbench-vision.md": {
+      "current_level": "L2",
+      "ever_in": [
+        "L2"
+      ],
+      "transitions": []
+    },
+    "docs/vision/core-truths.md": {
+      "current_level": "L2",
+      "ever_in": [
+        "L2"
+      ],
+      "transitions": []
+    },
+    "docs/vision/ghostscan-contextdna-chat.md": {
+      "current_level": "L2",
+      "ever_in": [
+        "L2"
+      ],
+      "transitions": []
+    },
+    "docs/vision/local-llm-philosophy-and-3surgeons-architecture.md": {
+      "current_level": "L2",
+      "ever_in": [
+        "L2"
+      ],
+      "transitions": []
+    },
+    "docs/vision/superset-vision-chat.md": {
+      "current_level": "L2",
+      "ever_in": [
+        "L2"
+      ],
+      "transitions": []
+    },
+    "docs/vision/trialbench-thesis.md": {
+      "current_level": "L2",
+      "ever_in": [
+        "L2"
+      ],
+      "transitions": []
+    }
+  },
+  "last_scan_ts": "2026-05-12T13:32:44.551702+00:00",
+  "level_counts": {
+    "L1": 3,
+    "L2": 6,
+    "L3": 25,
+    "L4": 12
+  },
+  "total_indexed": 46
+}

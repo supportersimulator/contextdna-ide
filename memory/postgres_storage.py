@@ -72,7 +72,7 @@ DATABASE_NAME = os.environ.get('LEARNINGS_DB_NAME', os.environ.get('DATABASE_NAM
 
 DATABASE_URL = os.environ.get(
     'DATABASE_URL',
-    f"postgresql://{DATABASE_USER}:{DATABASE_PASSWORD}@{DATABASE_HOST}:{DATABASE_PORT}/{DATABASE_NAME}"
+    f"postgresql://{DATABASE_USER}:YOUR_PASSWORD@{DATABASE_HOST}:{DATABASE_PORT}/{DATABASE_NAME}"
 )
 
 # Global connection pool

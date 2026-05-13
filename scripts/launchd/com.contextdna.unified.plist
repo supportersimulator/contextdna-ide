@@ -1,0 +1,95 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <!--
+    CONTEXT DNA HELPER AGENT SERVICE (macOS launchd)
+
+    Runs agent_service.py on port 8080 via uvicorn.
+    launchd manages the process directly (foreground) so it can:
+      - Auto-restart on crash (KeepAlive)
+      - Start on login (RunAtLoad)
+      - Throttle restart loops (ThrottleInterval)
+
+    Installation:
+        cp scripts/launchd/com.contextdna.unified.plist ~/Library/LaunchAgents/
+        launchctl load ~/Library/LaunchAgents/com.contextdna.unified.plist
+
+    Uninstall:
+        launchctl unload ~/Library/LaunchAgents/com.contextdna.unified.plist
+        rm ~/Library/LaunchAgents/com.contextdna.unified.plist
+
+    Check status:
+        launchctl list | grep contextdna
+        curl -s http://localhost:8080/health | python3 -m json.tool
+
+    View logs:
+        tail -f ~/dev/er-simulator-superrepo/logs/agent_service.log
+    -->
+
+    <key>Label</key>
+    <string>com.contextdna.unified</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/bash</string>
+        <string>__USER_HOME__/dev/er-simulator-superrepo/scripts/start-helper-agent.sh</string>
+    </array>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>KeepAlive</key>
+    <true/>
+
+    <key>StandardOutPath</key>
+    <string>__USER_HOME__/dev/er-simulator-superrepo/logs/agent_service.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>__USER_HOME__/dev/er-simulator-superrepo/logs/agent_service.log</string>
+
+    <key>WorkingDirectory</key>
+    <string>__USER_HOME__/dev/er-simulator-superrepo</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <!--
+        PATH must include /usr/sbin:/sbin so the start-helper-agent.sh
+        port-conflict probe can resolve `lsof` (R-0021 root cause: launchd
+        default PATH omits /usr/sbin → lsof not found → port_in_use returns
+        false → uvicorn starts → bind fails → 9266 crash-loop respawns).
+        -->
+        <key>PATH</key>
+        <string>/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:/opt/homebrew/bin</string>
+        <key>HOME</key>
+        <string>__USER_HOME__</string>
+        <key>PYTHONPATH</key>
+        <string>__USER_HOME__/dev/er-simulator-superrepo:__USER_HOME__/dev/er-simulator-superrepo/context-dna/src</string>
+    </dict>
+
+    <!-- Throttle restarts: wait 60s between respawns. Was 15s, but when
+         Docker contextdna-helper-agent holds port 8080 the script exits
+         cleanly (exit 0) every spawn — at 15s that's 240 wasted spawns/hr.
+         60s keeps watchdog responsive while avoiding spam (60/hr). -->
+    <key>ThrottleInterval</key>
+    <integer>60</integer>
+
+    <key>ProcessType</key>
+    <string>Background</string>
+
+    <!-- Increase file descriptor limits: default 256 is too low for
+         11 SQLite DBs + HTTP server + WebSocket connections + log files.
+         Was hitting ~410 FDs before leak fixes; 4096 soft / 8192 hard
+         provides headroom without risking system-wide exhaustion. -->
+    <key>SoftResourceLimits</key>
+    <dict>
+        <key>NumberOfFiles</key>
+        <integer>4096</integer>
+    </dict>
+    <key>HardResourceLimits</key>
+    <dict>
+        <key>NumberOfFiles</key>
+        <integer>8192</integer>
+    </dict>
+</dict>
+</plist>

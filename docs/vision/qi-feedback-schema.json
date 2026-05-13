@@ -1,0 +1,328 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://ersimulator.com/schemas/qi-feedback-event/1.0.0",
+  "title": "QI Feedback Event",
+  "description": "Structured feedback event captured per case attempt in the ER Simulator. Used for Quality Improvement (QI) workflow (issue #12).",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "case_id",
+    "learner_id",
+    "institution_id",
+    "session_id",
+    "started_at",
+    "completed_at",
+    "mode",
+    "actions",
+    "vitals_checks",
+    "diagnosis_attempts",
+    "final_diagnosis",
+    "outcome",
+    "score_pct",
+    "time_to_key_action_s",
+    "time_to_diagnosis_s",
+    "feedback_shown"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "schema_version": {
+      "type": "string",
+      "pattern": "^\\d+\\.\\d+\\.\\d+$",
+      "description": "Semantic version of this schema.",
+      "examples": ["1.0.0"]
+    },
+    "case_id": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Stable slug identifying the case, e.g. 'stemi-anterior-v2'."
+    },
+    "learner_id": {
+      "type": "string",
+      "format": "uuid",
+      "description": "Opaque UUID for the learner. Never contains PII."
+    },
+    "institution_id": {
+      "type": "string",
+      "format": "uuid",
+      "description": "Opaque UUID for the institution."
+    },
+    "session_id": {
+      "type": "string",
+      "format": "uuid",
+      "description": "UUID generated at simulator launch. Unique per attempt."
+    },
+    "started_at": {
+      "type": "string",
+      "format": "date-time",
+      "description": "UTC ISO 8601 timestamp when the case was started."
+    },
+    "completed_at": {
+      "type": "string",
+      "format": "date-time",
+      "description": "UTC ISO 8601 timestamp when the case was completed or timed out."
+    },
+    "mode": {
+      "type": "string",
+      "enum": ["training", "assessment", "debrief"],
+      "description": "Session mode. Controls feedback display rules."
+    },
+    "actions": {
+      "type": "array",
+      "description": "Ordered list of learner actions taken during the case.",
+      "items": {
+        "$ref": "#/definitions/action"
+      }
+    },
+    "vitals_checks": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Number of times the learner reviewed the vitals panel."
+    },
+    "diagnosis_attempts": {
+      "type": "array",
+      "description": "Ordered list of diagnosis guesses submitted by the learner.",
+      "items": {
+        "$ref": "#/definitions/diagnosis_attempt"
+      }
+    },
+    "final_diagnosis": {
+      "type": "string",
+      "minLength": 1,
+      "description": "The last submitted diagnosis string."
+    },
+    "outcome": {
+      "type": "string",
+      "enum": ["correct", "partial", "incorrect"],
+      "description": "Overall outcome of the attempt."
+    },
+    "score_pct": {
+      "type": "number",
+      "minimum": 0,
+      "maximum": 100,
+      "description": "Computed score as a percentage (0–100)."
+    },
+    "time_to_key_action_s": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Seconds from case start to the first critical/key action."
+    },
+    "time_to_diagnosis_s": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Seconds from case start to the first diagnosis attempt."
+    },
+    "feedback_shown": {
+      "type": "array",
+      "description": "Feedback items that were displayed to the learner.",
+      "items": {
+        "$ref": "#/definitions/feedback_item"
+      }
+    },
+    "flags": {
+      "type": "array",
+      "description": "Optional QI flag codes identifying specific deficiencies, e.g. 'missed_ecg', 'delayed_aspirin'.",
+      "items": {
+        "type": "string",
+        "minLength": 1
+      },
+      "default": []
+    },
+    "trialbench_arm": {
+      "type": "string",
+      "enum": ["A_raw", "B_generic_context", "C_contextdna_packet"],
+      "description": "Optional TrialBench arm assignment. Present only when session is part of a TrialBench trial."
+    },
+    "trialbench_trial_id": {
+      "type": "string",
+      "description": "Optional TrialBench trial ID. Present when trialbench_arm is set."
+    },
+    "client_version": {
+      "type": "string",
+      "description": "Optional simulator client version string, e.g. '2.4.1'."
+    },
+    "platform": {
+      "type": "string",
+      "enum": ["web", "ios", "android", "desktop"],
+      "description": "Optional client platform."
+    }
+  },
+  "definitions": {
+    "action": {
+      "type": "object",
+      "required": ["seq", "t_s", "action_type", "detail", "correct", "critical"],
+      "additionalProperties": false,
+      "properties": {
+        "seq": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "1-based sequence number within the attempt."
+        },
+        "t_s": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Seconds elapsed from case start when the action was taken."
+        },
+        "action_type": {
+          "type": "string",
+          "enum": [
+            "order_medication",
+            "order_imaging",
+            "order_lab",
+            "perform_procedure",
+            "consult",
+            "reassess_vitals",
+            "administer_treatment",
+            "transfer",
+            "other"
+          ],
+          "description": "Category of the action."
+        },
+        "detail": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Human-readable detail, e.g. 'aspirin 325mg' or '12-lead ECG'."
+        },
+        "correct": {
+          "type": "boolean",
+          "description": "Whether this action was correct per the case rubric."
+        },
+        "critical": {
+          "type": "boolean",
+          "description": "Whether this action is a critical/key action for the case."
+        },
+        "note": {
+          "type": "string",
+          "description": "Optional educator note attached to this action in the rubric."
+        }
+      }
+    },
+    "diagnosis_attempt": {
+      "type": "object",
+      "required": ["seq", "t_s", "value", "confidence", "correct"],
+      "additionalProperties": false,
+      "properties": {
+        "seq": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "1-based sequence number of this diagnosis guess."
+        },
+        "t_s": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Seconds elapsed from case start when this guess was submitted."
+        },
+        "value": {
+          "type": "string",
+          "minLength": 1,
+          "description": "The diagnosis string submitted by the learner."
+        },
+        "confidence": {
+          "type": "string",
+          "enum": ["low", "medium", "high"],
+          "description": "Learner-reported confidence level."
+        },
+        "correct": {
+          "type": "boolean",
+          "description": "Whether this guess matches a correct answer per the case rubric."
+        }
+      }
+    },
+    "feedback_item": {
+      "type": "object",
+      "required": ["id", "category", "message", "shown_at"],
+      "additionalProperties": false,
+      "properties": {
+        "id": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Stable identifier for this feedback item, e.g. 'fb-missed-ecg'."
+        },
+        "category": {
+          "type": "string",
+          "enum": [
+            "correct_action",
+            "critical_miss",
+            "suboptimal_order",
+            "timing_concern",
+            "diagnosis_error"
+          ],
+          "description": "Feedback category."
+        },
+        "message": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Human-readable feedback message shown to the learner."
+        },
+        "shown_at": {
+          "type": "string",
+          "enum": ["immediate", "debrief", "both"],
+          "description": "When this feedback item was displayed."
+        },
+        "reference_url": {
+          "type": "string",
+          "format": "uri",
+          "description": "Optional link to a guideline or reference supporting this feedback."
+        },
+        "related_action_seq": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "Optional seq of the action this feedback item relates to."
+        }
+      }
+    }
+  },
+  "examples": [
+    {
+      "schema_version": "1.0.0",
+      "case_id": "stemi-anterior-v2",
+      "learner_id": "a1b2c3d4-0000-0000-0000-000000000001",
+      "institution_id": "f0e1d2c3-0000-0000-0000-000000000002",
+      "session_id": "deadbeef-cafe-0000-0000-000000000003",
+      "started_at": "2026-05-12T14:00:00Z",
+      "completed_at": "2026-05-12T14:22:37Z",
+      "mode": "training",
+      "actions": [
+        {
+          "seq": 1,
+          "t_s": 45,
+          "action_type": "order_imaging",
+          "detail": "12-lead ECG",
+          "correct": true,
+          "critical": true
+        },
+        {
+          "seq": 2,
+          "t_s": 120,
+          "action_type": "order_medication",
+          "detail": "aspirin 325mg",
+          "correct": true,
+          "critical": true
+        }
+      ],
+      "vitals_checks": 4,
+      "diagnosis_attempts": [
+        {
+          "seq": 1,
+          "t_s": 180,
+          "value": "STEMI",
+          "confidence": "high",
+          "correct": true
+        }
+      ],
+      "final_diagnosis": "STEMI",
+      "outcome": "correct",
+      "score_pct": 94.0,
+      "time_to_key_action_s": 45,
+      "time_to_diagnosis_s": 180,
+      "feedback_shown": [
+        {
+          "id": "fb-ecg-timely",
+          "category": "correct_action",
+          "message": "ECG ordered within the first minute — excellent.",
+          "shown_at": "immediate"
+        }
+      ],
+      "flags": []
+    }
+  ]
+}

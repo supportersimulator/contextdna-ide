@@ -1,0 +1,64 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Fleet audit-tick — launchd trigger.
+
+  Independent of xbar so a crashed/exited xbar cannot leave the brain
+  broker offline undetected (3s post-exec verification Q2 fix). Spec:
+  docs/plans/2026-04-26-fleet-audit-pipeline.md.
+
+  Runs every FLEET_AUDIT_LAUNCHD_INTERVAL seconds (default 300 = 5 min).
+  The detector suite is cheap (~250ms) so this is well within the
+  cost budgets in the spec. State diff in /tmp ensures duplicate ticks
+  emit zero output when nothing changed.
+
+  Templated paths get substituted at install time by
+  scripts/install-fleet-audit-triggers.sh:
+    @REPO@   -> repo root
+    @PY@     -> python interpreter
+    @NODE@   -> MULTIFLEET_NODE_ID
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.fleet.audit-tick</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>@REPO@/scripts/fleet-audit-bootstrap-env.sh</string>
+        <string>@PY@</string>
+        <string>@REPO@/scripts/fleet-audit-tick.py</string>
+        <string>--source</string>
+        <string>launchd</string>
+        <string>--no-consult</string>
+        <string>--no-chief</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>@REPO@</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>MULTIFLEET_NODE_ID</key>
+        <string>@NODE@</string>
+        <key>PATH</key>
+        <string>/usr/local/bin:/usr/bin:/bin</string>
+    </dict>
+
+    <key>StartInterval</key>
+    <integer>300</integer>
+
+    <key>RunAtLoad</key>
+    <false/>
+
+    <key>StandardOutPath</key>
+    <string>/tmp/fleet-audit-tick-launchd.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>/tmp/fleet-audit-tick-launchd.err</string>
+
+    <key>ThrottleInterval</key>
+    <integer>60</integer>
+</dict>
+</plist>

@@ -1,0 +1,652 @@
+# =============================================================================
+# ContextDNA IDE — Mothership HEAVY profile
+# -----------------------------------------------------------------------------
+# Full Acontext-derived stack for a beefy node (Mac Studio, home server, cloud).
+# Target footprint: 6 GB+ RAM, 50 GB disk, 4+ CPU.
+#
+# Companion file: docker-compose.lite.yml (laptop, 2-3 GB).
+# Bidirectional sync mechanism: NATS leaf-node + JetStream KV `fleet_roster` +
+# Redis pub/sub. The heavy node runs the NATS *chief* that lite nodes connect
+# back to as leaf nodes.
+#
+# Usage:
+#   cp .env.example .env       # set POSTGRES_PASSWORD, REDIS_PASSWORD, etc.
+#   docker compose -f docker-compose.heavy.yml up -d
+#   docker compose -f docker-compose.heavy.yml --profile llm up -d   # +Ollama
+#
+# Modern compose syntax: no `version:` key (compose v2 implies schema v3+).
+# Inspired by context-dna/infra/docker-compose.yaml (Acontext-derived stack)
+# under Apache-2.0. See ARCHITECTURE.md for sync architecture diagram.
+# =============================================================================
+
+name: contextdna-heavy
+
+# -----------------------------------------------------------------------------
+# YAML anchors — shared logging + healthcheck patterns
+# -----------------------------------------------------------------------------
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "3"
+    compress: "true"
+
+services:
+  # ===========================================================================
+  # FOUNDATION TIER — datastores
+  # ===========================================================================
+
+  # --- PostgreSQL 16 with pgvector (semantic search backbone) -----------------
+  # Used by the helper agent and Acontext core for embeddings + structured data.
+  postgres:
+    image: pgvector/pgvector:pg16
+    container_name: contextdna-heavy-postgres
+    restart: unless-stopped
+    logging: *default-logging
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-contextdna}
+      POSTGRES_USER: ${POSTGRES_USER:-contextdna}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    deploy:
+      resources:
+        limits:
+          memory: ${POSTGRES_MEMORY:-1g}
+          cpus: "${POSTGRES_CPUS:-1}"
+        reservations:
+          memory: 256m
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-contextdna} -d ${POSTGRES_DB:-contextdna}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    networks: [contextdna_heavy]
+
+  # --- Redis 7 (cache, rate limiting, pub/sub bus for fleet learnings) --------
+  redis:
+    image: redis:7-alpine
+    container_name: contextdna-heavy-redis
+    restart: unless-stopped
+    logging: *default-logging
+    command:
+      - "redis-server"
+      - "--appendonly"
+      - "yes"
+      - "--requirepass"
+      - "${REDIS_PASSWORD}"
+    volumes:
+      - redis_data:/data
+    ports:
+      - "${REDIS_PORT:-6379}:6379"
+    deploy:
+      resources:
+        limits:
+          memory: ${REDIS_MEMORY:-512m}
+          cpus: "${REDIS_CPUS:-0.5}"
+        reservations:
+          memory: 64m
+    healthcheck:
+      test: ["CMD", "redis-cli", "-a", "${REDIS_PASSWORD}", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+    networks: [contextdna_heavy]
+
+  # --- RabbitMQ 3.13-management (Celery broker, S2/S6/S8 task fan-out) --------
+  # Heavy mode only. Lite falls back to in-process scheduling.
+  rabbitmq:
+    image: rabbitmq:3.13-management
+    container_name: contextdna-heavy-rabbitmq
+    restart: unless-stopped
+    logging: *default-logging
+    environment:
+      RABBITMQ_DEFAULT_USER: ${RABBITMQ_USER:-contextdna}
+      RABBITMQ_DEFAULT_PASS: ${RABBITMQ_PASSWORD}
+      RABBITMQ_DEFAULT_VHOST: ${RABBITMQ_VHOST:-/}
+    volumes:
+      - rabbitmq_data:/var/lib/rabbitmq
+    ports:
+      - "${RABBITMQ_PORT:-5672}:5672"        # AMQP
+      - "${RABBITMQ_MGMT_PORT:-15672}:15672" # Management UI
+    deploy:
+      resources:
+        limits:
+          memory: ${RABBITMQ_MEMORY:-512m}
+          cpus: "${RABBITMQ_CPUS:-0.5}"
+        reservations:
+          memory: 128m
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 15s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
+    networks: [contextdna_heavy]
+
+  # --- SeaweedFS (S3-compatible blob store for SOPs, artifacts, evidence) -----
+  # Master + volume + filer + S3 API all in the single-binary `server` mode.
+  seaweedfs:
+    image: chrislusf/seaweedfs:latest
+    container_name: contextdna-heavy-seaweedfs
+    restart: unless-stopped
+    logging: *default-logging
+    user: root  # required: https://github.com/seaweedfs/seaweedfs/pull/7399
+    environment:
+      WEED_S3_ACCESS_KEY: ${S3_ACCESS_KEY:-contextdna}
+      WEED_S3_SECRET_KEY: ${S3_SECRET_KEY}
+      WEED_MASTER_DEFAULT_REPLICATION: "000"
+    command: >
+      server -s3 -s3.port=8333 -dir=/data
+      -volume.max=100
+      -volume.publicUrl=http://seaweedfs:8333
+      -ip=seaweedfs -ip.bind=0.0.0.0
+      -metricsPort=9324
+    volumes:
+      - seaweedfs_data:/data
+    ports:
+      - "${S3_API_PORT:-8333}:8333"        # S3-compatible API
+      - "${S3_MASTER_PORT:-9333}:9333"     # Master UI
+      - "${S3_FILER_PORT:-8888}:8888"      # Filer UI
+    deploy:
+      resources:
+        limits:
+          memory: ${SEAWEEDFS_MEMORY:-512m}
+          cpus: "${SEAWEEDFS_CPUS:-1}"
+        reservations:
+          memory: 128m
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O- http://localhost:8333 >/dev/null 2>&1 || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+      start_period: 60s
+    networks: [contextdna_heavy]
+
+  # --- SeaweedFS bucket setup (one-shot init container) ----------------------
+  seaweedfs-setup:
+    image: amazon/aws-cli:2.32.6
+    container_name: contextdna-heavy-seaweedfs-setup
+    restart: "no"
+    logging: *default-logging
+    depends_on:
+      seaweedfs:
+        condition: service_healthy
+    environment:
+      AWS_ACCESS_KEY_ID: ${S3_ACCESS_KEY:-contextdna}
+      AWS_SECRET_ACCESS_KEY: ${S3_SECRET_KEY}
+      AWS_DEFAULT_REGION: ${S3_REGION:-us-east-1}
+    entrypoint:
+      - "/bin/sh"
+      - "-c"
+      - >
+        set -e;
+        BUCKET=$${S3_BUCKET:-contextdna-assets};
+        echo "Creating bucket $$BUCKET";
+        aws --endpoint-url=http://seaweedfs:8333 s3 mb s3://$$BUCKET 2>/dev/null || true;
+        for i in 1 2 3 4 5 6 7 8 9 10; do
+          if aws --endpoint-url=http://seaweedfs:8333 s3 ls s3://$$BUCKET >/dev/null 2>&1; then
+            echo "Bucket ready"; exit 0;
+          fi;
+          echo "waiting ($$i/10)"; sleep 3;
+        done;
+        echo "Bucket creation failed"; exit 1
+    networks: [contextdna_heavy]
+
+  # ===========================================================================
+  # FLEET TIER — NATS chief + bidirectional sync hub
+  # ===========================================================================
+
+  # --- NATS chief (JetStream cluster, leaf-node accept point) ----------------
+  # Lite nodes connect here as leaf nodes (port 7422). JetStream KV stream
+  # `fleet_roster` is the canonical fleet state. Redis pub/sub mirrors
+  # learnings → lite nodes.
+  nats:
+    image: nats:2-alpine
+    container_name: contextdna-heavy-nats
+    restart: unless-stopped
+    logging: *default-logging
+    command:
+      - "-js"                                          # enable JetStream
+      - "-sd=/data"                                    # JetStream store dir
+      - "-m=8222"                                      # monitoring port
+      - "--name=chief"
+      - "--cluster_name=contextdna-heavy"
+      - "--cluster=nats://0.0.0.0:6222"
+      - "--routes=${NATS_CLUSTER_ROUTES:-}"            # peer chiefs (optional)
+      - "--client_advertise=${NATS_ADVERTISE_HOST:-nats}:4222"
+      # Leaf-node listener for lite laptops to connect back.
+      - "--leafnode_listen=0.0.0.0:7422"
+    volumes:
+      - nats_data:/data
+    ports:
+      - "${NATS_CLIENT_PORT:-4222}:4222"   # NATS client
+      - "${NATS_CLUSTER_PORT:-6222}:6222"  # cluster routes (mac→mac→cloud)
+      - "${NATS_MONITOR_PORT:-8222}:8222"  # /healthz, /varz
+      - "${NATS_LEAF_PORT:-7422}:7422"     # leaf-node accept (lite → heavy)
+    deploy:
+      resources:
+        limits:
+          memory: ${NATS_MEMORY:-512m}
+          cpus: "${NATS_CPUS:-0.5}"
+        reservations:
+          memory: 128m
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O- http://localhost:8222/healthz | grep -q ok || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+    networks: [contextdna_heavy]
+
+  # ===========================================================================
+  # SERVICE MESH — Traefik reverse proxy (letsencrypt)
+  # ===========================================================================
+
+  # --- Traefik 3 (TLS termination, host routing) ------------------------------
+  # Routes:
+  #   acontext.local → contextdna-api  (helper agent / API)
+  #   ui.acontext.local → contextdna-ui (Next.js IDE shell — apps/ide-shell)
+  # Configure dynamic routers in ./traefik/dynamic/*.yml (out of scope here).
+  traefik:
+    image: traefik:v3.0
+    container_name: contextdna-heavy-traefik
+    restart: unless-stopped
+    logging: *default-logging
+    command:
+      - "--providers.docker=true"
+      - "--providers.docker.exposedbydefault=false"
+      - "--providers.file.directory=/etc/traefik/dynamic"
+      - "--providers.file.watch=true"
+      - "--entrypoints.web.address=:80"
+      - "--entrypoints.websecure.address=:443"
+      - "--certificatesresolvers.le.acme.tlschallenge=true"
+      - "--certificatesresolvers.le.acme.email=${LETSENCRYPT_EMAIL:-admin@example.com}"
+      - "--certificatesresolvers.le.acme.storage=/letsencrypt/acme.json"
+      - "--api.dashboard=true"
+      - "--ping=true"
+    ports:
+      - "${TRAEFIK_HTTP_PORT:-80}:80"
+      - "${TRAEFIK_HTTPS_PORT:-443}:443"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - ./traefik/dynamic:/etc/traefik/dynamic:ro
+      - traefik_letsencrypt:/letsencrypt
+      - traefik_logs:/var/log/traefik
+    labels:
+      # API/dashboard router — exposed at https://traefik.acontext.local
+      - "traefik.enable=true"
+      - "traefik.http.routers.dashboard.rule=Host(`traefik.acontext.local`)"
+      - "traefik.http.routers.dashboard.service=api@internal"
+      - "traefik.http.routers.dashboard.entrypoints=websecure"
+      - "traefik.http.routers.dashboard.tls.certresolver=le"
+    healthcheck:
+      test: ["CMD", "traefik", "healthcheck", "--ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+    networks: [contextdna_heavy]
+
+  # ===========================================================================
+  # APPLICATION TIER — webhook MCP server, helper agent, Celery workers
+  # ===========================================================================
+
+  # --- MCP webhook server (Cursor/Claude Code context injection) -------------
+  # Build context is the repo root because the Dockerfile copies both the MCP
+  # script and the memory/ package.
+  mcp-webhook:
+    build:
+      context: ../../
+      dockerfile: mcp-servers/Dockerfile.mcp
+    container_name: contextdna-heavy-mcp-webhook
+    restart: unless-stopped
+    logging: *default-logging
+    environment:
+      PYTHONPATH: /app
+      REPO_ROOT: /app
+      CONTEXT_DNA_TIMEOUT: "15000"
+      REDIS_URL: redis://:${REDIS_PASSWORD}@redis:6379
+      POSTGRES_URL: postgresql://${POSTGRES_USER:YOUR_PASSWORD@postgres:5432/${POSTGRES_DB:-contextdna}
+      NATS_URL: nats://nats:4222
+      MLX_SERVER_URL: ${MLX_SERVER_URL:-http://host.docker.internal:5044}
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - ../../:/app
+    ports:
+      - "${MCP_WEBHOOK_PORT:-8000}:8000"
+    deploy:
+      resources:
+        limits:
+          memory: ${MCP_WEBHOOK_MEMORY:-256m}
+          cpus: "${MCP_WEBHOOK_CPUS:-0.25}"
+        reservations:
+          memory: 64m
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import sys; sys.path.insert(0, '/app'); from memory.session_historian import SessionHistorian; print('ok')"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+    networks: [contextdna_heavy]
+
+  # --- Helper Agent (the "subconscious" Python brain) -------------------------
+  # Builds from memory/Dockerfile.agent (TODO: confirm Dockerfile present in
+  # the mothership snapshot — see assumptions in profiles/heavy.yaml).
+  helper-agent:
+    build:
+      context: ../../memory
+      dockerfile: Dockerfile.agent
+    container_name: contextdna-heavy-helper-agent
+    restart: unless-stopped
+    logging: *default-logging
+    environment:
+      MODE: heavy
+      POSTGRES_URL: postgresql://${POSTGRES_USER:YOUR_PASSWORD@postgres:5432/${POSTGRES_DB:-contextdna}
+      REDIS_URL: redis://:${REDIS_PASSWORD}@redis:6379
+      REDIS_PASSWORD: ${REDIS_PASSWORD}
+      NATS_URL: nats://nats:4222
+      WORK_LOG_PATH: /app/memory/.work_dialogue_log.jsonl
+      BRAIN_CYCLE_INTERVAL: ${BRAIN_CYCLE_INTERVAL:-300}
+      SUCCESS_DETECTION_INTERVAL: ${SUCCESS_DETECTION_INTERVAL:-60}
+      EVOLUTION_INTERVAL: ${EVOLUTION_INTERVAL:-1800}
+      MLX_SERVER_URL: ${MLX_SERVER_URL:-http://host.docker.internal:5044}
+      OLLAMA_URL: ${OLLAMA_URL:-http://ollama:11434}
+      S3_ENDPOINT: http://seaweedfs:8333
+      S3_BUCKET: ${S3_BUCKET:-contextdna-assets}
+      S3_ACCESS_KEY: ${S3_ACCESS_KEY:-contextdna}
+      S3_SECRET_KEY: ${S3_SECRET_KEY}
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - ../../memory:/app/memory
+      - ~/.context-dna:/root/.context-dna
+      - work_log_data:/data
+    ports:
+      - "${HELPER_AGENT_PORT:-8080}:8080"
+    deploy:
+      resources:
+        limits:
+          memory: ${HELPER_AGENT_MEMORY:-1g}
+          cpus: "${HELPER_AGENT_CPUS:-1}"
+        reservations:
+          memory: 256m
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      nats:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+    networks: [contextdna_heavy]
+
+  # --- Celery worker (S2/S6/S8 background processors, scanners, distillers) --
+  celery-worker:
+    build:
+      context: ../../memory
+      dockerfile: Dockerfile.agent
+    container_name: contextdna-heavy-celery-worker
+    restart: unless-stopped
+    logging: *default-logging
+    command: ["celery-worker"]
+    environment:
+      MODE: heavy
+      RABBITMQ_USER: ${RABBITMQ_USER:-contextdna}
+      RABBITMQ_PASSWORD: ${RABBITMQ_PASSWORD}
+      RABBITMQ_HOST: rabbitmq
+      RABBITMQ_PORT: "5672"
+      REDIS_HOST: redis
+      REDIS_PORT: "6379"
+      REDIS_PASSWORD: ${REDIS_PASSWORD}
+      POSTGRES_URL: postgresql://${POSTGRES_USER:YOUR_PASSWORD@postgres:5432/${POSTGRES_DB:-contextdna}
+      OLLAMA_URL: ${OLLAMA_URL:-http://ollama:11434}
+      MLX_SERVER_URL: ${MLX_SERVER_URL:-http://host.docker.internal:5044}
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - ../../memory:/app/memory
+      - ~/.context-dna:/root/.context-dna
+    deploy:
+      resources:
+        limits:
+          memory: ${CELERY_WORKER_MEMORY:-1g}
+          cpus: "${CELERY_WORKER_CPUS:-2}"
+        reservations:
+          memory: 256m
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+    networks: [contextdna_heavy]
+
+  # --- Celery beat (cron-style scheduler: scan / brain cycle / evolution) ----
+  celery-beat:
+    build:
+      context: ../../memory
+      dockerfile: Dockerfile.agent
+    container_name: contextdna-heavy-celery-beat
+    restart: unless-stopped
+    logging: *default-logging
+    command: ["celery-beat"]
+    environment:
+      RABBITMQ_USER: ${RABBITMQ_USER:-contextdna}
+      RABBITMQ_PASSWORD: ${RABBITMQ_PASSWORD}
+      RABBITMQ_HOST: rabbitmq
+      RABBITMQ_PORT: "5672"
+      REDIS_HOST: redis
+      REDIS_PORT: "6379"
+      REDIS_PASSWORD: ${REDIS_PASSWORD}
+    deploy:
+      resources:
+        limits:
+          memory: ${CELERY_BEAT_MEMORY:-256m}
+          cpus: "${CELERY_BEAT_CPUS:-0.25}"
+        reservations:
+          memory: 64m
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks: [contextdna_heavy]
+
+  # ===========================================================================
+  # OBSERVABILITY TIER — Jaeger, Prometheus, Grafana
+  # ===========================================================================
+
+  # --- Jaeger (distributed tracing, OTLP receiver, all-in-one) ---------------
+  jaeger:
+    image: jaegertracing/all-in-one:1.64.0
+    container_name: contextdna-heavy-jaeger
+    restart: unless-stopped
+    logging: *default-logging
+    environment:
+      COLLECTOR_OTLP_ENABLED: "true"
+      SPAN_STORAGE_TYPE: "memory"  # swap to elasticsearch + opensearch for prod
+    ports:
+      - "${JAEGER_UI_PORT:-16686}:16686"          # Jaeger UI
+      - "${JAEGER_OTLP_GRPC_PORT:-4317}:4317"     # OTLP gRPC
+      - "${JAEGER_OTLP_HTTP_PORT:-4318}:4318"     # OTLP HTTP
+    deploy:
+      resources:
+        limits:
+          memory: ${JAEGER_MEMORY:-512m}
+          cpus: "${JAEGER_CPUS:-0.5}"
+        reservations:
+          memory: 128m
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://localhost:16686"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+    networks: [contextdna_heavy]
+
+  # --- Prometheus (metric collection) ----------------------------------------
+  prometheus:
+    image: prom/prometheus:v2.48.0
+    container_name: contextdna-heavy-prometheus
+    restart: unless-stopped
+    logging: *default-logging
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.path=/prometheus"
+      - "--storage.tsdb.retention.time=30d"
+      - "--web.enable-lifecycle"
+    volumes:
+      # Provide your own scrape config at ./prometheus/prometheus.yml.
+      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus_data:/prometheus
+    ports:
+      - "${PROMETHEUS_PORT:-9090}:9090"
+    deploy:
+      resources:
+        limits:
+          memory: ${PROMETHEUS_MEMORY:-512m}
+          cpus: "${PROMETHEUS_CPUS:-0.5}"
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost:9090/-/healthy"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    networks: [contextdna_heavy]
+
+  # --- Grafana (dashboards, datasource auto-provisioned from ./grafana) ------
+  grafana:
+    image: grafana/grafana:10.2.0
+    container_name: contextdna-heavy-grafana
+    restart: unless-stopped
+    logging: *default-logging
+    environment:
+      GF_SECURITY_ADMIN_USER: ${GRAFANA_USER:-admin}
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_PASSWORD}
+      GF_INSTALL_PLUGINS: grafana-clock-panel,grafana-piechart-panel
+    volumes:
+      # Drop datasource + dashboard provisioning yaml here:
+      # ./grafana/provisioning/datasources/prometheus.yml
+      # ./grafana/provisioning/dashboards/*.json
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - grafana_data:/var/lib/grafana
+    ports:
+      - "${GRAFANA_PORT:-3001}:3000"
+    deploy:
+      resources:
+        limits:
+          memory: ${GRAFANA_MEMORY:-256m}
+          cpus: "${GRAFANA_CPUS:-0.5}"
+    depends_on:
+      - prometheus
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q --spider http://localhost:3000/api/health || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    networks: [contextdna_heavy]
+
+  # ===========================================================================
+  # OPTIONAL — local LLM via Ollama (profile: llm)
+  # ===========================================================================
+  #
+  # Heavy nodes that don't have native MLX (e.g., Linux servers, cloud) can
+  # run Ollama + Qwen2.5-3B as a fallback. macOS hosts should prefer MLX.
+  # Start with: docker compose -f docker-compose.heavy.yml --profile llm up -d
+
+  ollama:
+    image: ollama/ollama:0.5.4
+    container_name: contextdna-heavy-ollama
+    restart: unless-stopped
+    logging: *default-logging
+    profiles: ["llm"]
+    environment:
+      OLLAMA_NUM_PARALLEL: ${OLLAMA_NUM_PARALLEL:-2}
+      OLLAMA_MAX_LOADED_MODELS: ${OLLAMA_MAX_LOADED_MODELS:-2}
+      OLLAMA_KEEP_ALIVE: ${OLLAMA_KEEP_ALIVE:-5m}
+      OLLAMA_HOST: "0.0.0.0:11434"
+    ports:
+      - "${OLLAMA_PORT:-11434}:11434"
+    volumes:
+      - ollama_models:/root/.ollama
+    deploy:
+      resources:
+        limits:
+          memory: ${OLLAMA_MEMORY:-8g}
+          cpus: "${OLLAMA_CPUS:-4}"
+        reservations:
+          memory: 2g
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:11434/api/tags || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+    networks: [contextdna_heavy]
+
+  # One-shot pull of Qwen2.5-3B so the worker can resolve `qwen2.5:3b` immediately.
+  ollama-setup:
+    image: curlimages/curl:8.5.0
+    container_name: contextdna-heavy-ollama-setup
+    restart: "no"
+    logging: *default-logging
+    profiles: ["llm"]
+    depends_on:
+      ollama:
+        condition: service_healthy
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        echo "Pulling qwen2.5:3b...";
+        curl -X POST http://ollama:11434/api/pull -d '{"name": "qwen2.5:3b"}' || true;
+        echo "Model setup complete."
+    networks: [contextdna_heavy]
+
+# =============================================================================
+# VOLUMES — named so they survive `docker compose down` (use -v to wipe)
+# =============================================================================
+volumes:
+  postgres_data:
+    name: contextdna-heavy-postgres-data
+  redis_data:
+    name: contextdna-heavy-redis-data
+  rabbitmq_data:
+    name: contextdna-heavy-rabbitmq-data
+  seaweedfs_data:
+    name: contextdna-heavy-seaweedfs-data
+  nats_data:
+    name: contextdna-heavy-nats-data
+  work_log_data:
+    name: contextdna-heavy-work-log-data
+  traefik_letsencrypt:
+    name: contextdna-heavy-traefik-letsencrypt
+  traefik_logs:
+    name: contextdna-heavy-traefik-logs
+  prometheus_data:
+    name: contextdna-heavy-prometheus-data
+  grafana_data:
+    name: contextdna-heavy-grafana-data
+  ollama_models:
+    name: contextdna-heavy-ollama-models
+
+# =============================================================================
+# NETWORK — explicit bridge so service-name DNS works (e.g., postgres, redis)
+# =============================================================================
+networks:
+  contextdna_heavy:
+    name: contextdna_heavy
+    driver: bridge

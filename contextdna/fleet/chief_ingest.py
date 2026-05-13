@@ -2,7 +2,7 @@
 """
 Multi-Fleet Chief Ingest Server — HTTP server that receives packets from worker nodes.
 
-Runs on the chief machine (mac1 / chief).
+Runs on the chief machine (mac1 / 192.168.1.165).
 Listens on port 8844 for inbound packets.
 
 Usage:

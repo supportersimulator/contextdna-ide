@@ -1,17 +1,122 @@
-# ===== SECRETS & ENVIRONMENT =====
+# =============================================================================
+# ContextDNA IDE — Mothership .gitignore
+# =============================================================================
+# Conservative by default. Personal state, secrets, and runtime artifacts
+# stay local; the open-source skeleton (specs, scripts, code) tracks cleanly.
+# =============================================================================
+
+
+# ----------------------------------------------------------------------------
+# Python
+# ----------------------------------------------------------------------------
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+
+# Build artifacts
+build/
+dist/
+develop-eggs/
+downloads/
+eggs/
+.eggs/
+sdist/
+wheels/
+share/python-wheels/
+*.egg-info/
+*.egg
+.installed.cfg
+MANIFEST
+
+# Test + type caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
+.tox/
+.nox/
+
+# Virtual environments
+.venv/
+.venv*/
+venv/
+venv*/
+ENV/
+env/
+
+
+# ----------------------------------------------------------------------------
+# Node / TypeScript / Frontend panels
+# ----------------------------------------------------------------------------
+node_modules/
+.npm
+.yarn-integrity
+*.tsbuildinfo
+.next/
+out/
+dist/
+.parcel-cache/
+.turbo/
+
+# Submodule node_modules — engines and apps each carry their own.
+engines/*/node_modules/
+apps/*/node_modules/
+
+
+# ----------------------------------------------------------------------------
+# Docker / runtime volumes
+# ----------------------------------------------------------------------------
+.docker-volumes/
+docker-volumes/
+
+
+# ----------------------------------------------------------------------------
+# Secrets — these MUST NEVER be committed.
+# ----------------------------------------------------------------------------
 .env
 .env.local
 .env.production
 .env.staging
-# Keep the template
+.env.*.local
+# But keep the template:
 !.env.example
 
-# API keys that may appear in config files
 *.key
 *.pem
+*.crt
 *.p12
 
-# ===== RUNTIME DATABASE & STATE =====
+# Service-specific token caches
+.openai_token
+.anthropic_token
+.deepseek_token
+
+
+# ----------------------------------------------------------------------------
+# Runtime databases + logs
+# ----------------------------------------------------------------------------
+*.db
+*.db-shm
+*.db-wal
+*.sqlite
+*.sqlite3
+*.sqlite-journal
+*.log
+logs/
+tmp/
+/tmp/
+
+
+# ----------------------------------------------------------------------------
+# Personal / private mothership state
+# ----------------------------------------------------------------------------
+# Family wisdom and personal corpora are never open-sourced.
+memory/family_wisdom/
 memory/*.db
 memory/*.sqlite
 memory/*.db-shm
@@ -19,7 +124,7 @@ memory/*.db-wal
 memory/.*.json
 memory/.work_log_archives/
 
-# Specific runtime state files
+# Per-machine session state files — generated at runtime, machine-specific.
 .ab_testing_log.json
 .active_session_injections.json
 .agent_service_heartbeat.json
@@ -39,70 +144,45 @@ memory/.work_log_archives/
 .hindsight_validator.db-wal
 .session_index.db
 
-# ===== PERSONAL / PRIVATE DIRECTORIES =====
-google-drive-code/
-docs/reflect/
-docs/inbox/
-memory/family_wisdom/
-
-# ===== RUNTIME ARTIFACTS =====
+# Fleet runtime artifacts
+.fleet-messages/
 submissions/
-logs/
 artifacts/
 dashboard_exports/
-.fleet-messages/
-/tmp/
 
-# ===== ER SIMULATOR PRODUCT (separate repo) =====
-admin.ersimulator.com/
-ersim-voice-stack/
-backend/
-er-simulator/
 
-# ===== CUSTOMER / PII DATA =====
-# Any file that may contain customer emails, phones, or health data
-*.customer.json
-*.pii.*
-customer_data/
+# ----------------------------------------------------------------------------
+# NATS / JetStream local data
+# ----------------------------------------------------------------------------
+nats-server.pid
+jetstream/
 
-# ===== PYTHON =====
-__pycache__/
-*.py[cod]
-*$py.class
-*.so
-.Python
-build/
-develop-eggs/
-dist/
-downloads/
-eggs/
-.eggs/
-lib/
-lib64/
-parts/
-sdist/
-var/
-wheels/
-share/python-wheels/
-*.egg-info/
-.installed.cfg
-*.egg
-MANIFEST
-.venv/
-venv/
-ENV/
-env/
 
-# ===== NODE / TYPESCRIPT =====
-node_modules/
-.npm
-.yarn-integrity
-*.tsbuildinfo
-.next/
-out/
-dist/
+# ----------------------------------------------------------------------------
+# Large binary models — never tracked.
+# ----------------------------------------------------------------------------
+*.bin
+*.weights
+*.gguf
+*.onnx
+*.safetensors
 
-# ===== MACOS =====
+
+# ----------------------------------------------------------------------------
+# IDE / editor
+# ----------------------------------------------------------------------------
+.vscode/
+.idea/
+.claude/
+.cursor/
+*.swp
+*.swo
+*~
+
+
+# ----------------------------------------------------------------------------
+# OS
+# ----------------------------------------------------------------------------
 .DS_Store
 .AppleDouble
 .LSOverride
@@ -110,27 +190,6 @@ dist/
 .Spotlight-V100
 .Trashes
 .fseventsd
-
-# ===== EDITORS =====
-.idea/
-.vscode/settings.json
-*.swp
-*.swo
-*~
-
-# ===== TESTING & COVERAGE =====
-.coverage
-htmlcov/
-.pytest_cache/
-.mypy_cache/
-.ruff_cache/
-
-# ===== NATS / INFRA DATA =====
-nats-server.pid
-jetstream/
-
-# ===== LARGE BINARY ASSETS =====
-*.bin
-*.weights
-*.gguf
-*.onnx
+Thumbs.db
+ehthumbs.db
+Desktop.ini

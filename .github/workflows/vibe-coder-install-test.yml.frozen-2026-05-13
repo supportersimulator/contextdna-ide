@@ -1,0 +1,700 @@
+# Vibe Coder Install Test - GitHub Actions Workflow
+# Tests the actual installation process on clean environments
+#
+# This workflow tests:
+# 1. Environment detection on fresh OS
+# 2. IDE adapter detection without pre-existing installations
+# 3. Hook installation in clean environment
+# 4. Cross-platform compatibility (macOS, Ubuntu, Windows)
+
+name: Vibe Coder Install Test
+
+on:
+  push:
+    paths:
+      - 'memory/environment_detector.py'
+      - 'memory/ide_adapters/**'
+      - 'memory/unified_installer.py'
+      - 'memory/workspace_scaffolder.py'
+      - 'memory/first_experience.py'
+      - 'scripts/install-context-dna.sh'
+      - '.github/workflows/vibe-coder-install-test.yml'
+  pull_request:
+    paths:
+      - 'memory/**'
+      - 'scripts/install-context-dna.sh'
+  workflow_dispatch:  # Manual trigger
+
+jobs:
+  # ============================================
+  # Test 1: Detection on Clean Environment
+  # ============================================
+  test-detection-clean:
+    name: Detection (Clean ${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        python-version: ['3.11']
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install psutil  # For hardware detection
+
+      - name: Test Environment Detection (No IDEs installed)
+        run: |
+          python -c "
+          import sys
+          sys.path.insert(0, 'memory')
+
+          from environment_detector import EnvironmentDetector
+          detector = EnvironmentDetector()
+          profile = detector.detect_all()
+
+          print('=== CLEAN ENVIRONMENT DETECTION TEST ===')
+          print()
+          print('Tools detected:')
+          for name, status in profile.tools.items():
+              icon = '[OK]' if status.installed else '[  ]'
+              print(f'  {icon} {name}: {status.installed}')
+
+          print()
+          print('Extensions detected:')
+          for ext in profile.extensions:
+              icon = '[OK]' if ext.installed else '[  ]'
+              print(f'  {icon} {ext.name}: {ext.installed}')
+
+          print()
+          print('Workspace status:', profile.workspace_status)
+          print('Missing critical:', profile.missing_critical)
+
+          # Verify detection doesn't crash on clean system
+          assert profile is not None, 'Profile should not be None'
+          print()
+          print('[OK] Detection completed without errors on clean environment')
+          "
+
+  # ============================================
+  # Test 2: IDE Adapter Detection (Clean)
+  # ============================================
+  test-adapters-clean:
+    name: Adapters (Clean ${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Test IDE Adapters (Nothing installed)
+        # Uses dedicated test script to avoid PowerShell parsing issues
+        # Script tests from a clean temp directory (not repo checkout)
+        # This avoids false positives from .cursorrules etc in the repo
+        run: python memory/tests/test_adapters_ci.py
+
+  # ============================================
+  # Test 3: Install Script Dry Run
+  # ============================================
+  test-install-dry-run:
+    name: Install Dry Run (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]  # Windows needs different shell
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Create virtual environment
+        run: python -m venv .venv
+
+      - name: Install Python dependencies
+        run: |
+          .venv/bin/pip install --upgrade pip
+          .venv/bin/pip install psutil requests
+
+      - name: Test install script (dry run)
+        run: |
+          chmod +x scripts/install-context-dna.sh
+          # Dry run should not modify system, just show what would happen
+          ./scripts/install-context-dna.sh --dry-run --skip-docker 2>&1 || true
+          echo "[OK] Dry run completed"
+
+  # ============================================
+  # Test 4: With VS Code Installed
+  # ============================================
+  test-with-vscode:
+    name: Detection with VS Code
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install VS Code
+        run: |
+          # Install VS Code on Ubuntu
+          wget -qO- https://packages.microsoft.com/keys/microsoft.asc | gpg --dearmor > packages.microsoft.gpg
+          sudo install -D -o root -g root -m 644 packages.microsoft.gpg /etc/apt/keyrings/packages.microsoft.gpg
+          echo "deb [arch=amd64,arm64,armhf signed-by=/etc/apt/keyrings/packages.microsoft.gpg] https://packages.microsoft.com/repos/code stable main" | sudo tee /etc/apt/sources.list.d/vscode.list > /dev/null
+          sudo apt-get update
+          sudo apt-get install -y code
+
+      - name: Verify VS Code installed
+        run: code --version
+
+      - name: Test Detection with VS Code
+        run: |
+          python -c "
+          import sys
+          sys.path.insert(0, 'memory')
+
+          from environment_detector import EnvironmentDetector
+          detector = EnvironmentDetector()
+
+          # Test VS Code detection
+          vscode_status = detector.detect_vscode()
+          print(f'VS Code detected: {vscode_status.installed}')
+          print(f'VS Code version: {vscode_status.version}')
+
+          assert vscode_status.installed, 'VS Code should be detected after installation'
+          print('[OK] VS Code correctly detected after installation')
+          "
+
+      - name: Test VS Code Adapter
+        run: |
+          python -c "
+          import sys
+          sys.path.insert(0, 'memory')
+          from pathlib import Path
+
+          from ide_adapters.vscode import VSCodeAdapter
+          adapter = VSCodeAdapter(Path.cwd())
+
+          is_installed = adapter.is_installed()
+          print(f'VS Code adapter detection: {is_installed}')
+
+          # VS Code is installed but may not have .vscode directory in repo
+          # The adapter should at least not crash
+          print('[OK] VS Code adapter runs without error')
+          "
+
+  # ============================================
+  # Test 5: Extension Parsing (Unit Test)
+  # ============================================
+  test-extension-parsing:
+    name: Extension Parsing Unit Tests
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Test extension directory parsing
+        run: |
+          python -c "
+          import sys
+          sys.path.insert(0, 'memory')
+
+          from environment_detector import EnvironmentDetector
+          detector = EnvironmentDetector()
+
+          test_cases = [
+              ('ms-python.python-2024.1.0', 'ms-python.python'),
+              ('anthropic.claude-code-1.0.0', 'anthropic.claude-code'),
+              ('one-more-thing-0.1.0-beta', 'one-more-thing'),
+              ('eamodio.gitlens-15.0.0', 'eamodio.gitlens'),
+              ('my-cool-ext-1.2.3-preview.1', 'my-cool-ext'),
+              ('ms-python.python-2024.1.0-beta.1', 'ms-python.python'),
+              ('simple-ext-1.0.0', 'simple-ext'),
+              ('publisher.ext-name-2.0.0+build.123', 'publisher.ext-name'),
+          ]
+
+          print('=== EXTENSION PARSING UNIT TESTS ===')
+          all_passed = True
+          for dir_name, expected in test_cases:
+              result = detector._parse_extension_dir_name(dir_name)
+              status = '[OK]' if result == expected else '❌'
+              if result != expected:
+                  all_passed = False
+              print(f'{status} {dir_name} -> {result} (expected: {expected})')
+
+          assert all_passed, 'Some extension parsing tests failed'
+          print()
+          print('[OK] All extension parsing tests passed')
+          "
+
+  # ============================================
+  # Test 6: Workspace Scaffolder
+  # ============================================
+  test-workspace-scaffolder:
+    name: Workspace Scaffolder
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Test workspace scaffolding
+        run: python memory/tests/test_scaffolder_ci.py
+
+  # ============================================
+  # Test 7: VS Code Installation on macOS
+  # ============================================
+  test-vscode-macos:
+    name: VS Code Install (macOS)
+    runs-on: macos-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install VS Code via Homebrew
+        run: |
+          brew install --cask visual-studio-code
+
+      - name: Add code to PATH
+        run: |
+          # VS Code installs code command to /usr/local/bin on macOS
+          echo "/usr/local/bin" >> $GITHUB_PATH
+          # Also try the Application path
+          export PATH="/Applications/Visual Studio Code.app/Contents/Resources/app/bin:$PATH"
+          echo "/Applications/Visual Studio Code.app/Contents/Resources/app/bin" >> $GITHUB_PATH
+
+      - name: Verify VS Code installed
+        run: |
+          code --version || echo "code command not in PATH, checking app..."
+          ls -la "/Applications/Visual Studio Code.app" || true
+
+      - name: Test VS Code Detection
+        run: |
+          python -c "
+          import sys
+          sys.path.insert(0, 'memory')
+
+          from environment_detector import EnvironmentDetector
+          detector = EnvironmentDetector()
+
+          vscode_status = detector.detect_vscode()
+          print(f'VS Code detected: {vscode_status.installed}')
+          print(f'VS Code version: {vscode_status.version}')
+          print(f'VS Code path: {vscode_status.path}')
+
+          # Should detect via app bundle even if code not in PATH
+          assert vscode_status.installed, 'VS Code should be detected on macOS'
+          print('[OK] VS Code correctly detected on macOS')
+          "
+
+      - name: Test VS Code Adapter
+        run: |
+          python -c "
+          import sys
+          sys.path.insert(0, 'memory')
+          from pathlib import Path
+
+          from ide_adapters.vscode import VSCodeAdapter
+          adapter = VSCodeAdapter(Path.cwd())
+
+          is_installed = adapter.is_installed()
+          print(f'VS Code adapter detection: {is_installed}')
+          print('[OK] VS Code adapter runs without error on macOS')
+          "
+
+  # ============================================
+  # Test 8: VS Code Installation on Windows
+  # ============================================
+  test-vscode-windows:
+    name: VS Code Install (Windows)
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install VS Code via winget
+        shell: pwsh
+        run: |
+          # Try winget first
+          winget install Microsoft.VisualStudioCode --accept-source-agreements --accept-package-agreements -e || true
+          # Give it time to complete
+          Start-Sleep -Seconds 10
+
+      - name: Add VS Code to PATH
+        shell: pwsh
+        run: |
+          $vscodePaths = @(
+            "$env:LOCALAPPDATA\Programs\Microsoft VS Code\bin",
+            "$env:ProgramFiles\Microsoft VS Code\bin",
+            "C:\Program Files\Microsoft VS Code\bin"
+          )
+          foreach ($path in $vscodePaths) {
+            if (Test-Path $path) {
+              echo "$path" >> $env:GITHUB_PATH
+              Write-Host "Added to PATH: $path"
+            }
+          }
+
+      - name: Verify VS Code installed
+        shell: pwsh
+        run: |
+          try {
+            code --version
+          } catch {
+            Write-Host "code command not found, checking installation paths..."
+            Get-ChildItem "C:\Program Files\Microsoft VS Code" -ErrorAction SilentlyContinue
+            Get-ChildItem "$env:LOCALAPPDATA\Programs\Microsoft VS Code" -ErrorAction SilentlyContinue
+          }
+
+      - name: Test VS Code Detection
+        shell: pwsh
+        run: |
+          python -c @"
+          import sys
+          sys.path.insert(0, 'memory')
+
+          from environment_detector import EnvironmentDetector
+          detector = EnvironmentDetector()
+
+          vscode_status = detector.detect_vscode()
+          print(f'VS Code detected: {vscode_status.installed}')
+          print(f'VS Code version: {vscode_status.version}')
+          print(f'VS Code path: {vscode_status.path}')
+
+          # May or may not detect depending on install location
+          print('[OK] VS Code detection completed on Windows')
+          "@
+
+  # ============================================
+  # Test 9: Cursor Detection Tests
+  # ============================================
+  test-cursor-detection:
+    name: Cursor Detection (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Test Cursor Detection (Not Installed)
+        run: python memory/tests/test_adapters_ci.py
+
+      - name: Test Cursor Detection with .cursorrules
+        run: |
+          python -c "
+          import sys
+          import tempfile
+          from pathlib import Path
+          sys.path.insert(0, 'memory')
+
+          from ide_adapters.cursor import CursorAdapter
+
+          # Create temp project with .cursorrules (cross-platform)
+          with tempfile.TemporaryDirectory() as tmpdir:
+              project_path = Path(tmpdir)
+              cursorrules = project_path / '.cursorrules'
+              cursorrules.write_text('# Cursor rules for testing', encoding='utf-8')
+
+              # Test with .cursorrules file present
+              adapter = CursorAdapter(project_path)
+              is_installed = adapter.is_installed()
+              print(f'Cursor detected with .cursorrules: {is_installed}')
+              assert is_installed, 'Should detect Cursor via .cursorrules'
+              print('[OK] Cursor correctly detected via .cursorrules')
+          "
+
+  # ============================================
+  # Test 10: Claude Code Fallback Detection
+  # ============================================
+  test-claude-code-fallbacks:
+    name: Claude Code Fallbacks
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Test Claude Code Multi-Method Detection
+        run: |
+          python -c "
+          import sys
+          sys.path.insert(0, 'memory')
+          from pathlib import Path
+          from unittest.mock import patch, MagicMock
+          import tempfile
+
+          from ide_adapters.claude_code import ClaudeCodeAdapter
+
+          print('=== CLAUDE CODE FALLBACK DETECTION TESTS ===')
+          print()
+
+          # Test 1: Detection with CLI only
+          print('Test 1: CLI detection...')
+          with tempfile.TemporaryDirectory() as tmpdir:
+              adapter = ClaudeCodeAdapter(Path(tmpdir))
+              with patch('shutil.which', return_value='/usr/local/bin/claude'):
+                  result = adapter.is_installed()
+                  assert result, 'Should detect via CLI'
+                  print('  [OK] CLI detection works')
+
+          # Test 2: Detection with npm only
+          print('Test 2: npm detection...')
+          with tempfile.TemporaryDirectory() as tmpdir:
+              adapter = ClaudeCodeAdapter(Path(tmpdir))
+              with patch('shutil.which', return_value=None):
+                  mock_result = MagicMock()
+                  mock_result.returncode = 0
+                  mock_result.stdout = '{\"dependencies\": {\"@anthropic-ai/claude-code\": \"1.0.0\"}}'
+                  with patch('subprocess.run', return_value=mock_result):
+                      result = adapter.is_installed()
+                      assert result, 'Should detect via npm'
+                      print('  [OK] npm detection works')
+
+          # Test 3: All methods fail gracefully
+          print('Test 3: Graceful failure...')
+          with tempfile.TemporaryDirectory() as tmpdir:
+              adapter = ClaudeCodeAdapter(Path(tmpdir))
+              with patch('shutil.which', return_value=None):
+                  with patch('subprocess.run', side_effect=Exception('fail')):
+                      with patch.object(Path, 'home', return_value=Path(tmpdir)):
+                          result = adapter.is_installed()
+                          assert not result, 'Should return False, not crash'
+                          print('  [OK] Graceful failure works')
+
+          print()
+          print('[OK] All Claude Code fallback tests passed')
+          "
+
+  # ============================================
+  # Test 11: Edge Cases and Fallbacks
+  # ============================================
+  test-edge-cases:
+    name: Edge Cases (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Run Edge Case Tests
+        run: python memory/tests/test_edge_cases_and_fallbacks.py
+
+  # ============================================
+  # Test 11B: Fallback Simulation (Intentional Failures)
+  # ============================================
+  test-fallback-simulation:
+    name: Fallback Simulation (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        # Skip Windows - permission tests don't work the same way
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Run Fallback Simulation Tests
+        run: python memory/tests/test_fallback_simulation.py
+
+  # ============================================
+  # Test 12: Chained Installation Flow
+  # ============================================
+  test-chained-install-flow:
+    name: Chained Install Flow
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install psutil
+
+      - name: Run Chained Install Flow Tests
+        run: python memory/tests/test_chained_install_flow.py
+
+  # ============================================
+  # Test 13: Install Script Resilience (Windows)
+  # ============================================
+  test-install-resilience-windows:
+    name: Install Resilience (Windows)
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Test Environment Detection Resilience
+        shell: pwsh
+        run: |
+          python -c @"
+          import sys
+          sys.path.insert(0, 'memory')
+
+          from environment_detector import EnvironmentDetector
+
+          print('=== WINDOWS ENVIRONMENT DETECTION TEST ===')
+
+          detector = EnvironmentDetector()
+          profile = detector.detect_all()
+
+          print(f'Platform: {profile.platform_info}')
+          print(f'Tools detected: {len(profile.tools)}')
+          print(f'Ready for Context DNA: {profile.ready_for_context_dna}')
+
+          # Should complete without crash on Windows
+          assert profile is not None
+          print('[OK] Environment detection works on Windows')
+          "@
+
+      - name: Test Workspace Scaffolder on Windows
+        shell: pwsh
+        run: |
+          python -c @"
+          import sys
+          sys.path.insert(0, 'memory')
+          import tempfile
+          from pathlib import Path
+
+          from workspace_scaffolder import WorkspaceScaffolder
+
+          print('=== WINDOWS WORKSPACE SCAFFOLDER TEST ===')
+
+          scaffolder = WorkspaceScaffolder()
+          templates = scaffolder.get_available_templates()
+          print(f'Templates available: {len(templates)}')
+
+          with tempfile.TemporaryDirectory() as tmpdir:
+              result = scaffolder.scaffold_project(
+                  template_id='python_starter',
+                  project_name='test-windows-project',
+                  location=Path(tmpdir)
+              )
+              print(f'Scaffolding result: {result.success}')
+              if result.error:
+                  print(f'Error: {result.error}')
+
+              assert result.success, 'Scaffolding should work on Windows'
+              print('[OK] Workspace scaffolding works on Windows')
+          "@
+
+  # ============================================
+  # Test 14: User Journey Sequence Tests
+  # ============================================
+  test-user-journeys:
+    name: User Journeys (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        # Windows has different permission model, skip for now
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install psutil
+
+      - name: Run User Journey Sequence Tests
+        run: python memory/tests/test_user_journey_sequences.py

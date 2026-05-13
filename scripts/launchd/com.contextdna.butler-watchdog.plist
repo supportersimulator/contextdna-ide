@@ -1,0 +1,54 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <!--
+    BUTLER WATCHDOG — Unified Service Health Monitor
+
+    Replaces com.considerate.vllm-watchdog (stale, references vllm-mlx).
+    Probes ALL 5 services every 60s. Auto-restarts on failure.
+    Pure bash — works even if Python/.venv is broken.
+
+    Services: LLM (5044), Redis (6379), PG (5432), Agent (8080), Scheduler
+
+    Install (script goes to ~/.local/bin to bypass macOS TCC on ~/Documents):
+        mkdir -p ~/.local/bin
+        cp scripts/butler-watchdog.sh ~/.local/bin/butler-watchdog.sh
+        chmod +x ~/.local/bin/butler-watchdog.sh
+        cp scripts/launchd/com.contextdna.butler-watchdog.plist ~/Library/LaunchAgents/
+        launchctl load ~/Library/LaunchAgents/com.contextdna.butler-watchdog.plist
+    -->
+
+    <key>Label</key>
+    <string>com.contextdna.butler-watchdog</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/bash</string>
+        <string>__USER_HOME__/.local/bin/butler-watchdog.sh</string>
+    </array>
+
+    <key>StartInterval</key>
+    <integer>60</integer>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>StandardOutPath</key>
+    <string>/tmp/butler-watchdog.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>/tmp/butler-watchdog-error.log</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/usr/local/bin:/usr/bin:/bin:/opt/homebrew/bin</string>
+        <key>HOME</key>
+        <string>__USER_HOME__</string>
+    </dict>
+
+    <key>ThrottleInterval</key>
+    <integer>60</integer>
+</dict>
+</plist>

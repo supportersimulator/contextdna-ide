@@ -1,0 +1,138 @@
+# =============================================================================
+# ContextDNA IDE — LITE profile spec
+# -----------------------------------------------------------------------------
+# Companion to profiles/heavy.yaml. Describes docker-compose.lite.yml in a
+# CI-consumable form. Two services are NOT containerized on macOS and run via
+# launchd (Event Bridge + MLX-LLM proxy) — they're documented under
+# `host_services` below.
+# =============================================================================
+
+profile: lite
+description: >-
+  Laptop-class minimal stack. Six containers + two host-native launchd services.
+  The local NATS server runs in *leaf-node* mode and pipes work logs back to
+  the heavy chief. Helper agent runs in single-process mode (no Celery).
+
+# -----------------------------------------------------------------------------
+# Hardware expectations — checked by scripts/bootstrap-check.sh before start.
+# -----------------------------------------------------------------------------
+resources:
+  ram_min_gb: 3
+  ram_recommended_gb: 8
+  disk_min_gb: 20
+  disk_recommended_gb: 60
+  cpu_min_cores: 2
+  cpu_recommended_cores: 4
+
+# -----------------------------------------------------------------------------
+# Containerized services (matches docker-compose.lite.yml).
+# -----------------------------------------------------------------------------
+services:
+  - name: postgres
+    image: postgres:16-alpine
+    role: "Small Postgres (shm_size 256m, 384m memory cap)"
+    optional: false
+
+  - name: redis
+    image: redis:7-alpine
+    role: "Cache + pub/sub mirror (256mb maxmemory, LRU eviction)"
+    optional: false
+
+  - name: nats-leaf
+    image: nats:2-alpine
+    role: "NATS leaf-node client → heavy chief on port 7422"
+    optional: false
+
+  - name: mcp-webhook
+    build: mcp-servers/Dockerfile.mcp
+    role: "MCP webhook server for IDE context injection"
+    optional: false
+
+  - name: helper-agent
+    build: memory/Dockerfile.agent
+    role: "Helper agent in MODE=lite (in-process scheduling, no Celery)"
+    optional: false
+
+# -----------------------------------------------------------------------------
+# Host-native services (NOT containerized on macOS).
+# -----------------------------------------------------------------------------
+host_services:
+  - name: event-bridge
+    launchd_plist: ~/Library/LaunchAgents/io.contextdna.event-bridge.plist
+    binary: scripts/event-bridge/event_bridge.py
+    reason: >-
+      Needs filesystem access to ~/Library/Application Support/Claude for
+      session-historian rehydrate. Containerization would require bind-mounting
+      user-specific paths and break across machine moves.
+    publishes_to: nats://127.0.0.1:4222  # the leaf node above
+    health: "Check the unix socket /tmp/contextdna-event-bridge.sock"
+
+  - name: mlx-llm-proxy
+    launchd_plist: ~/Library/LaunchAgents/com.contextdna.llm.plist
+    binary: mlx_lm.server (Qwen3-4B-4bit)
+    reason: >-
+      MLX requires Apple Metal; Docker on macOS can't expose Metal to
+      containers. The proxy stays native and is reachable from containers via
+      http://host.docker.internal:5044.
+    listens_on: 127.0.0.1:5044
+    health: "curl http://127.0.0.1:5044/v1/models"
+
+# -----------------------------------------------------------------------------
+# Required environment — must be present in .env.
+# -----------------------------------------------------------------------------
+required_env:
+  - POSTGRES_PASSWORD
+  - REDIS_PASSWORD
+  - NATS_REMOTE_URL         # e.g., nats-leaf://heavy.local:7422
+  - NATS_LEAF_PASSWORD      # for the leaf credentials file
+
+optional_env:
+  - POSTGRES_USER           # default: contextdna
+  - POSTGRES_DB             # default: contextdna_lite
+  - NATS_LEAF_USER          # default: leaf
+  - FLEET_NODE_ID           # default: lite (used in pub subject)
+  - MLX_SERVER_URL          # default: http://host.docker.internal:5044
+  - BRAIN_CYCLE_INTERVAL    # default: 600 (longer than heavy — saves battery)
+  - SUCCESS_DETECTION_INTERVAL  # default: 120
+  - EVOLUTION_INTERVAL      # default: 3600
+
+# -----------------------------------------------------------------------------
+# Exposed ports — bound to 127.0.0.1 only. Laptop is not a public server.
+# -----------------------------------------------------------------------------
+ports:
+  - {service: postgres,    host: 5432,  bind: 127.0.0.1, description: "Postgres SQL"}
+  - {service: redis,       host: 6379,  bind: 127.0.0.1, description: "Redis client"}
+  - {service: nats-leaf,   host: 4222,  bind: 127.0.0.1, description: "Local NATS (leaf)"}
+  - {service: nats-leaf,   host: 8222,  bind: 127.0.0.1, description: "NATS monitor"}
+  - {service: mcp-webhook, host: 8000,  bind: 127.0.0.1, description: "MCP webhook"}
+  - {service: helper-agent, host: 8080, bind: 127.0.0.1, description: "Helper agent health"}
+
+# -----------------------------------------------------------------------------
+# Bidirectional sync mechanism — lite is a *leaf node* of the heavy chief.
+# -----------------------------------------------------------------------------
+sync:
+  role: leaf
+  description: >-
+    Lite node's local NATS runs in leaf-node mode connected back to the heavy
+    chief on port 7422. JetStream KV `fleet_roster` is replicated leaf ↔
+    chief. The helper agent publishes work logs upstream and subscribes to
+    distilled learnings broadcast by the chief.
+
+  jetstream:
+    enabled: true
+    store_dir: /data
+    note: >-
+      Lite holds a *local mirror* of streams `fleet_roster` and
+      `fleet_learnings`. Writes to `fleet.lite.<node_id>.worklog` propagate
+      upstream automatically through the leaf bridge.
+
+  leaf_connection:
+    remote_url: ${NATS_REMOTE_URL}      # nats-leaf://heavy.local:7422
+    creds_file: /etc/nats/leaf.creds    # mounted from ./nats/leaf.creds
+    reconnect_backoff_ms: [1000, 2000, 4000, 8000, 16000]
+
+  redis_pubsub:
+    enabled: true
+    channels:
+      - fleet:worklog:ingest            # lite → heavy summary
+      - fleet:learnings:broadcast       # subscribed for IDE injection

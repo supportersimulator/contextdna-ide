@@ -1,0 +1,123 @@
+# Multi-fleet Release
+#
+# Manual-trigger release workflow:
+#   1. Run full pytest on Linux/3.12.
+#   2. Build sdist + wheel via `python -m build`.
+#   3. Upload artifacts to a GitHub Release (created if missing).
+#
+# This workflow does NOT publish to PyPI. Publishing is Aaron-only and is
+# performed locally with twine + a personal API token. See the TODO at the
+# bottom of this file for the procedure.
+#
+# Trigger by going to Actions -> "multi-fleet Release" -> Run workflow,
+# and supplying the version tag (e.g. v5.2.1).
+
+name: multi-fleet Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag (e.g. multifleet-v5.2.1)"
+        required: true
+        type: string
+      draft:
+        description: "Create the GitHub Release as a draft"
+        required: false
+        default: true
+        type: boolean
+
+permissions:
+  contents: write   # required to create the GitHub Release
+
+jobs:
+  release:
+    name: Build + publish GitHub Release
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: false
+          fetch-depth: 0   # ensure tags are visible
+
+      - name: Setup Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+          cache-dependency-path: |
+            multi-fleet/pyproject.toml
+
+      - name: Install nats-server
+        run: |
+          set -euo pipefail
+          NATS_VERSION="2.10.22"
+          curl -fsSL -o /tmp/nats-server.deb \
+            "https://github.com/nats-io/nats-server/releases/download/v${NATS_VERSION}/nats-server-v${NATS_VERSION}-amd64.deb"
+          sudo dpkg -i /tmp/nats-server.deb
+
+      - name: Install multi-fleet (with dev + build tooling)
+        working-directory: multi-fleet
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+          pip install build twine
+
+      - name: Run pytest (release gate)
+        working-directory: multi-fleet
+        run: |
+          pytest tests/ -q --tb=short
+
+      - name: Build sdist + wheel
+        working-directory: multi-fleet
+        run: |
+          rm -rf dist/
+          python -m build
+          twine check dist/*
+          ls -la dist/
+
+      - name: Upload build artifacts (workflow run)
+        uses: actions/upload-artifact@v4
+        with:
+          name: multifleet-dist-${{ github.event.inputs.tag }}
+          path: multi-fleet/dist/*
+          if-no-files-found: error
+
+      - name: Create GitHub Release + attach wheel
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.event.inputs.tag }}
+          name: ${{ github.event.inputs.tag }}
+          draft: ${{ github.event.inputs.draft }}
+          generate_release_notes: true
+          files: |
+            multi-fleet/dist/*.whl
+            multi-fleet/dist/*.tar.gz
+        env:
+          # GITHUB_TOKEN is auto-provided by Actions and scoped to this repo.
+          # No secrets need to be configured for this step.
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      # ======================================================================
+      # TODO (Aaron-only): PyPI publication
+      # ======================================================================
+      # CI deliberately does NOT push to PyPI. To publish a release to PyPI,
+      # download the wheel + sdist from the GitHub Release (or the workflow
+      # artifact) and run locally:
+      #
+      #   python -m pip install --upgrade twine
+      #   twine check dist/*
+      #   twine upload dist/*        # prompts for the PyPI API token
+      #
+      # Or, with a token in ~/.pypirc:
+      #
+      #   twine upload -r pypi dist/*
+      #
+      # If/when we want trusted publishing (OIDC, no token), add a
+      # `pypi-publish` job here gated on `environment: pypi` and configure
+      # the trusted publisher on PyPI. Aaron must approve the environment
+      # for the run before it executes.
+      # ======================================================================

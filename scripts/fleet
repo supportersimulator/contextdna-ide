@@ -1,0 +1,274 @@
+#!/usr/bin/env bash
+# fleet — Universal fleet command (single entry point for all fleet operations)
+#
+# Install: fleet install        (symlinks to /usr/local/bin/fleet)
+# Complete: eval "$(fleet completion)"
+
+set -uo pipefail
+
+REPO="$(cd "$(dirname "$0")/.." 2>/dev/null && pwd || echo "$HOME/dev/er-simulator-superrepo")"
+PORT="${FLEET_NERVE_PORT:-8855}"
+PYTHON="${PYTHON:-python3}"
+SEND="$PYTHON $REPO/tools/fleet_nerve_send.py"
+OPS="$PYTHON $REPO/tools/fleet_ops.py"
+VERSION="1.1.0"
+
+CMD="${1:-help}"
+shift 2>/dev/null || true
+
+case "$CMD" in
+    # --- Communication ---
+    status)     $SEND --status "$@" ;;
+    check)      bash "$REPO/scripts/fleet-check.sh" ;;
+    send)       $SEND --type context "$@" ;;
+    task)       $SEND --type task "$@" ;;
+    alert)      $SEND --type alert "$@" ;;
+    broadcast)  $SEND --broadcast "$@" ;;
+    reply)      $SEND --type reply "$@" ;;
+
+    # --- NATS-native ---
+    nats-health) $PYTHON "$REPO/tools/fleet_nerve_nats.py" health ;;
+    nats-send)   $PYTHON "$REPO/tools/fleet_nerve_nats.py" send "$@" ;;
+    nats-broadcast) $PYTHON "$REPO/tools/fleet_nerve_nats.py" broadcast "$@" ;;
+    monitor)     $PYTHON "$REPO/tools/fleet_nerve_nats.py" monitor ;;
+    inbox)
+        curl -s "http://127.0.0.1:${PORT}/inbox" 2>/dev/null | $PYTHON -c "
+import sys,json
+d = json.load(sys.stdin)
+if d['count'] == 0: print('Inbox empty.')
+else:
+    print(f'Inbox: {d[\"count\"]} message(s)\n')
+    for item in d['items']:
+        read = '  ' if item.get('read') else '→'
+        t = item.get('type','?').upper()
+        print(f'{read} [{t}] from {item[\"from\"]}: {item.get(\"subject\",\"\")}')
+        if item.get('summary'): print(f'   {item[\"summary\"][:120]}')
+        print()
+" 2>/dev/null || echo "Daemon not running" ;;
+
+    # --- Monitoring ---
+    work)       $OPS work ;;
+    next)       bash "$REPO/scripts/fleet-work-next.sh" ;;
+    tasks)      $SEND --tasks "$@" ;;
+    health)     bash "$REPO/scripts/fleet-health.sh" ;;
+    dashboard)  curl -s "http://127.0.0.1:${PORT}/dashboard" 2>/dev/null ;;
+    wal)        $OPS wal ;;
+
+    # --- Relay (fix: join node/path with /) ---
+    relay)
+        NODE="${1:-}"; shift 2>/dev/null || true
+        PATH_ARG="${1:-/health}"; shift 2>/dev/null || true
+        # Strip leading slash from path if present
+        PATH_ARG="${PATH_ARG#/}"
+        curl -s "http://127.0.0.1:${PORT}/relay/${NODE}/${PATH_ARG}" 2>/dev/null
+        ;;
+
+    # --- Operations ---
+    wake)       $SEND --wake "$@" ;;
+    wake-all)   $SEND --wake-fleet ;;
+    sync)       $OPS sync ;;
+    audit)      $OPS audit ;;
+    readiness)  $OPS readiness ;;
+    deploy)     $OPS deploy ;;
+    cleanup)    $OPS cleanup ;;
+    historian)  $OPS historian "${1:-fast}" ;;
+
+    # --- Daemon ---
+    daemon)
+        SUB="${1:-status}"; shift 2>/dev/null || true
+        case "$SUB" in
+            start)   bash "$REPO/scripts/fleet-nerve-setup.sh" ;;
+            stop)    lsof -ti :"${PORT}" 2>/dev/null | xargs kill 2>/dev/null && echo "Daemon stopped" || echo "No daemon running" ;;
+            restart) lsof -ti :"${PORT}" 2>/dev/null | xargs kill 2>/dev/null; sleep 1; bash "$REPO/scripts/fleet-nerve-setup.sh" ;;
+            status)  curl -s "http://127.0.0.1:${PORT}/health" 2>/dev/null && echo "" || echo "Daemon not running" ;;
+            logs)    ls -t /tmp/fleet-nerve-*.log 2>/dev/null | head -1 | xargs tail -50 2>/dev/null || echo "No daemon logs found" ;;
+            *)       echo "Usage: fleet daemon [start|stop|restart|status|logs]" ;;
+        esac
+        ;;
+
+    # --- Hooks ---
+    hooks)
+        if [ -f "$REPO/scripts/fleet-register-hooks.sh" ]; then
+            bash "$REPO/scripts/fleet-register-hooks.sh" "$@"
+        else
+            echo "Hook registration script not found"
+        fi
+        ;;
+
+    # --- Swarm ---
+    swarm)
+        if [ -f "$REPO/scripts/fleet-swarm.sh" ]; then
+            bash "$REPO/scripts/fleet-swarm.sh" "$@"
+        else
+            echo "Swarm script not found"
+        fi
+        ;;
+
+    # --- Install / Completion ---
+    install)
+        TARGET="$REPO/scripts/fleet"
+        # Try /usr/local/bin first, fall back to ~/bin
+        for LINK_DIR in /usr/local/bin "$HOME/bin"; do
+            LINK="$LINK_DIR/fleet"
+            if [ -L "$LINK" ] && [ "$(readlink "$LINK")" = "$TARGET" ]; then
+                echo "Already installed: $LINK → $TARGET"
+                break
+            elif ln -sf "$TARGET" "$LINK" 2>/dev/null; then
+                echo "Installed: $LINK → $TARGET"
+                echo ""
+                echo "Tab completion — add to ~/.zshrc:"
+                echo '  eval "$(fleet completion)"'
+                break
+            fi
+        done
+        # Verify
+        if ! command -v fleet &>/dev/null; then
+            echo "Note: fleet not yet in PATH. Add ~/bin to PATH or run:"
+            echo "  sudo ln -sf $TARGET /usr/local/bin/fleet"
+        fi
+        ;;
+
+    completion)
+        cat <<'COMP'
+_fleet_completions() {
+    local cur="${COMP_WORDS[COMP_CWORD]}"
+    local prev="${COMP_WORDS[COMP_CWORD-1]}"
+
+    local commands="status check send task alert broadcast reply work next tasks health dashboard wal relay wake wake-all sync audit readiness deploy cleanup historian daemon hooks swarm install completion version help"
+    local nodes="mac1 mac2 mac3"
+
+    case "$prev" in
+        send|task|alert|wake|relay)
+            COMPREPLY=($(compgen -W "$nodes" -- "$cur"))
+            return ;;
+        daemon)
+            COMPREPLY=($(compgen -W "start stop restart status logs" -- "$cur"))
+            return ;;
+        historian)
+            COMPREPLY=($(compgen -W "fast full cleanup" -- "$cur"))
+            return ;;
+        fleet)
+            COMPREPLY=($(compgen -W "$commands" -- "$cur"))
+            return ;;
+    esac
+
+    if [ "$COMP_CWORD" -eq 1 ]; then
+        COMPREPLY=($(compgen -W "$commands" -- "$cur"))
+    fi
+}
+
+# Bash completion
+if [ -n "${BASH_VERSION:-}" ]; then
+    complete -F _fleet_completions fleet
+fi
+
+# Zsh completion (bash-compat)
+if [ -n "${ZSH_VERSION:-}" ]; then
+    autoload -U +X bashcompinit 2>/dev/null && bashcompinit 2>/dev/null
+    complete -F _fleet_completions fleet 2>/dev/null
+
+    # Native zsh completion
+    _fleet() {
+        local commands=(
+            'status:fleet health summary'
+            'check:dashboard + messages'
+            'send:send message to peer'
+            'task:send task (spawns agent)'
+            'alert:send alert (interrupts)'
+            'broadcast:send to all peers'
+            'reply:send reply to task'
+            'work:show work backlog'
+            'next:next unclaimed item'
+            'tasks:active task agents'
+            'health:one-liner fleet health'
+            'dashboard:theatrical live view'
+            'wal:WAL status across fleet'
+            'relay:proxy through daemon'
+            'wake:wake a node'
+            'wake-all:wake entire fleet'
+            'sync:sync all to latest'
+            'audit:daemon inventory'
+            'readiness:full readiness check'
+            'deploy:pull + restart daemons'
+            'cleanup:remove obsolete daemons'
+            'historian:session historian'
+            'daemon:manage local daemon'
+            'hooks:register fleet hooks'
+            'swarm:parallel task execution'
+            'install:install fleet to PATH'
+            'completion:output completion script'
+            'version:show version'
+            'help:show help'
+        )
+        local nodes=('mac1' 'mac2' 'mac3')
+
+        _arguments '1: :->cmd' '2: :->arg'
+        case $state in
+            cmd) _describe 'command' commands ;;
+            arg)
+                case ${words[2]} in
+                    send|task|alert|wake|relay) _describe 'node' nodes ;;
+                    daemon) _describe 'action' '(start stop restart status logs)' ;;
+                    historian) _describe 'mode' '(fast full cleanup)' ;;
+                esac
+                ;;
+        esac
+    }
+    compdef _fleet fleet 2>/dev/null
+fi
+COMP
+        ;;
+
+    version|-v|--version)
+        echo "fleet v${VERSION} ($(hostname))"
+        ;;
+
+    help|-h|--help)
+        cat <<EOF
+fleet v${VERSION} — Universal fleet CLI
+
+Communication:
+  fleet send <node> <msg>     — send message
+  fleet task <node> <msg>     — send task (spawns agent)
+  fleet alert <node> <msg>    — send alert (interrupts)
+  fleet reply <node> <msg>    — send reply to task
+  fleet broadcast <msg>       — send to all
+  fleet relay <node> <path>   — proxy through daemon
+
+Monitoring:
+  fleet status                — fleet health
+  fleet check                 — dashboard + messages
+  fleet dashboard             — theatrical live view
+  fleet health                — one-liner status
+  fleet tasks                 — active agents
+  fleet work                  — backlog status
+  fleet next                  — next unclaimed item
+  fleet wal                   — WAL status across fleet
+
+Operations:
+  fleet wake <node>           — wake a node
+  fleet wake-all              — wake entire fleet
+  fleet sync                  — sync all to latest
+  fleet deploy                — pull + restart daemons
+  fleet audit                 — daemon inventory
+  fleet readiness             — full readiness check
+  fleet cleanup               — remove obsolete daemons
+  fleet historian [fast|full] — session historian
+
+Daemon:
+  fleet daemon [start|stop|restart|status|logs]
+
+Setup:
+  fleet hooks                 — register fleet hooks
+  fleet swarm <tasks...>      — parallel task execution
+  fleet install               — symlink to /usr/local/bin
+  fleet completion            — output shell completion
+  fleet version               — show version
+EOF
+        ;;
+
+    *)
+        echo "Unknown command: $CMD (try: fleet help)"
+        exit 1
+        ;;
+esac

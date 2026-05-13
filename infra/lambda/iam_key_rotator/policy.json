@@ -1,0 +1,47 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "Logs",
+      "Effect": "Allow",
+      "Action": [
+        "logs:CreateLogGroup",
+        "logs:CreateLogStream",
+        "logs:PutLogEvents"
+      ],
+      "Resource": "arn:aws:logs:*:*:*"
+    },
+    {
+      "Sid": "SecretsManagerErsimIAM",
+      "Effect": "Allow",
+      "Action": [
+        "secretsmanager:DescribeSecret",
+        "secretsmanager:GetSecretValue",
+        "secretsmanager:PutSecretValue",
+        "secretsmanager:UpdateSecretVersionStage"
+      ],
+      "Resource": "arn:aws:secretsmanager:*:*:secret:/ersim/prod/iam/*"
+    },
+    {
+      "Sid": "RotateIamKeysScoped",
+      "Effect": "Allow",
+      "Action": [
+        "iam:CreateAccessKey",
+        "iam:UpdateAccessKey",
+        "iam:DeleteAccessKey",
+        "iam:ListAccessKeys"
+      ],
+      "Resource": [
+        "arn:aws:iam::*:user/terraform-ersim-prod",
+        "arn:aws:iam::*:user/cursor-deploy",
+        "arn:aws:iam::*:user/ersim-rotation-test-*"
+      ]
+    },
+    {
+      "Sid": "StsIdentity",
+      "Effect": "Allow",
+      "Action": "sts:GetCallerIdentity",
+      "Resource": "*"
+    }
+  ]
+}

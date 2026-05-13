@@ -1,0 +1,74 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <!--
+    CHANNEL SMOKETEST — Weekly exercise of every fleet channel.
+
+    WHY: In normal traffic the channel cascade short-circuits on the first
+    success (almost always P1 NATS). The lower fallback channels (P4 seed /
+    P5 ssh / P6 WoL / P7 git) are NEVER exercised until something is already
+    broken — by which time we don't know if the fallback itself still works.
+
+    This LaunchAgent runs scripts/channel-smoketest.py once a week (Mondays
+    at 13:00 local time) on every node. Each run:
+      - Probes P1/P2/P2T/P4/P5/P6(dry)/P7 for every peer with INERT payloads
+      - Appends results to .fleet/channel-smoketest/<date>.json
+      - Surfaces fallback rot before it matters
+
+    Install (idempotent):
+        bash scripts/install-launchd-plists.sh channel-smoketest
+
+    Manual run:
+        python3 scripts/channel-smoketest.py
+
+    Bootout:
+        launchctl bootout gui/$(id -u) ~/Library/LaunchAgents/io.contextdna.channel-smoketest.plist
+        rm ~/Library/LaunchAgents/io.contextdna.channel-smoketest.plist
+    -->
+
+    <key>Label</key>
+    <string>io.contextdna.channel-smoketest</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/usr/bin/env</string>
+        <string>python3</string>
+        <string>__USER_HOME__/dev/er-simulator-superrepo/scripts/channel-smoketest.py</string>
+    </array>
+
+    <!-- StartCalendarInterval: Mondays at 13:00 local. Weekly cadence is
+         intentional — the cascade ledger already gets P1/P2 hits every
+         minute via real fleet traffic; we only need a weekly heartbeat
+         to confirm the *fallback* channels are still wired. -->
+    <key>StartCalendarInterval</key>
+    <dict>
+        <key>Weekday</key>
+        <integer>1</integer>
+        <key>Hour</key>
+        <integer>13</integer>
+        <key>Minute</key>
+        <integer>0</integer>
+    </dict>
+
+    <key>RunAtLoad</key>
+    <false/>
+
+    <key>StandardOutPath</key>
+    <string>/tmp/channel-smoketest.stdout.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>/tmp/channel-smoketest.stderr.log</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin</string>
+        <key>HOME</key>
+        <string>__USER_HOME__</string>
+    </dict>
+
+    <key>WorkingDirectory</key>
+    <string>__USER_HOME__/dev/er-simulator-superrepo</string>
+</dict>
+</plist>

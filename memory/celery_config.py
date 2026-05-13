@@ -13,7 +13,7 @@ ARCHITECTURE (from ChatGPT's Synaptic foundation):
 - Local LLM = cognition engine
 
 SERVICES USED (from context-dna/docker-compose.yml):
-- context-dna-rabbitmq: Message broker (amqp://context_dna:password@localhost:5672)
+- context-dna-rabbitmq: Message broker (://:password@
 - context-dna-redis: Cache + pub/sub (redis://localhost:6379)
 - context-dna-postgres: PostgreSQL (localhost:5432, databases: context_dna + contextdna)
 
@@ -53,7 +53,7 @@ REDIS_HOST = os.environ.get('CD_REDIS_HOST', '127.0.0.1')
 REDIS_PORT = os.environ.get('CD_REDIS_PORT', '6379')
 
 # Build connection URLs
-BROKER_URL = f"amqp://{RABBITMQ_USER}:{RABBITMQ_PASSWORD}@{RABBITMQ_HOST}:{RABBITMQ_PORT}/{RABBITMQ_VHOST}"
+BROKER_URL = f"amqp://{RABBITMQ_USER}:YOUR_PASSWORD@{RABBITMQ_HOST}:{RABBITMQ_PORT}/{RABBITMQ_VHOST}"
 RESULT_BACKEND = f"redis://{REDIS_HOST}:{REDIS_PORT}/0" if not REDIS_PASSWORD else f"redis://:{REDIS_PASSWORD}@{REDIS_HOST}:{REDIS_PORT}/0"
 
 # =============================================================================

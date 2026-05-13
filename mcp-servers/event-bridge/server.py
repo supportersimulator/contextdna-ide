@@ -284,7 +284,7 @@ class Handler(BaseHTTPRequestHandler):
                         if datetime.fromisoformat(e["ts"]) >= since_dt
                     ]
                 except Exception:
-                    pass
+                    _bump("date_filter_errors")  # zsf-allow: date parse fail — events returned unfiltered
             body = json.dumps({"events": events, "count": len(events)}).encode()
         except Exception as exc:
             _bump("ring_buffer_errors")

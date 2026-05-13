@@ -363,7 +363,7 @@ Happy building! 🚀
 
 # API Settings
 # DEBUG=true
-# DATABASE_URL=postgresql://user:pass@localhost/db
+# DATABASE_URL=://:pass@/db
 ''',
             },
             dependencies=[

@@ -1,0 +1,86 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <!--
+    CONTEXT DNA SCHEDULER COORDINATOR (macOS launchd)
+
+    Runs scheduler_coordinator.py which manages:
+      - lite_scheduler.py (14 jobs: quarantine eval, promotion bridge, rollups, etc.)
+      - Automatic fallback between Celery (heavy) and lite (SQLite) modes
+      - Evidence pipeline: quarantine → trusted → flagged → wisdom
+
+    Installation:
+        cp scripts/launchd/com.contextdna.scheduler.plist ~/Library/LaunchAgents/
+        launchctl load ~/Library/LaunchAgents/com.contextdna.scheduler.plist
+
+    Uninstall:
+        launchctl unload ~/Library/LaunchAgents/com.contextdna.scheduler.plist
+        rm ~/Library/LaunchAgents/com.contextdna.scheduler.plist
+
+    Check status:
+        launchctl list | grep contextdna.scheduler
+        PYTHONPATH=. python3 memory/lite_scheduler.py status
+
+    View logs:
+        tail -f ~/dev/er-simulator-superrepo/logs/scheduler_coordinator.log
+    -->
+
+    <key>Label</key>
+    <string>com.contextdna.scheduler</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>__USER_HOME__/dev/er-simulator-superrepo/.venv/bin/python3</string>
+        <string>__USER_HOME__/dev/er-simulator-superrepo/memory/scheduler_coordinator.py</string>
+    </array>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>KeepAlive</key>
+    <false/>
+
+    <key>StandardOutPath</key>
+    <string>__USER_HOME__/dev/er-simulator-superrepo/logs/scheduler_coordinator.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>__USER_HOME__/dev/er-simulator-superrepo/logs/scheduler_coordinator.log</string>
+
+    <key>WorkingDirectory</key>
+    <string>__USER_HOME__/dev/er-simulator-superrepo</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <!-- /usr/sbin:/sbin needed so child shells/processes can resolve
+             system tools (lsof, ifconfig, etc). Matches unified plist. -->
+        <key>PATH</key>
+        <string>/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:/opt/homebrew/bin</string>
+        <key>HOME</key>
+        <string>__USER_HOME__</string>
+        <key>PYTHONPATH</key>
+        <string>__USER_HOME__/dev/er-simulator-superrepo:__USER_HOME__/dev/er-simulator-superrepo/context-dna/src</string>
+    </dict>
+
+    <!-- Throttle restarts: wait 15s between crash restarts -->
+    <key>ThrottleInterval</key>
+    <integer>15</integer>
+
+    <key>ProcessType</key>
+    <string>Background</string>
+
+    <!-- Increase file descriptor limits: scheduler opens multiple SQLite DBs
+         for 22 scheduled jobs (hindsight, rollups, repair mining, etc.).
+         Match unified service limits for consistency. -->
+    <key>SoftResourceLimits</key>
+    <dict>
+        <key>NumberOfFiles</key>
+        <integer>4096</integer>
+    </dict>
+    <key>HardResourceLimits</key>
+    <dict>
+        <key>NumberOfFiles</key>
+        <integer>8192</integer>
+    </dict>
+</dict>
+</plist>

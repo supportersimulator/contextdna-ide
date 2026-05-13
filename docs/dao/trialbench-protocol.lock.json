@@ -1,0 +1,15 @@
+{
+  "version": "v0.1",
+  "generated_at": "2026-05-06T15:58:33Z",
+  "trial_protocol_hash": "6c72130f331d451cfe54a4bc60edc79d75cdd744da011338bdb4c6f5bc4721f6",
+  "files": [
+    "trialbench-adjudication.md",
+    "trialbench-blinding.md",
+    "trialbench-endpoints.md",
+    "trialbench-protocol.md",
+    "trialbench-randomization.md",
+    "trialbench-sap.md",
+    "task_bank.json"
+  ],
+  "approved_by": "Aaron Tjomsland (commit signature)"
+}

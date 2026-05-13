@@ -1,0 +1,59 @@
+# =============================================================================
+# zsf-bare-except.yml — Zero Silent Failures: bare-except scanner
+# -----------------------------------------------------------------------------
+# WHAT THIS GATES:
+#   Runs scripts/check-zsf-bare-except.sh, which scans the codebase for the
+#   forbidden pattern `except Exception: pass` (and bare `except:` siblings)
+#   that swallow errors without observability. The scanner honours an
+#   allowlist at scripts/.zsf-bare-except-allowlist.txt for documented
+#   exceptions only.
+#
+# WHAT FAILURE MEANS:
+#   New code introduced a silent failure. The Zero Silent Failures invariant
+#   from CLAUDE.md is non-negotiable: every exception must reach an
+#   observable channel (health endpoint, log line, Redis counter, gains gate).
+#   Fix by either:
+#     - logging + incrementing a named error counter, OR
+#     - adding the path to the allowlist with a written justification.
+#   DO NOT silence the scanner.
+#
+# WHY REQUIRED:
+#   Bare-except is the single most common way "everything looks green" while
+#   the system is actually broken. Catching it at PR time is 100x cheaper than
+#   diagnosing a silent regression in production.
+# =============================================================================
+
+name: zsf-bare-except
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  zsf-bare-except:
+    name: zsf bare-except scan
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Checkout (with submodules)
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 1
+
+      - name: Setup Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Run ZSF bare-except scanner
+        run: bash scripts/check-zsf-bare-except.sh

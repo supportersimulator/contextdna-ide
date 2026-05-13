@@ -1,0 +1,72 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Cloud inbox listener — long-lived NATS subscriber that REPLACES the
+  hourly RemoteTrigger polling loop. One process, awakens on event
+  delivery, emits status reports only on state change (debounced 1h).
+
+  Deploy:
+    sed "s|__USER_HOME__|$HOME|g" \
+      scripts/launchd/io.contextdna.cloud-inbox-listener.plist \
+      > ~/Library/LaunchAgents/io.contextdna.cloud-inbox-listener.plist
+    launchctl load ~/Library/LaunchAgents/io.contextdna.cloud-inbox-listener.plist
+
+  When this is loaded, the operator MUST disable any RemoteTrigger
+  schedule that wakes a cloud Claude session every 5-15 minutes. The
+  listener subscribes to fleet.> on NATS — events drive work, not time.
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>io.contextdna.cloud-inbox-listener</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>__USER_HOME__/dev/er-simulator-superrepo/.venv/bin/python3</string>
+        <string>__USER_HOME__/dev/er-simulator-superrepo/tools/cloud_inbox_listener.py</string>
+        <string>--node</string>
+        <string>cloud</string>
+    </array>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>KeepAlive</key>
+    <true/>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PYTHONPATH</key>
+        <string>__USER_HOME__/dev/er-simulator-superrepo:__USER_HOME__/dev/er-simulator-superrepo/multi-fleet</string>
+        <key>PATH</key>
+        <string>/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin</string>
+        <key>NATS_URL</key>
+        <string>nats://127.0.0.1:4222</string>
+        <key>MULTIFLEET_NODE_ID</key>
+        <string>cloud</string>
+        <!-- WW4 (2026-05-12): right-size cloud as P7 mailbox only.
+             Daemon publishes this role to KV → fleet-state.json. Other
+             nodes' compute-class dispatch (per WW2) skips role=p7_mailbox. -->
+        <key>MULTIFLEET_ROLE</key>
+        <string>p7_mailbox</string>
+        <key>LOG_LEVEL</key>
+        <string>INFO</string>
+    </dict>
+
+    <key>ProcessType</key>
+    <string>Background</string>
+
+    <key>Nice</key>
+    <integer>5</integer>
+
+    <key>StandardOutPath</key>
+    <string>/tmp/cloud-inbox-listener.log</string>
+    <key>StandardErrorPath</key>
+    <string>/tmp/cloud-inbox-listener.err</string>
+
+    <!-- Restart throttle: NOT a polling cadence — only fires if the
+         listener crashes. Steady state is one persistent process. -->
+    <key>ThrottleInterval</key>
+    <integer>30</integer>
+</dict>
+</plist>

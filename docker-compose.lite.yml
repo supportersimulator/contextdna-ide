@@ -1,0 +1,323 @@
+# =============================================================================
+# ContextDNA IDE — Mothership LITE profile
+# -----------------------------------------------------------------------------
+# Minimal laptop stack. Pairs with docker-compose.heavy.yml on a beefy node.
+# Target footprint: 2-3 GB RAM, 20 GB disk, 2 CPU.
+#
+# Architecture decisions vs. heavy:
+#   - Postgres: shm_size=256m (small), single CPU, 384m memory cap.
+#   - No RabbitMQ / Celery — lite uses in-process scheduling in the helper agent.
+#   - No SeaweedFS — lite emits artifact references to NATS; heavy fetches them.
+#   - No Traefik — lite services bind 127.0.0.1 only (laptop is not public).
+#   - No Jaeger/Prometheus/Grafana — lite emits OTLP traces over NATS to heavy.
+#   - No Ollama — lite uses the native macOS MLX-LLM proxy (port 5044, launchd).
+#
+# Two services are intentionally *not* containerized on macOS:
+#   - Event Bridge  → `~/Library/LaunchAgents/io.contextdna.event-bridge.plist`
+#   - MLX-LLM proxy → `~/Library/LaunchAgents/com.contextdna.llm.plist`
+# See comments on the `event-bridge-notice` and `mlx-llm-notice` placeholders
+# below for context. They are documented here so anyone reading this file
+# sees the full lite topology in one place.
+#
+# Bidirectional sync mechanism:
+#   - NATS leaf-node client (this file) → chief NATS on heavy node (port 7422).
+#   - JetStream KV `fleet_roster` is replicated leaf ↔ chief.
+#   - Helper agent publishes work logs to `fleet.lite.<node_id>.worklog`.
+#   - Helper agent subscribes to `fleet.heavy.learnings.>` for downloaded SOPs.
+#
+# Usage:
+#   cp .env.example .env       # set POSTGRES_PASSWORD, REDIS_PASSWORD,
+#                              # NATS_REMOTE_URL (e.g., nats-leaf://heavy:7422)
+#   docker compose -f docker-compose.lite.yml up -d
+# =============================================================================
+
+name: contextdna-lite
+
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "5m"
+    max-file: "2"
+    compress: "true"
+
+services:
+  # ===========================================================================
+  # FOUNDATION TIER — slim datastores
+  # ===========================================================================
+
+  # --- Postgres 16 (small) ---------------------------------------------------
+  # shm_size=256m keeps shared buffers + temp files within laptop budget.
+  postgres:
+    image: postgres:16-alpine
+    container_name: contextdna-lite-postgres
+    restart: unless-stopped
+    logging: *default-logging
+    shm_size: 256m
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-contextdna_lite}
+      POSTGRES_USER: ${POSTGRES_USER:-contextdna}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+    volumes:
+      - postgres_lite_data:/var/lib/postgresql/data
+    ports:
+      # 127.0.0.1 bind: only local apps can reach Postgres on the laptop.
+      - "127.0.0.1:${POSTGRES_PORT:-5432}:5432"
+    deploy:
+      resources:
+        limits:
+          memory: ${POSTGRES_MEMORY:-384m}
+          cpus: "${POSTGRES_CPUS:-1}"
+        reservations:
+          memory: 128m
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-contextdna} -d ${POSTGRES_DB:-contextdna_lite}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+    networks: [contextdna_lite]
+
+  # --- Redis 7 (cache, pub/sub mirror) ---------------------------------------
+  redis:
+    image: redis:7-alpine
+    container_name: contextdna-lite-redis
+    restart: unless-stopped
+    logging: *default-logging
+    command:
+      - "redis-server"
+      - "--appendonly"
+      - "yes"
+      - "--requirepass"
+      - "${REDIS_PASSWORD}"
+      - "--maxmemory"
+      - "256mb"
+      - "--maxmemory-policy"
+      - "allkeys-lru"
+    volumes:
+      - redis_lite_data:/data
+    ports:
+      - "127.0.0.1:${REDIS_PORT:-6379}:6379"
+    deploy:
+      resources:
+        limits:
+          memory: ${REDIS_MEMORY:-320m}
+          cpus: "${REDIS_CPUS:-0.5}"
+        reservations:
+          memory: 64m
+    healthcheck:
+      test: ["CMD", "redis-cli", "-a", "${REDIS_PASSWORD}", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+    networks: [contextdna_lite]
+
+  # ===========================================================================
+  # FLEET TIER — NATS leaf-node client
+  # ===========================================================================
+
+  # --- NATS leaf node (connects back to heavy chief) -------------------------
+  # The leaf-node config file must reference $NATS_REMOTE_URL and the leaf
+  # credentials (creds file mounted read-only). See docs/sync/bidirectional.md
+  # and docs/plans/2026-04-23-nats-leaf-node-plan.md.
+  #
+  # Required runtime files (mount points below):
+  #   ./nats/leaf.conf       — leaf-node config (remotes, listen, jetstream)
+  #   ./nats/leaf.creds      — NATS creds file (chmod 600 on the host)
+  #
+  # The leaf gives this laptop a local NATS server on 4222 that automatically
+  # mirrors subjects from chief. JetStream replicas roll back to the chief.
+  nats-leaf:
+    image: nats:2-alpine
+    container_name: contextdna-lite-nats-leaf
+    restart: unless-stopped
+    logging: *default-logging
+    command:
+      - "-c"
+      - "/etc/nats/leaf.conf"
+    environment:
+      # leaf.conf can reference $NATS_REMOTE_URL via env interpolation.
+      NATS_REMOTE_URL: ${NATS_REMOTE_URL}
+      NATS_LEAF_USER: ${NATS_LEAF_USER:-leaf}
+      NATS_LEAF_PASSWORD: ${NATS_LEAF_PASSWORD}
+    volumes:
+      - ./nats/leaf.conf:/etc/nats/leaf.conf:ro
+      - ./nats/leaf.creds:/etc/nats/leaf.creds:ro
+      - nats_lite_data:/data
+    ports:
+      - "127.0.0.1:${NATS_CLIENT_PORT:-4222}:4222"   # local NATS client
+      - "127.0.0.1:${NATS_MONITOR_PORT:-8222}:8222"  # /healthz
+    deploy:
+      resources:
+        limits:
+          memory: ${NATS_MEMORY:-128m}
+          cpus: "${NATS_CPUS:-0.25}"
+        reservations:
+          memory: 32m
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O- http://localhost:8222/healthz | grep -q ok || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+    networks: [contextdna_lite]
+
+  # ===========================================================================
+  # APPLICATION TIER
+  # ===========================================================================
+
+  # --- MCP webhook server (Cursor/Claude Code → 9-section payload) -----------
+  mcp-webhook:
+    build:
+      context: ../../
+      dockerfile: mcp-servers/Dockerfile.mcp
+    container_name: contextdna-lite-mcp-webhook
+    restart: unless-stopped
+    logging: *default-logging
+    environment:
+      PYTHONPATH: /app
+      REPO_ROOT: /app
+      MODE: lite
+      CONTEXT_DNA_TIMEOUT: "15000"
+      REDIS_URL: redis://:${REDIS_PASSWORD}@redis:6379
+      POSTGRES_URL: postgresql://${POSTGRES_USER:YOUR_PASSWORD@postgres:5432/${POSTGRES_DB:-contextdna_lite}
+      NATS_URL: nats://nats-leaf:4222
+      # Native macOS MLX server reached via host bridge (see launchd note).
+      MLX_SERVER_URL: ${MLX_SERVER_URL:-http://host.docker.internal:5044}
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - ../../:/app
+    ports:
+      - "127.0.0.1:${MCP_WEBHOOK_PORT:-8000}:8000"
+    deploy:
+      resources:
+        limits:
+          memory: ${MCP_WEBHOOK_MEMORY:-256m}
+          cpus: "${MCP_WEBHOOK_CPUS:-0.25}"
+        reservations:
+          memory: 64m
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import sys; sys.path.insert(0, '/app'); from memory.session_historian import SessionHistorian; print('ok')"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+    networks: [contextdna_lite]
+
+  # --- Helper Agent (lite mode — in-process scheduling, no Celery) -----------
+  helper-agent:
+    build:
+      context: ../../memory
+      dockerfile: Dockerfile.agent
+    container_name: contextdna-lite-helper-agent
+    restart: unless-stopped
+    logging: *default-logging
+    environment:
+      MODE: lite                              # switches helper to single-process loop
+      POSTGRES_URL: postgresql://${POSTGRES_USER:YOUR_PASSWORD@postgres:5432/${POSTGRES_DB:-contextdna_lite}
+      REDIS_URL: redis://:${REDIS_PASSWORD}@redis:6379
+      REDIS_PASSWORD: ${REDIS_PASSWORD}
+      NATS_URL: nats://nats-leaf:4222
+      WORK_LOG_PATH: /app/memory/.work_dialogue_log.jsonl
+      BRAIN_CYCLE_INTERVAL: ${BRAIN_CYCLE_INTERVAL:-600}
+      SUCCESS_DETECTION_INTERVAL: ${SUCCESS_DETECTION_INTERVAL:-120}
+      EVOLUTION_INTERVAL: ${EVOLUTION_INTERVAL:-3600}
+      # Sync subjects (used by memory.fleet_sync module — see ARCHITECTURE.md).
+      FLEET_SYNC_PUBLISH_SUBJECT: fleet.lite.${FLEET_NODE_ID:-lite}.worklog
+      FLEET_SYNC_SUBSCRIBE_SUBJECTS: "fleet.heavy.learnings.>"
+      MLX_SERVER_URL: ${MLX_SERVER_URL:-http://host.docker.internal:5044}
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - ../../memory:/app/memory
+      - ~/.context-dna:/root/.context-dna
+      - work_log_lite_data:/data
+    ports:
+      - "127.0.0.1:${HELPER_AGENT_PORT:-8080}:8080"
+    deploy:
+      resources:
+        limits:
+          memory: ${HELPER_AGENT_MEMORY:-512m}
+          cpus: "${HELPER_AGENT_CPUS:-0.5}"
+        reservations:
+          memory: 128m
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      nats-leaf:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+    networks: [contextdna_lite]
+
+  # ===========================================================================
+  # OUT-OF-COMPOSE — services that run on the macOS host, NOT in containers
+  # ===========================================================================
+  #
+  # The following two services are documented here for completeness. They are
+  # not part of the compose graph because they must run natively on the host:
+  #
+  # ---------------------------------------------------------------------------
+  # event-bridge-notice
+  # ---------------------------------------------------------------------------
+  # The Event Bridge ferries webhook events between the local Claude Code
+  # session and the helper agent. It needs filesystem access to the user's
+  # ~/Library/Application Support/Claude folder, so it cannot run in Docker.
+  #
+  # Install with launchd:
+  #   cp scripts/launchd/io.contextdna.event-bridge.plist \
+  #      ~/Library/LaunchAgents/io.contextdna.event-bridge.plist
+  #   launchctl bootstrap gui/$(id -u) \
+  #      ~/Library/LaunchAgents/io.contextdna.event-bridge.plist
+  #
+  # Defaults: stdio bridge on /tmp/contextdna-event-bridge.sock, publishes to
+  # nats://127.0.0.1:4222 (the leaf node above).
+  #
+  # ---------------------------------------------------------------------------
+  # mlx-llm-notice
+  # ---------------------------------------------------------------------------
+  # The MLX-LLM proxy hosts Qwen3-4B on Apple Silicon. MLX requires the macOS
+  # Metal framework and *cannot* be containerized.
+  #
+  # Install with launchd:
+  #   cp scripts/launchd/com.contextdna.llm.plist \
+  #      ~/Library/LaunchAgents/com.contextdna.llm.plist
+  #   launchctl bootstrap gui/$(id -u) \
+  #      ~/Library/LaunchAgents/com.contextdna.llm.plist
+  #
+  # Health check: `curl http://127.0.0.1:5044/v1/models`.
+  # Container reach: `http://host.docker.internal:5044` via extra_hosts above.
+  #
+  # ===========================================================================
+
+# =============================================================================
+# VOLUMES
+# =============================================================================
+volumes:
+  postgres_lite_data:
+    name: contextdna-lite-postgres-data
+  redis_lite_data:
+    name: contextdna-lite-redis-data
+  nats_lite_data:
+    name: contextdna-lite-nats-data
+  work_log_lite_data:
+    name: contextdna-lite-work-log-data
+
+# =============================================================================
+# NETWORK
+# =============================================================================
+networks:
+  contextdna_lite:
+    name: contextdna_lite
+    driver: bridge

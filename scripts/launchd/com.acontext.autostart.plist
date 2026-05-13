@@ -1,0 +1,48 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.acontext.autostart</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/bash</string>
+        <string>-c</string>
+        <string>
+            # Bail early if working dir doesn't exist (avoid silent failure / read-only fs error)
+            ACONTEXT_DIR=/Users/aarontjomsland/dev/er-simulator-superrepo/acontext
+            if [ ! -d "$ACONTEXT_DIR" ]; then
+                echo "[$(date)] acontext dir missing ($ACONTEXT_DIR); job is dormant, no compose available"
+                exit 64  # EX_USAGE — observable, non-zero, lets launchd record it without restart loop
+            fi
+            # Wait for Docker to be ready (up to 120 seconds)
+            for i in {1..24}; do
+                if docker info &amp;&gt;/dev/null; then
+                    cd "$ACONTEXT_DIR"
+                    /Users/aarontjomsland/.acontext/bin/acontext docker up -d
+                    exit 0
+                fi
+                sleep 5
+            done
+            echo "[$(date)] Docker not ready after 120s, skipping Acontext autostart"
+            exit 75  # EX_TEMPFAIL
+        </string>
+    </array>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>StandardOutPath</key>
+    <string>/tmp/acontext-autostart.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>/tmp/acontext-autostart.log</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    </dict>
+</dict>
+</plist>

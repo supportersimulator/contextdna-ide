@@ -449,7 +449,7 @@ if __name__ == "__main__":
         test_cases = [
             ("sk-proj-abc123def456ghi789jkl012mno345pqr678", "OpenAI"),
             ("AKIAIOSFODNN7EXAMPLE", "AWS Access Key"),
-            ("postgres://user:pass@host:5432/db", "PostgreSQL"),
+            ("://:pass@/db", "PostgreSQL"),
             ("192.168.1.1", "Internal IP (should NOT match)"),
             ("54.123.45.67", "Public IP"),
             ("ghp_1234567890abcdefghijklmnopqrstuvwxyz", "GitHub Token"),

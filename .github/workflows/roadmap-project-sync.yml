@@ -1,0 +1,173 @@
+name: Roadmap → Master Project Sync
+
+on:
+  issues:
+    types: [opened, labeled, reopened]
+  pull_request:
+    types: [opened, reopened, ready_for_review, converted_to_draft, closed, labeled]
+
+permissions:
+  contents: read
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Sync roadmap-labeled items into Master Roadmap Project
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.PROJECTS_TOKEN }}
+          script: |
+            const projectId = process.env.PROJECT_ID;
+            const roadmapLabel = 'roadmap';
+
+            const eventName = context.eventName;
+            const action = context.payload.action;
+
+            const isIssue = eventName === 'issues';
+            const isPR = eventName === 'pull_request';
+
+            const issue = isIssue ? context.payload.issue : null;
+            const pr = isPR ? context.payload.pull_request : null;
+
+            const contentId = isIssue ? issue?.node_id : pr?.node_id;
+            if (!contentId) {
+              core.info('No content node_id found; skipping.');
+              return;
+            }
+
+            const labels = (isIssue ? issue.labels : pr.labels).map(l => l.name);
+            const labelJustAdded = context.payload.label?.name;
+
+            // Only act when roadmap is present.
+            if (!(labels.includes(roadmapLabel) || labelJustAdded === roadmapLabel)) {
+              core.info(`No '${roadmapLabel}' label; skipping.`);
+              return;
+            }
+
+            // Determine desired statuses:
+            // - Roadmap Status: rich lifecycle (Backlog/Planned/In Review/etc.)
+            // - Built-in Status: Todo/In Progress/Done (for simple GitHub board views)
+            let desiredRoadmapStatus = 'Backlog';
+            let desiredBuiltInStatus = 'Todo';
+            if (isPR) {
+              if (action === 'closed') {
+                desiredRoadmapStatus = pr.merged ? 'Done' : 'Backlog';
+                desiredBuiltInStatus = pr.merged ? 'Done' : 'Todo';
+              } else {
+                desiredRoadmapStatus = pr.draft ? 'In Progress' : 'In Review';
+                desiredBuiltInStatus = 'In Progress';
+              }
+            }
+
+            async function graphql(query, variables) {
+              return await github.graphql(query, variables);
+            }
+
+            async function getProjectItemIdForContent() {
+              const q = `query($contentId:ID!){
+                node(id:$contentId){
+                  __typename
+                  ... on Issue { projectItems(first:20){ nodes { id project { id } } } }
+                  ... on PullRequest { projectItems(first:20){ nodes { id project { id } } } }
+                }
+              }`;
+              const res = await graphql(q, { contentId });
+              const node = res.node;
+              const nodes = node.projectItems?.nodes || [];
+              const match = nodes.find(n => n.project?.id === projectId);
+              return match?.id || null;
+            }
+
+            async function addToProject() {
+              const m = `mutation($projectId:ID!,$contentId:ID!){
+                addProjectV2ItemById(input:{projectId:$projectId, contentId:$contentId}){
+                  item { id }
+                }
+              }`;
+              const res = await graphql(m, { projectId, contentId });
+              return res.addProjectV2ItemById.item.id;
+            }
+
+            async function getSingleSelectFieldAndOptionId(fieldName, optionName) {
+              const q = `query($projectId:ID!){
+                node(id:$projectId){
+                  ... on ProjectV2 {
+                    fields(first:100){
+                      nodes {
+                        __typename
+                        ... on ProjectV2SingleSelectField {
+                          id
+                          name
+                          options { id name }
+                        }
+                      }
+                    }
+                  }
+                }
+              }`;
+              const res = await graphql(q, { projectId });
+              const fields = res.node.fields.nodes;
+              const field = fields.find(f => f.__typename === 'ProjectV2SingleSelectField' && f.name === fieldName);
+              if (!field) return { fieldId: null, optionId: null };
+              const option = field.options.find(o => o.name === optionName);
+              return { fieldId: field.id, optionId: option?.id || null };
+            }
+
+            async function setSingleSelect(itemId, fieldName, optionName) {
+              const { fieldId, optionId } = await getSingleSelectFieldAndOptionId(fieldName, optionName);
+              if (!fieldId) {
+                core.warning(`Field not found: ${fieldName}`);
+                return;
+              }
+              if (!optionId) {
+                core.warning(`Option not found for ${fieldName}: ${optionName}`);
+                return;
+              }
+
+              // GitHub treats single-select option IDs as strings (not node IDs).
+              const m = `mutation($projectId:ID!,$itemId:ID!,$fieldId:ID!,$optionId:String!){
+                updateProjectV2ItemFieldValue(input:{projectId:$projectId,itemId:$itemId,fieldId:$fieldId,value:{singleSelectOptionId:$optionId}}){
+                  projectV2Item { id }
+                }
+              }`;
+              await graphql(m, { projectId, itemId, fieldId, optionId });
+            }
+
+            let itemId = await getProjectItemIdForContent();
+            let created = false;
+
+            if (!itemId) {
+              itemId = await addToProject();
+              created = true;
+              core.info(`Added to project: itemId=${itemId}`);
+            } else {
+              core.info(`Already in project: itemId=${itemId}`);
+            }
+
+            // Always keep Roadmap Status aligned with PR lifecycle / issue backlog.
+            await setSingleSelect(itemId, 'Roadmap Status', desiredRoadmapStatus);
+            core.info(`Set Roadmap Status → ${desiredRoadmapStatus}`);
+
+            // Also keep GitHub's built-in Status aligned (Todo/In Progress/Done).
+            await setSingleSelect(itemId, 'Status', desiredBuiltInStatus);
+            core.info(`Set Status → ${desiredBuiltInStatus}`);
+
+            // Set defaults only on first add (doesn't override later manual edits).
+            if (created) {
+              const surface = process.env.SURFACE_DEFAULT;
+              const productArea = process.env.PRODUCT_AREA_DEFAULT;
+
+              if (surface) {
+                await setSingleSelect(itemId, 'Surface', surface);
+                core.info(`Set Surface → ${surface}`);
+              }
+              if (productArea) {
+                await setSingleSelect(itemId, 'Product Area', productArea);
+                core.info(`Set Product Area → ${productArea}`);
+              }
+            }
+        env:
+          PROJECT_ID: PVT_kwHODj9o384BLGah
+          SURFACE_DEFAULT: Docs/Process
+          PRODUCT_AREA_DEFAULT: Infra/Deploy

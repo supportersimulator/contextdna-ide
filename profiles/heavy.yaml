@@ -1,0 +1,205 @@
+# =============================================================================
+# ContextDNA IDE — HEAVY profile spec
+# -----------------------------------------------------------------------------
+# This is a documentation file: human-readable description of what
+# docker-compose.heavy.yml stands up. CI consumes the `resources`,
+# `required_env`, and `ports` fields to validate before bringing up a node.
+# =============================================================================
+
+profile: heavy
+description: >-
+  Full Acontext-derived stack for a beefy node (Mac Studio, home server, cloud).
+  Hosts the NATS chief that lite leaf nodes connect back to, plus the heavy
+  Postgres/Redis/RabbitMQ/SeaweedFS/Celery/Traefik/Jaeger/Prometheus/Grafana
+  fleet. Optional Ollama profile adds Qwen2.5-3B on non-Apple-Silicon hosts.
+
+# -----------------------------------------------------------------------------
+# Hardware expectations — checked by scripts/bootstrap-check.sh before start.
+# -----------------------------------------------------------------------------
+resources:
+  ram_min_gb: 6
+  ram_recommended_gb: 16
+  disk_min_gb: 50
+  disk_recommended_gb: 200
+  cpu_min_cores: 4
+  cpu_recommended_cores: 8
+
+# -----------------------------------------------------------------------------
+# Services included (matches docker-compose.heavy.yml exactly).
+# -----------------------------------------------------------------------------
+services:
+  - name: postgres
+    image: pgvector/pgvector:pg16
+    role: "Primary store + pgvector embeddings"
+    optional: false
+
+  - name: redis
+    image: redis:7-alpine
+    role: "Cache, rate limiter, pub/sub fan-out for fleet learnings"
+    optional: false
+
+  - name: rabbitmq
+    image: rabbitmq:3.13-management
+    role: "Celery broker (S2/S6/S8 task dispatch)"
+    optional: false
+
+  - name: seaweedfs
+    image: chrislusf/seaweedfs:latest
+    role: "S3-compatible blob store for SOPs and artifacts"
+    optional: false
+
+  - name: seaweedfs-setup
+    image: amazon/aws-cli:2.32.6
+    role: "One-shot bucket initializer (runs once, exits)"
+    optional: false
+
+  - name: nats
+    image: nats:2-alpine
+    role: "JetStream chief + leaf-node accept point for lite laptops"
+    optional: false
+
+  - name: traefik
+    image: traefik:v3.0
+    role: "TLS termination + host routing (Let's Encrypt)"
+    optional: false
+
+  - name: mcp-webhook
+    build: mcp-servers/Dockerfile.mcp
+    role: "MCP webhook server for IDE context injection"
+    optional: false
+
+  - name: helper-agent
+    build: memory/Dockerfile.agent
+    role: "The 'subconscious' brain — work-log processing, brain cycles"
+    optional: false
+
+  - name: celery-worker
+    build: memory/Dockerfile.agent
+    role: "Background processors (scanners, distillers, LLM tasks)"
+    optional: false
+
+  - name: celery-beat
+    build: memory/Dockerfile.agent
+    role: "Cron-style scheduler for periodic brain/scanner/evolution tasks"
+    optional: false
+
+  - name: jaeger
+    image: jaegertracing/all-in-one:1.64.0
+    role: "Distributed tracing + OTLP receiver"
+    optional: false
+
+  - name: prometheus
+    image: prom/prometheus:v2.48.0
+    role: "Metric collection"
+    optional: false
+
+  - name: grafana
+    image: grafana/grafana:10.2.0
+    role: "Metric visualization + dashboards"
+    optional: false
+
+  - name: ollama
+    image: ollama/ollama:0.5.4
+    role: "Local LLM (Qwen2.5-3B) — non-Apple-Silicon fallback"
+    optional: true
+    profile: llm
+
+  - name: ollama-setup
+    image: curlimages/curl:8.5.0
+    role: "One-shot Qwen2.5-3B pull"
+    optional: true
+    profile: llm
+
+# -----------------------------------------------------------------------------
+# Required environment — must be present in .env or compose fails.
+# -----------------------------------------------------------------------------
+required_env:
+  # Datastore secrets — set strong values, never commit.
+  - POSTGRES_PASSWORD       # postgres + helper-agent + celery-worker
+  - REDIS_PASSWORD          # redis + helper-agent + celery-worker
+  - RABBITMQ_PASSWORD       # rabbitmq + celery-worker + celery-beat
+  - S3_SECRET_KEY           # seaweedfs + seaweedfs-setup + helper-agent
+  - GRAFANA_PASSWORD        # grafana admin login
+
+optional_env:
+  - POSTGRES_USER           # default: contextdna
+  - POSTGRES_DB             # default: contextdna
+  - RABBITMQ_USER           # default: contextdna
+  - RABBITMQ_VHOST          # default: /
+  - S3_ACCESS_KEY           # default: contextdna
+  - S3_BUCKET               # default: contextdna-assets
+  - S3_REGION               # default: us-east-1
+  - GRAFANA_USER            # default: admin
+  - LETSENCRYPT_EMAIL       # default: admin@example.com
+  - NATS_CLUSTER_ROUTES     # peer chief URLs (only set if multi-chief)
+  - NATS_ADVERTISE_HOST     # hostname leaf nodes resolve us as
+  - MLX_SERVER_URL          # default: http://host.docker.internal:5044
+  - OLLAMA_URL              # default: http://ollama:11434 (llm profile only)
+  - BRAIN_CYCLE_INTERVAL    # default: 300 (seconds)
+  - SUCCESS_DETECTION_INTERVAL  # default: 60
+  - EVOLUTION_INTERVAL      # default: 1800
+
+# -----------------------------------------------------------------------------
+# Exposed ports — published on 0.0.0.0 because heavy is a server.
+# -----------------------------------------------------------------------------
+ports:
+  - {service: postgres,    host: 5432,  description: "Postgres SQL"}
+  - {service: redis,       host: 6379,  description: "Redis client"}
+  - {service: rabbitmq,    host: 5672,  description: "AMQP broker"}
+  - {service: rabbitmq,    host: 15672, description: "RabbitMQ management UI"}
+  - {service: seaweedfs,   host: 8333,  description: "S3-compatible API"}
+  - {service: seaweedfs,   host: 9333,  description: "SeaweedFS master UI"}
+  - {service: seaweedfs,   host: 8888,  description: "SeaweedFS filer UI"}
+  - {service: nats,        host: 4222,  description: "NATS client"}
+  - {service: nats,        host: 6222,  description: "NATS cluster routes"}
+  - {service: nats,        host: 8222,  description: "NATS monitoring"}
+  - {service: nats,        host: 7422,  description: "NATS leaf-node accept (lite → heavy)"}
+  - {service: traefik,     host: 80,    description: "HTTP (Let's Encrypt http-01)"}
+  - {service: traefik,     host: 443,   description: "HTTPS"}
+  - {service: mcp-webhook, host: 8000,  description: "MCP webhook server"}
+  - {service: helper-agent, host: 8080, description: "Helper agent health + control"}
+  - {service: jaeger,      host: 16686, description: "Jaeger UI"}
+  - {service: jaeger,      host: 4317,  description: "OTLP gRPC"}
+  - {service: jaeger,      host: 4318,  description: "OTLP HTTP"}
+  - {service: prometheus,  host: 9090,  description: "Prometheus UI"}
+  - {service: grafana,     host: 3001,  description: "Grafana UI"}
+  - {service: ollama,      host: 11434, description: "Ollama API (llm profile only)"}
+
+# -----------------------------------------------------------------------------
+# Bidirectional sync mechanism (NATS leaf-node + JetStream KV + Redis pub/sub)
+# -----------------------------------------------------------------------------
+sync:
+  role: chief
+  description: >-
+    Heavy node accepts leaf-node connections from lite laptops on port 7422.
+    The chief owns the canonical JetStream KV `fleet_roster` and broadcasts
+    distilled learnings to lite nodes. Lite nodes publish work logs and
+    completion events for the chief to ingest.
+
+  jetstream:
+    enabled: true
+    store_dir: /data
+    streams:
+      - name: fleet_roster
+        type: kv
+        replicas: 3                     # quorum self-heal (RACE N3/O4 shipped)
+        description: "Canonical fleet membership + node health"
+      - name: fleet_worklogs
+        subjects: ["fleet.lite.>.worklog"]
+        retention: limits
+        max_age_hours: 168              # 7 days of laptop work logs
+      - name: fleet_learnings
+        subjects: ["fleet.heavy.learnings.>"]
+        retention: limits
+        max_age_hours: 720              # 30 days of distilled SOPs
+
+  leaf_node:
+    listen_port: 7422
+    auth: creds_file                    # leaf nodes mount leaf.creds
+    accept_from: ["lite-laptop-*"]      # any node whose creds match
+
+  redis_pubsub:
+    enabled: true
+    channels:
+      - fleet:learnings:broadcast       # heavy → all subscribers
+      - fleet:worklog:ingest            # lite → heavy summary

@@ -1,0 +1,30 @@
+[submodule "engines/3-surgeons"]
+	path = engines/3-surgeons
+	url = https://github.com/supportersimulator/3-surgeons.git
+	branch = main
+
+[submodule "engines/multi-fleet"]
+	path = engines/multi-fleet
+	url = https://github.com/supportersimulator/multi-fleet.git
+	branch = main
+
+# ============================================================
+# TODO: confirm public URL — may be private
+# ------------------------------------------------------------
+# As of 2026-05-13, https://github.com/supportersimulator/context-dna.git
+# returns 404. The context-dna engine currently lives only as a
+# local pip-packaged module inside the er-simulator-superrepo. Before
+# operators run wire-submodules.sh, promote context-dna to its own
+# public (or private-but-accessible) GitHub repo, or swap this URL
+# for the internal mirror. wire-submodules.sh will log this to
+# submodule-todo.md and skip if unreachable — it will NOT fail.
+# ============================================================
+[submodule "engines/context-dna"]
+	path = engines/context-dna
+	url = https://github.com/supportersimulator/context-dna.git
+	branch = main
+
+[submodule "apps/ide-shell"]
+	path = apps/ide-shell
+	url = https://github.com/supportersimulator/v0-Context-DNA-1.git
+	branch = main

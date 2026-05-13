@@ -1,0 +1,75 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <!-- Service Label -->
+    <key>Label</key>
+    <string>io.contextdna.synaptic</string>
+
+    <!-- Description: Synaptic Fast Chat v5.5 - 8th Intelligence voice server -->
+
+    <!-- Program and Arguments -->
+    <key>ProgramArguments</key>
+    <array>
+        <string>__USER_HOME__/dev/er-simulator-superrepo/.venv/bin/python3</string>
+        <string>__USER_HOME__/dev/er-simulator-superrepo/memory/synaptic_chat_server.py</string>
+    </array>
+
+    <!-- Working Directory -->
+    <key>WorkingDirectory</key>
+    <string>__USER_HOME__/dev/er-simulator-superrepo/memory</string>
+
+    <!-- Start at login/boot -->
+    <key>RunAtLoad</key>
+    <true/>
+
+    <!-- Keep alive - restart if crashes -->
+    <key>KeepAlive</key>
+    <dict>
+        <!-- Restart on crash -->
+        <key>SuccessfulExit</key>
+        <false/>
+        <!-- Don't restart if deliberately stopped -->
+        <key>Crashed</key>
+        <true/>
+    </dict>
+
+    <!-- Throttle restarts (wait 10 seconds between restart attempts) -->
+    <key>ThrottleInterval</key>
+    <integer>10</integer>
+
+    <!-- Environment Variables -->
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>HOME</key>
+        <string>__USER_HOME__</string>
+        <key>PATH</key>
+        <string>__USER_HOME__/dev/er-simulator-superrepo/.venv/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+        <key>PYTHONPATH</key>
+        <string>__USER_HOME__/dev/er-simulator-superrepo</string>
+        <key>DJANGO_BACKEND_URL</key>
+        <string>http://127.0.0.1:8000</string>
+    </dict>
+
+    <!-- Logging -->
+    <key>StandardOutPath</key>
+    <string>__USER_HOME__/.context-dna/logs/synaptic.stdout.log</string>
+    <key>StandardErrorPath</key>
+    <string>__USER_HOME__/.context-dna/logs/synaptic.stderr.log</string>
+
+    <!-- Process management -->
+    <key>ProcessType</key>
+    <string>Standard</string>
+
+    <!-- Nice value (priority) - slightly lower than normal for background service -->
+    <key>Nice</key>
+    <integer>5</integer>
+
+    <!-- Soft resource limits -->
+    <key>SoftResourceLimits</key>
+    <dict>
+        <key>NumberOfFiles</key>
+        <integer>1024</integer>
+    </dict>
+</dict>
+</plist>

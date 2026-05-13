@@ -1,0 +1,163 @@
+{
+  "passed": 23,
+  "failed": 0,
+  "warnings": 3,
+  "tests": [
+    {
+      "name": "Resource listed: contextdna://webhook",
+      "status": "pass",
+      "details": "",
+      "timestamp": "2026-02-08T15:54:35.905637"
+    },
+    {
+      "name": "Resource listed: contextdna://session-recovery",
+      "status": "pass",
+      "details": "",
+      "timestamp": "2026-02-08T15:54:35.905643"
+    },
+    {
+      "name": "Resource listed: contextdna://professor",
+      "status": "pass",
+      "details": "",
+      "timestamp": "2026-02-08T15:54:35.905682"
+    },
+    {
+      "name": "Resource listed: contextdna://8th-intelligence",
+      "status": "pass",
+      "details": "",
+      "timestamp": "2026-02-08T15:54:35.905683"
+    },
+    {
+      "name": "All 4 resources present",
+      "status": "pass",
+      "details": "",
+      "timestamp": "2026-02-08T15:54:35.905685"
+    },
+    {
+      "name": "Webhook content generated",
+      "status": "pass",
+      "details": "552 characters",
+      "timestamp": "2026-02-08T15:54:42.606663"
+    },
+    {
+      "name": "Webhook sections",
+      "status": "warn",
+      "details": "Running in fallback mode",
+      "timestamp": "2026-02-08T15:54:42.606667"
+    },
+    {
+      "name": "Session recovery content",
+      "status": "pass",
+      "details": "1658 characters",
+      "timestamp": "2026-02-08T15:54:42.609405"
+    },
+    {
+      "name": "Session recovery format",
+      "status": "pass",
+      "details": "",
+      "timestamp": "2026-02-08T15:54:42.609409"
+    },
+    {
+      "name": "Rehydration command present",
+      "status": "pass",
+      "details": "",
+      "timestamp": "2026-02-08T15:54:42.609411"
+    },
+    {
+      "name": "Professor wisdom content",
+      "status": "pass",
+      "details": "50 characters",
+      "timestamp": "2026-02-08T15:54:42.609636"
+    },
+    {
+      "name": "Professor service status",
+      "status": "warn",
+      "details": "Professor service offline (expected if not running)",
+      "timestamp": "2026-02-08T15:54:42.609639"
+    },
+    {
+      "name": "8th Intelligence content",
+      "status": "pass",
+      "details": "1171 characters",
+      "timestamp": "2026-02-08T15:54:42.612530"
+    },
+    {
+      "name": "8th Intelligence format",
+      "status": "pass",
+      "details": "Synaptic voice markers present",
+      "timestamp": "2026-02-08T15:54:42.612535"
+    },
+    {
+      "name": "Synaptic service status",
+      "status": "pass",
+      "details": "Synaptic generated perspective",
+      "timestamp": "2026-02-08T15:54:42.612547"
+    },
+    {
+      "name": "Freshness: contextdna://webhook",
+      "status": "pass",
+      "details": "3/3 unique generations",
+      "timestamp": "2026-02-08T15:54:46.599048"
+    },
+    {
+      "name": "Generation time: contextdna://webhook",
+      "status": "pass",
+      "details": "3.3s for 3 generations",
+      "timestamp": "2026-02-08T15:54:46.599052"
+    },
+    {
+      "name": "Freshness: contextdna://session-recovery",
+      "status": "warn",
+      "details": "Content appears identical (may be cached)",
+      "timestamp": "2026-02-08T15:54:48.609601"
+    },
+    {
+      "name": "Generation time: contextdna://session-recovery",
+      "status": "pass",
+      "details": "2.0s for 3 generations",
+      "timestamp": "2026-02-08T15:54:48.609610"
+    },
+    {
+      "name": "Invalid URI handling",
+      "status": "pass",
+      "details": "Proper error code returned",
+      "timestamp": "2026-02-08T15:54:48.609619"
+    },
+    {
+      "name": "Fallback context generation",
+      "status": "pass",
+      "details": "552 characters",
+      "timestamp": "2026-02-08T15:54:48.609632"
+    },
+    {
+      "name": "Fallback has recovery command",
+      "status": "pass",
+      "details": "",
+      "timestamp": "2026-02-08T15:54:48.609633"
+    },
+    {
+      "name": "MCP initialize",
+      "status": "pass",
+      "details": "Protocol: 2024-11-05",
+      "timestamp": "2026-02-08T15:54:48.609639"
+    },
+    {
+      "name": "MCP server info",
+      "status": "pass",
+      "details": "contextdna-webhook v2.0.0",
+      "timestamp": "2026-02-08T15:54:48.609641"
+    },
+    {
+      "name": "MCP resources/list",
+      "status": "pass",
+      "details": "4 resources",
+      "timestamp": "2026-02-08T15:54:48.609644"
+    },
+    {
+      "name": "MCP resources/read",
+      "status": "pass",
+      "details": "Successfully read resource",
+      "timestamp": "2026-02-08T15:54:49.236329"
+    }
+  ]
+}
