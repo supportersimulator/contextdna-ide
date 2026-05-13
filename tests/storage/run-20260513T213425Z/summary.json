@@ -1,0 +1,47 @@
+{
+  "run_id": "run-20260513T213425Z",
+  "started_at": "2026-05-13T21:34:25.176028+00:00",
+  "workers": 4,
+  "iterations": 4,
+  "ops_per_iter": 20,
+  "seed": 1337,
+  "checkpoints": [
+    "/private/tmp/cdna-mothership-build/tests/storage/run-20260513T213425Z/checkpoint-001.json",
+    "/private/tmp/cdna-mothership-build/tests/storage/run-20260513T213425Z/checkpoint-002.json",
+    "/private/tmp/cdna-mothership-build/tests/storage/run-20260513T213425Z/checkpoint-003.json",
+    "/private/tmp/cdna-mothership-build/tests/storage/run-20260513T213425Z/checkpoint-004.json"
+  ],
+  "fuzz_invariant_violations_total": 0,
+  "fuzz_worker_traceback_total": 0,
+  "ended_at": "2026-05-13T21:34:25.316088+00:00",
+  "harness_counters": {
+    "reset.ok": 5,
+    "op.promote.skip_empty": 2,
+    "op.query.ok": 91,
+    "op.record.fail": 2,
+    "op.retire.skip_empty": 1,
+    "op.record.ok": 127,
+    "op.promote.miss": 11,
+    "op.retire.miss": 8,
+    "op.retire.ok": 31,
+    "op.promote.ok": 47
+  },
+  "learning_store_counters": {
+    "backend.sqlite_used": 3,
+    "recent.ok": 1,
+    "query.ok": 91,
+    "store.fail": 10,
+    "json_backup.write_fail": 58,
+    "store.ok": 205,
+    "by_id.ok": 213,
+    "promote.not_found": 7,
+    "retire.not_found": 4,
+    "promote.fail": 4,
+    "retire.ok": 31,
+    "promote.ok": 47,
+    "retire.fail": 4,
+    "backend.postgres_unhealthy": 2,
+    "backend.auto_sqlite": 2,
+    "stats.ok": 4
+  }
+}

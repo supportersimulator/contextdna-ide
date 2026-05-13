@@ -1,0 +1,65 @@
+{
+  "n": 3,
+  "ts": "2026-05-13T21:34:25.268475+00:00",
+  "duration_s": 0.029,
+  "backend_before": "sqlite",
+  "backend_after": "auto",
+  "row_count_before": 96,
+  "row_count_after": 96,
+  "row_count_delta": 0,
+  "invariant_pass": true,
+  "evidence": {
+    "sql_count": 96,
+    "api_count": 96,
+    "duplicate_ids": [],
+    "promotion_still_promoted": 35,
+    "promotion_drifted": []
+  },
+  "iteration_errors": [
+    {
+      "phase": "promote",
+      "msg": "promote returned False",
+      "tb": ""
+    },
+    {
+      "phase": "retire",
+      "msg": "retire returned False",
+      "tb": ""
+    },
+    {
+      "phase": "promote",
+      "msg": "promote returned False",
+      "tb": ""
+    },
+    {
+      "phase": "promote",
+      "msg": "promote returned False",
+      "tb": ""
+    },
+    {
+      "phase": "retire",
+      "msg": "retire returned False",
+      "tb": ""
+    },
+    {
+      "phase": "promote",
+      "msg": "promote returned False",
+      "tb": ""
+    }
+  ],
+  "iteration_error_total": 6,
+  "promoted_in_iter": [
+    "fuzz_928_355284_6ae5418e",
+    "fuzz_920_577426_95f91fb2",
+    "fuzz_424_777080_f9386159",
+    "fuzz_920_389630_c0d5362f",
+    "fuzz_416_692777_54f87443",
+    "fuzz_424_566682_92ae0b0e",
+    "fuzz_424_155905_e211a627",
+    "fuzz_416_825644_b756e6d7",
+    "fuzz_928_179534_1d67e0e9",
+    "fuzz_928_554297_623bf954",
+    "fuzz_928_630561_162bc973",
+    "fuzz_424_612852_f43fef2d"
+  ]
+}

@@ -1,0 +1,69 @@
+{
+  "n": 1,
+  "ts": "2026-05-13T21:34:25.208820+00:00",
+  "duration_s": 0.03,
+  "backend_before": "sqlite",
+  "backend_after": "auto",
+  "row_count_before": 32,
+  "row_count_after": 32,
+  "row_count_delta": 0,
+  "invariant_pass": true,
+  "evidence": {
+    "sql_count": 32,
+    "api_count": 32,
+    "duplicate_ids": [],
+    "promotion_still_promoted": 11,
+    "promotion_drifted": []
+  },
+  "iteration_errors": [
+    {
+      "phase": "record",
+      "msg": "StorageError: store_learning failed: bad parameter or other API misuse",
+      "tb": ""
+    },
+    {
+      "phase": "retire",
+      "msg": "retire returned False",
+      "tb": ""
+    },
+    {
+      "phase": "promote",
+      "msg": "promote returned False",
+      "tb": ""
+    },
+    {
+      "phase": "retire",
+      "msg": "retire returned False",
+      "tb": ""
+    },
+    {
+      "phase": "promote",
+      "msg": "promote returned False",
+      "tb": ""
+    },
+    {
+      "phase": "retire",
+      "msg": "retire returned False",
+      "tb": ""
+    },
+    {
+      "phase": "retire",
+      "msg": "retire returned False",
+      "tb": ""
+    }
+  ],
+  "iteration_error_total": 7,
+  "promoted_in_iter": [
+    "fuzz_928_730983_c55e97ed",
+    "fuzz_424_265152_b7033d18",
+    "fuzz_928_17973_a69084e8",
+    "fuzz_416_421943_bad0bd62",
+    "fuzz_928_17973_a69084e8",
+    "fuzz_424_834045_6143893c",
+    "fuzz_416_614242_9be47643",
+    "fuzz_416_614242_9be47643",
+    "fuzz_928_694825_c79ea4d5",
+    "fuzz_424_684639_f7def2b8",
+    "fuzz_424_684639_f7def2b8"
+  ]
+}

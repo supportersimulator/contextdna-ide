@@ -24,6 +24,71 @@ ZSF compliance:
     - Connection errors surface as ``StorageError`` with the cause attached.
     - ``health_check`` returns False instead of raising, but the counter still
       records the failure.
+
+Thread-safety (migrate5 round-4 fix)
+------------------------------------
+Round 3 added ``self._lock = threading.RLock()`` and wrapped only
+``store_learning`` (extracted into ``_store_learning_locked``). The fuzz
+harness (tests/storage/storage_fuzz_harness.py) immediately found that the
+remaining ~26 ``self.conn.execute(...)`` call sites are still vulnerable to
+concurrent-write corruption — single-connection sqlite3 with
+``check_same_thread=False`` is NOT thread-safe; cursor state can be clobbered
+by another thread between ``.execute()`` and ``.fetch*()``.
+
+Round 4 (this file) applies the SAME Round-3 pattern uniformly to every public
+method that touches ``self.conn``:
+
+    public_method(args)            <- thin wrapper, ``with self._lock``
+        -> _public_method_locked(args)
+
+Internal helpers that take ``self.conn`` directly (``_find_duplicate``,
+``_init_schema``) are called from already-locked contexts (RLock allows
+reentry), so they keep their existing bodies but the contract is documented:
+"caller must hold self._lock".
+
+Methods locked in round-4 (sorted by name):
+    _find_duplicate        (helper; caller-locked, RLock-safe on reentry)
+    _init_schema           (ctor-only, but documented locked-contract)
+    close                  (write — disposes connection)
+    get_by_id              (read)
+    get_by_session         (read)
+    get_by_type            (read)
+    get_frequent_negative_patterns  (read)
+    get_recent             (read)
+    get_since              (read)
+    get_stats              (read; multiple SELECTs as one atomic snapshot)
+    health_check           (read; trivial SELECT 1)
+    mark_pattern_promoted  (write)
+    query                  (read; FTS + keyword fallback as one atomic snapshot)
+    record_negative_pattern (read-then-write; full lock required)
+    store_learning         (write; round-3 already)
+
+Methods NOT requiring DB locking (no ``self.conn`` access):
+    __init__               (constructor; cursor is created before publication)
+    _bump / get_counters   (module-level; use ``_COUNTER_LOCK``)
+    _get_or_create_device_id (file I/O only — JSON sidecar)
+    _row_to_dict           (pure transform)
+    _smart_merge           (pure transform)
+    device_id              (property; pure read of in-memory field)
+    get_db_path            (module-level; env+filesystem only)
+    get_device_info        (file I/O only)
+    get_sqlite_storage     (singleton accessor; uses ``_sqlite_storage_lock``)
+    link_to_backend        (file I/O only; no SQL)
+
+The ``__init__`` PRAGMA statements run before the instance is visible to other
+threads (singleton creation is protected by ``_sqlite_storage_lock``), so they
+do not need ``self._lock`` — they cannot race anything.
+
+Choice of pattern: every DB-touching method gets the same ``with self._lock:
+return self._<name>_locked(...)`` wrapper, even for read-only SELECTs. The
+task spec offered a lighter "lock only the cursor call" variant for reads,
+but a uniform pattern is preferred because:
+    (a) sqlite3's C API already serializes on the connection — the contention
+        savings of a tighter lock are zero in practice for short SELECTs.
+    (b) A uniform pattern is easier to audit and harder to regress when
+        someone later adds a second statement to a "read-only" method.
+    (c) Round 3 used the wrapper-then-delegate shape for store_learning; this
+        is just the same shape applied to every sibling method.
 """
 
 from __future__ import annotations
@@ -141,6 +206,13 @@ class SQLiteStorage:
     # -- schema ---------------------------------------------------------- #
 
     def _init_schema(self) -> None:
+        """Build / migrate the schema.
+
+        Thread-safety: locked (called only from ``__init__`` before the
+        instance is published, so no concurrent caller exists yet; lock is
+        unnecessary here but the contract is documented for round-4
+        consistency).
+        """
         cur = self.conn
         try:
             cur.execute(
@@ -333,6 +405,13 @@ class SQLiteStorage:
         time_window_hours: int = 24,
         workspace_id: str = "",
     ) -> Optional[sqlite3.Row]:
+        """Find an existing learning matching ``new_learning`` for dedup.
+
+        Thread-safety: caller MUST hold ``self._lock``. This helper is only
+        invoked from ``_store_learning_locked`` (which is already inside the
+        lock); the RLock allows nested acquisition if a future caller wraps
+        again.
+        """
         new_title = (new_learning.get("title") or "").lower().strip()
         if not new_title:
             return None
@@ -432,7 +511,8 @@ class SQLiteStorage:
                                 dup["id"],
                             ),
                         )
-                        result = self._row_to_dict(self.get_by_id(dup["id"]))
+                        # get_by_id acquires self._lock; RLock-safe on reentry.
+                        result = self._row_to_dict(self._get_by_id_locked(dup["id"]))
                         result["_consolidated"] = True
                         _bump("store.consolidated")
                         return result
@@ -447,7 +527,7 @@ class SQLiteStorage:
             now = datetime.now(timezone.utc).isoformat()
             # Upsert: skip_dedup callers (promote/retire/associate) rely on
             # re-saving an existing row by id without colliding on PK.
-            existing_for_upsert = self.get_by_id(learning_id) if skip_dedup else None
+            existing_for_upsert = self._get_by_id_locked(learning_id) if skip_dedup else None
             if existing_for_upsert is not None:
                 self.conn.execute(
                     """
@@ -496,13 +576,18 @@ class SQLiteStorage:
                     ),
                 )
                 _bump("store.ok")
-            stored = self.get_by_id(learning_id)
+            stored = self._get_by_id_locked(learning_id)
             return self._row_to_dict(stored) if stored else learning_data
         except sqlite3.Error as exc:
             _bump("store.fail")
             raise StorageError(f"store_learning failed: {exc}") from exc
 
     def get_by_id(self, learning_id: str) -> Optional[sqlite3.Row]:
+        """Thread-safety: locked."""
+        with self._lock:
+            return self._get_by_id_locked(learning_id)
+
+    def _get_by_id_locked(self, learning_id: str) -> Optional[sqlite3.Row]:
         try:
             row = self.conn.execute(
                 "SELECT * FROM learnings WHERE id = ?", (learning_id,)
@@ -514,6 +599,11 @@ class SQLiteStorage:
             return None
 
     def get_recent(self, limit: int = 20) -> List[Dict[str, Any]]:
+        """Thread-safety: locked."""
+        with self._lock:
+            return self._get_recent_locked(limit)
+
+    def _get_recent_locked(self, limit: int = 20) -> List[Dict[str, Any]]:
         try:
             rows = self.conn.execute(
                 "SELECT * FROM learnings ORDER BY created_at DESC LIMIT ?", (limit,)
@@ -525,6 +615,11 @@ class SQLiteStorage:
             return []
 
     def get_by_session(self, session_id: str) -> List[Dict[str, Any]]:
+        """Thread-safety: locked."""
+        with self._lock:
+            return self._get_by_session_locked(session_id)
+
+    def _get_by_session_locked(self, session_id: str) -> List[Dict[str, Any]]:
         try:
             rows = self.conn.execute(
                 "SELECT * FROM learnings WHERE session_id = ? ORDER BY created_at DESC",
@@ -537,6 +632,11 @@ class SQLiteStorage:
             return []
 
     def get_since(self, timestamp: str, limit: int = 20) -> List[Dict[str, Any]]:
+        """Thread-safety: locked."""
+        with self._lock:
+            return self._get_since_locked(timestamp, limit)
+
+    def _get_since_locked(self, timestamp: str, limit: int = 20) -> List[Dict[str, Any]]:
         try:
             rows = self.conn.execute(
                 "SELECT * FROM learnings WHERE created_at >= ? "
@@ -550,6 +650,11 @@ class SQLiteStorage:
             return []
 
     def get_by_type(self, learning_type: str, limit: int = 20) -> List[Dict[str, Any]]:
+        """Thread-safety: locked."""
+        with self._lock:
+            return self._get_by_type_locked(learning_type, limit)
+
+    def _get_by_type_locked(self, learning_type: str, limit: int = 20) -> List[Dict[str, Any]]:
         try:
             rows = self.conn.execute(
                 "SELECT * FROM learnings WHERE type = ? "
@@ -568,7 +673,21 @@ class SQLiteStorage:
         limit: int = 10,
         workspace_id: Optional[str] = None,
     ) -> List[Dict[str, Any]]:
-        """FTS5 OR-matching with keyword fallback. Workspace-aware."""
+        """FTS5 OR-matching with keyword fallback. Workspace-aware.
+
+        Thread-safety: locked (FTS try + keyword fallback form one atomic
+        snapshot — splitting the lock between them could let a concurrent
+        writer flip rows in between, producing inconsistent search results).
+        """
+        with self._lock:
+            return self._query_locked(search, limit, workspace_id)
+
+    def _query_locked(
+        self,
+        search: str,
+        limit: int = 10,
+        workspace_id: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
         stop = {
             "the", "a", "an", "is", "are", "was", "were", "be", "to", "of",
             "in", "for", "on", "with", "at", "by", "from", "it", "this",
@@ -627,6 +746,11 @@ class SQLiteStorage:
             return []
 
     def get_stats(self) -> Dict[str, Any]:
+        """Thread-safety: locked (four SELECTs form one atomic snapshot)."""
+        with self._lock:
+            return self._get_stats_locked()
+
+    def _get_stats_locked(self) -> Dict[str, Any]:
         try:
             total = self.conn.execute("SELECT COUNT(*) FROM learnings").fetchone()[0]
             by_type: Dict[str, int] = {}
@@ -665,6 +789,11 @@ class SQLiteStorage:
             return {"total": 0, "wins": 0, "fixes": 0, "patterns": 0, "by_type": {}}
 
     def health_check(self) -> bool:
+        """Thread-safety: locked."""
+        with self._lock:
+            return self._health_check_locked()
+
+    def _health_check_locked(self) -> bool:
         try:
             self.conn.execute("SELECT 1").fetchone()
             _bump("health.ok")
@@ -676,6 +805,19 @@ class SQLiteStorage:
     # -- negative patterns ----------------------------------------------- #
 
     def record_negative_pattern(
+        self,
+        pattern_key: str,
+        context: str,
+        goal: str = "",
+        description: str = "",
+    ) -> int:
+        """Thread-safety: locked (read-then-write must be atomic)."""
+        with self._lock:
+            return self._record_negative_pattern_locked(
+                pattern_key, context, goal, description
+            )
+
+    def _record_negative_pattern_locked(
         self,
         pattern_key: str,
         context: str,
@@ -728,6 +870,13 @@ class SQLiteStorage:
     def get_frequent_negative_patterns(
         self, min_frequency: int = 3, goal: Optional[str] = None
     ) -> List[Dict[str, Any]]:
+        """Thread-safety: locked."""
+        with self._lock:
+            return self._get_frequent_negative_patterns_locked(min_frequency, goal)
+
+    def _get_frequent_negative_patterns_locked(
+        self, min_frequency: int = 3, goal: Optional[str] = None
+    ) -> List[Dict[str, Any]]:
         try:
             if goal:
                 rows = self.conn.execute(
@@ -764,6 +913,11 @@ class SQLiteStorage:
             return []
 
     def mark_pattern_promoted(self, pattern_key: str) -> None:
+        """Thread-safety: locked."""
+        with self._lock:
+            return self._mark_pattern_promoted_locked(pattern_key)
+
+    def _mark_pattern_promoted_locked(self, pattern_key: str) -> None:
         try:
             self.conn.execute(
                 "UPDATE negative_patterns SET promoted_to_sop = 1 WHERE pattern_key = ?",
@@ -774,6 +928,12 @@ class SQLiteStorage:
             _bump("negpat.promote_fail")
 
     def close(self) -> None:
+        """Thread-safety: locked (disposes self.conn — any racing call must
+        observe the closed connection)."""
+        with self._lock:
+            return self._close_locked()
+
+    def _close_locked(self) -> None:
         try:
             self.conn.close()
             _bump("close.ok")

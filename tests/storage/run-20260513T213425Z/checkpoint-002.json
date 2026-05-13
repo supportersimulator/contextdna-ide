@@ -1,0 +1,60 @@
+{
+  "n": 2,
+  "ts": "2026-05-13T21:34:25.239156+00:00",
+  "duration_s": 0.03,
+  "backend_before": "auto",
+  "backend_after": "sqlite",
+  "row_count_before": 67,
+  "row_count_after": 67,
+  "row_count_delta": 0,
+  "invariant_pass": true,
+  "evidence": {
+    "sql_count": 67,
+    "api_count": 67,
+    "duplicate_ids": [],
+    "promotion_still_promoted": 23,
+    "promotion_drifted": []
+  },
+  "iteration_errors": [
+    {
+      "phase": "promote",
+      "msg": "promote returned False",
+      "tb": ""
+    },
+    {
+      "phase": "record",
+      "msg": "IndexError: tuple index out of range",
+      "tb": ""
+    },
+    {
+      "phase": "retire",
+      "msg": "retire returned False",
+      "tb": ""
+    },
+    {
+      "phase": "retire",
+      "msg": "retire returned False",
+      "tb": ""
+    },
+    {
+      "phase": "promote",
+      "msg": "promote returned False",
+      "tb": ""
+    }
+  ],
+  "iteration_error_total": 5,
+  "promoted_in_iter": [
+    "fuzz_928_730983_c55e97ed",
+    "fuzz_928_882126_23e84e4e",
+    "fuzz_928_694825_c79ea4d5",
+    "fuzz_416_218540_5d23e91c",
+    "fuzz_928_653960_dd5e32de",
+    "fuzz_928_410911_ec087727",
+    "fuzz_416_742766_7d25cb07",
+    "fuzz_416_550967_7b538ee2",
+    "fuzz_928_694825_c79ea4d5",
+    "fuzz_416_366183_e85986ab",
+    "fuzz_920_389630_c0d5362f",
+    "fuzz_928_136829_fc4610cc"
+  ]
+}

@@ -1,0 +1,38 @@
+{
+  "n": 3,
+  "ts": "2026-05-13T21:34:11.427198+00:00",
+  "duration_s": 0.09,
+  "backend_before": "sqlite",
+  "backend_after": "auto",
+  "row_count_before": 95,
+  "row_count_after": 95,
+  "row_count_delta": 0,
+  "invariant_pass": true,
+  "evidence": {
+    "sql_count": 95,
+    "api_count": 95,
+    "duplicate_ids": [],
+    "promotion_still_promoted": 43,
+    "promotion_drifted": []
+  },
+  "iteration_errors": [],
+  "iteration_error_total": 0,
+  "promoted_in_iter": [
+    "fuzz_224_577426_e25135ac",
+    "fuzz_232_179534_a4d4422d",
+    "fuzz_728_366183_b3ecfd8c",
+    "fuzz_224_692777_0cb3f51a",
+    "fuzz_232_202170_f9bb8be4",
+    "fuzz_728_233646_b4ca8ab6",
+    "fuzz_720_630561_4783e0a8",
+    "fuzz_728_707444_aac9c25a",
+    "fuzz_720_963214_79997062",
+    "fuzz_232_939278_9e83d2da",
+    "fuzz_728_825644_e7d6bb2a",
+    "fuzz_720_612852_2cd7e125",
+    "fuzz_720_612852_2cd7e125",
+    "fuzz_720_211127_a5ba7b91",
+    "fuzz_224_136829_68d3956f",
+    "fuzz_224_995965_deea0c31"
+  ]
+}
