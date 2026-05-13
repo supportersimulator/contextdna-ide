@@ -32,15 +32,20 @@ set -uo pipefail
 
 INCLUDE_SSH=false
 OUTPUT_PATH=""
+PASSPHRASE_SOURCE="tty"   # tty | stdin | clipboard | env:NAME
 for arg in "$@"; do
     case "$arg" in
         --include-ssh) INCLUDE_SSH=true ;;
         --output) OUTPUT_PATH="next" ;;
+        --passphrase-stdin)     PASSPHRASE_SOURCE="stdin" ;;
+        --passphrase-clipboard) PASSPHRASE_SOURCE="clipboard" ;;
+        --passphrase-env)       PASSPHRASE_SOURCE="env" ;;
         --help|-h)
             sed -n '2,30p' "$0" | sed 's|^# ||; s|^#||'
             exit 0 ;;
         *)
             if [ "$OUTPUT_PATH" = "next" ]; then OUTPUT_PATH="$arg"
+            elif [[ "$PASSPHRASE_SOURCE" = "env" && "$arg" =~ ^[A-Z_]+$ ]]; then PASSPHRASE_SOURCE="env:$arg"
             else echo "unknown arg: $arg" >&2; exit 2
             fi ;;
     esac
@@ -444,12 +449,34 @@ TAR_FILE="$(mktemp -t ctxdna-tar.XXXXXX).tar.gz"
 TAR_SIZE="$(wc -c < "$TAR_FILE" | tr -d ' ')"
 _ok "archive packed ($TAR_SIZE bytes)"
 
-# age --passphrase reads from stdin if not a tty. Encourage interactive prompt.
-echo ""
-echo "  ${BOLD}Choose a passphrase you can remember in 6 months.${RESET}"
-echo "  ${YELLOW}Write it down. Save it in 1Password. Without it, this bundle is gone.${RESET}"
-echo ""
-age --passphrase -o "$OUTPUT_PATH" "$TAR_FILE" || _fail "age encrypt failed"
+# Source the passphrase
+case "$PASSPHRASE_SOURCE" in
+    tty)
+        echo ""
+        echo "  ${BOLD}Choose a passphrase you can remember in 6 months.${RESET}"
+        echo "  ${YELLOW}Write it down. Save it in 1Password. Without it, this bundle is gone.${RESET}"
+        echo ""
+        age --passphrase -o "$OUTPUT_PATH" "$TAR_FILE" || _fail "age encrypt failed"
+        ;;
+    stdin)
+        _info "reading passphrase from stdin (pipe it in)"
+        age --passphrase -o "$OUTPUT_PATH" "$TAR_FILE" || _fail "age encrypt failed"
+        ;;
+    clipboard)
+        command -v pbpaste >/dev/null || _fail "--passphrase-clipboard requires pbpaste (macOS)"
+        _info "reading passphrase from macOS clipboard (pbpaste)"
+        # rage's behaviour with no tty + stdin pipe is to read passphrase from stdin
+        pbpaste | age --passphrase -o "$OUTPUT_PATH" "$TAR_FILE" || _fail "age encrypt failed"
+        ;;
+    env:*)
+        local varname="${PASSPHRASE_SOURCE#env:}"
+        local passval="${!varname:-}"
+        [ -n "$passval" ] || _fail "env var $varname is empty"
+        _info "reading passphrase from env var $varname"
+        printf '%s' "$passval" | age --passphrase -o "$OUTPUT_PATH" "$TAR_FILE" || _fail "age encrypt failed"
+        unset passval
+        ;;
+esac
 rm -f "$TAR_FILE"
 chmod 600 "$OUTPUT_PATH"
 OUT_SIZE="$(wc -c < "$OUTPUT_PATH" | tr -d ' ')"
