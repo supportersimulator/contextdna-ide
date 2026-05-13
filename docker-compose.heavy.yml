@@ -299,7 +299,7 @@ services:
   # script and the memory/ package.
   mcp-webhook:
     build:
-      context: ../../
+      context: .
       dockerfile: mcp-servers/Dockerfile.mcp
     container_name: contextdna-heavy-mcp-webhook
     restart: unless-stopped
@@ -309,13 +309,13 @@ services:
       REPO_ROOT: /app
       CONTEXT_DNA_TIMEOUT: "15000"
       REDIS_URL: redis://:${REDIS_PASSWORD}@redis:6379
-      POSTGRES_URL: postgresql://${POSTGRES_USER:YOUR_PASSWORD@postgres:5432/${POSTGRES_DB:-contextdna}
+      POSTGRES_URL: postgresql://${POSTGRES_USER:-contextdna}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-contextdna}
       NATS_URL: nats://nats:4222
       MLX_SERVER_URL: ${MLX_SERVER_URL:-http://host.docker.internal:5044}
     extra_hosts:
       - "host.docker.internal:host-gateway"
     volumes:
-      - ../../:/app
+      - .:/app
     ports:
       - "${MCP_WEBHOOK_PORT:-8000}:8000"
     deploy:
@@ -343,14 +343,14 @@ services:
   # the mothership snapshot — see assumptions in profiles/heavy.yaml).
   helper-agent:
     build:
-      context: ../../memory
+      context: ./memory
       dockerfile: Dockerfile.agent
     container_name: contextdna-heavy-helper-agent
     restart: unless-stopped
     logging: *default-logging
     environment:
       MODE: heavy
-      POSTGRES_URL: postgresql://${POSTGRES_USER:YOUR_PASSWORD@postgres:5432/${POSTGRES_DB:-contextdna}
+      POSTGRES_URL: postgresql://${POSTGRES_USER:-contextdna}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-contextdna}
       REDIS_URL: redis://:${REDIS_PASSWORD}@redis:6379
       REDIS_PASSWORD: ${REDIS_PASSWORD}
       NATS_URL: nats://nats:4222
@@ -367,7 +367,7 @@ services:
     extra_hosts:
       - "host.docker.internal:host-gateway"
     volumes:
-      - ../../memory:/app/memory
+      - ./memory:/app/memory
       - ~/.context-dna:/root/.context-dna
       - work_log_data:/data
     ports:
@@ -397,7 +397,7 @@ services:
   # --- Celery worker (S2/S6/S8 background processors, scanners, distillers) --
   celery-worker:
     build:
-      context: ../../memory
+      context: ./memory
       dockerfile: Dockerfile.agent
     container_name: contextdna-heavy-celery-worker
     restart: unless-stopped
@@ -412,13 +412,13 @@ services:
       REDIS_HOST: redis
       REDIS_PORT: "6379"
       REDIS_PASSWORD: ${REDIS_PASSWORD}
-      POSTGRES_URL: postgresql://${POSTGRES_USER:YOUR_PASSWORD@postgres:5432/${POSTGRES_DB:-contextdna}
+      POSTGRES_URL: postgresql://${POSTGRES_USER:-contextdna}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-contextdna}
       OLLAMA_URL: ${OLLAMA_URL:-http://ollama:11434}
       MLX_SERVER_URL: ${MLX_SERVER_URL:-http://host.docker.internal:5044}
     extra_hosts:
       - "host.docker.internal:host-gateway"
     volumes:
-      - ../../memory:/app/memory
+      - ./memory:/app/memory
       - ~/.context-dna:/root/.context-dna
     deploy:
       resources:
@@ -439,7 +439,7 @@ services:
   # --- Celery beat (cron-style scheduler: scan / brain cycle / evolution) ----
   celery-beat:
     build:
-      context: ../../memory
+      context: ./memory
       dockerfile: Dockerfile.agent
     container_name: contextdna-heavy-celery-beat
     restart: unless-stopped

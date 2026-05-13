@@ -24,4 +24,4 @@ HEALTHCHECK --interval=30s --timeout=3s --start-period=10s --retries=3 \
 
 # Run MCP server as stdio server (managed by Cursor)
 # In production, this container just needs to be ready to serve requests
-CMD ["python3", "-c", "import time; print('MCP server ready'); time.sleep(infinity)"]
+CMD ["python3", "-c", "import signal; print('MCP server ready'); signal.pause()"]

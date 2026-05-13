@@ -306,28 +306,117 @@ class SynapticServiceHub:
         )
 
     def _check_mlx_api(self) -> ServiceInfo:
-        """Check local LLM via Redis health cache (no direct HTTP to 5044)."""
+        """Check local LLM liveness.
+
+        Two-tier probe:
+          1. Fast path — Redis-cached queue health (`llm:health == "ok"`).
+             Updated by `_execute_llm_request` after every successful call.
+             Avoids stampeding :5044 when queue traffic is steady.
+          2. Fallback — direct GET to /v1/models with 2s timeout.
+             Used when Redis cache is empty/stale (quiet system) so the
+             status probe does not report a false-OFFLINE while MLX is
+             serving requests just fine.
+
+        Probe failures route through the same ZSF counters as the queue
+        (`queue_redis_health_check_errors`) plus a probe-specific counter
+        for direct HTTP failures so /metrics can distinguish the two.
+        """
+        start = datetime.now()
+        cache_healthy = False
+        # Tier 1: Redis cache (cheap, ~1ms, preserves queue's centralized access)
         try:
             from memory.llm_priority_queue import check_llm_health
-            start = datetime.now()
-            healthy = check_llm_health()
+            cache_healthy = check_llm_health()
+        except Exception as e:
+            logger.debug(f"LLM cache health check failed: {e}")
+
+        if cache_healthy:
             elapsed = (datetime.now() - start).total_seconds() * 1000
-            if healthy:
+            return ServiceInfo(
+                name="Local LLM",
+                status=ServiceStatus.HEALTHY,
+                port=5044,
+                message="Healthy (via queue cache)",
+                response_time_ms=elapsed
+            )
+
+        # Tier 2: direct probe to MLX OpenAI-compat /v1/models (2s timeout).
+        # Uses stdlib urllib to avoid new deps; httpx not guaranteed sync-safe here.
+        import urllib.request
+        import urllib.error
+        try:
+            req = urllib.request.Request(
+                "http://127.0.0.1:5044/v1/models",
+                headers={"Accept": "application/json"},
+            )
+            with urllib.request.urlopen(req, timeout=2) as resp:
+                status_code = resp.getcode()
+                body = resp.read(64 * 1024)  # cap to avoid pathological responses
+            elapsed = (datetime.now() - start).total_seconds() * 1000
+            if status_code == 200:
+                try:
+                    payload = json.loads(body)
+                except json.JSONDecodeError as je:
+                    logger.warning(f"MLX /v1/models returned non-JSON: {je}")
+                    return ServiceInfo(
+                        name="Local LLM",
+                        status=ServiceStatus.OFFLINE,
+                        port=5044,
+                        message=f"Bad JSON from /v1/models: {je}",
+                        response_time_ms=elapsed,
+                    )
+                data = payload.get("data") if isinstance(payload, dict) else None
+                if isinstance(data, list) and data:
+                    model_id = data[0].get("id", "unknown") if isinstance(data[0], dict) else "unknown"
+                    return ServiceInfo(
+                        name="Local LLM",
+                        status=ServiceStatus.HEALTHY,
+                        port=5044,
+                        message=f"Model: {model_id} (direct probe)",
+                        response_time_ms=elapsed,
+                    )
                 return ServiceInfo(
                     name="Local LLM",
-                    status=ServiceStatus.HEALTHY,
+                    status=ServiceStatus.DEGRADED,
                     port=5044,
-                    message="Model: Qwen3-4B-4bit (via queue health)",
-                    response_time_ms=elapsed
+                    message="/v1/models returned empty model list",
+                    response_time_ms=elapsed,
                 )
+            return ServiceInfo(
+                name="Local LLM",
+                status=ServiceStatus.OFFLINE,
+                port=5044,
+                message=f"/v1/models HTTP {status_code}",
+                response_time_ms=elapsed,
+            )
+        except urllib.error.URLError as e:
+            # Includes connection refused, DNS, timeout
+            reason = getattr(e, "reason", e)
+            logger.debug(f"MLX direct probe failed: {reason}")
+            try:
+                from memory.llm_priority_queue import _zsf_record
+                _zsf_record("mlx_direct_probe_errors", "_check_mlx_api", e)
+            except Exception:
+                pass
+            return ServiceInfo(
+                name="Local LLM",
+                status=ServiceStatus.OFFLINE,
+                port=5044,
+                message=f"Not responding: {reason}",
+            )
         except Exception as e:
-            logger.debug(f"LLM health check failed: {e}")
-        return ServiceInfo(
-            name="Local LLM",
-            status=ServiceStatus.OFFLINE,
-            port=5044,
-            message="Not running"
-        )
+            logger.debug(f"MLX direct probe unexpected error: {e}")
+            try:
+                from memory.llm_priority_queue import _zsf_record
+                _zsf_record("mlx_direct_probe_errors", "_check_mlx_api", e)
+            except Exception:
+                pass
+            return ServiceInfo(
+                name="Local LLM",
+                status=ServiceStatus.OFFLINE,
+                port=5044,
+                message=f"Probe error: {e}",
+            )
 
     # =========================================================================
     # RICH CONTEXT (Aggregated from all sources)

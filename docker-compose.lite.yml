@@ -168,7 +168,7 @@ services:
   # --- MCP webhook server (Cursor/Claude Code → 9-section payload) -----------
   mcp-webhook:
     build:
-      context: ../../
+      context: .
       dockerfile: mcp-servers/Dockerfile.mcp
     container_name: contextdna-lite-mcp-webhook
     restart: unless-stopped
@@ -179,14 +179,14 @@ services:
       MODE: lite
       CONTEXT_DNA_TIMEOUT: "15000"
       REDIS_URL: redis://:${REDIS_PASSWORD}@redis:6379
-      POSTGRES_URL: postgresql://${POSTGRES_USER:YOUR_PASSWORD@postgres:5432/${POSTGRES_DB:-contextdna_lite}
+      POSTGRES_URL: postgresql://${POSTGRES_USER:-contextdna}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-contextdna_lite}
       NATS_URL: nats://nats-leaf:4222
       # Native macOS MLX server reached via host bridge (see launchd note).
       MLX_SERVER_URL: ${MLX_SERVER_URL:-http://host.docker.internal:5044}
     extra_hosts:
       - "host.docker.internal:host-gateway"
     volumes:
-      - ../../:/app
+      - .:/app
     ports:
       - "127.0.0.1:${MCP_WEBHOOK_PORT:-8000}:8000"
     deploy:
@@ -212,14 +212,14 @@ services:
   # --- Helper Agent (lite mode — in-process scheduling, no Celery) -----------
   helper-agent:
     build:
-      context: ../../memory
+      context: ./memory
       dockerfile: Dockerfile.agent
     container_name: contextdna-lite-helper-agent
     restart: unless-stopped
     logging: *default-logging
     environment:
       MODE: lite                              # switches helper to single-process loop
-      POSTGRES_URL: postgresql://${POSTGRES_USER:YOUR_PASSWORD@postgres:5432/${POSTGRES_DB:-contextdna_lite}
+      POSTGRES_URL: postgresql://${POSTGRES_USER:-contextdna}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-contextdna_lite}
       REDIS_URL: redis://:${REDIS_PASSWORD}@redis:6379
       REDIS_PASSWORD: ${REDIS_PASSWORD}
       NATS_URL: nats://nats-leaf:4222
@@ -234,7 +234,7 @@ services:
     extra_hosts:
       - "host.docker.internal:host-gateway"
     volumes:
-      - ../../memory:/app/memory
+      - ./memory:/app/memory
       - ~/.context-dna:/root/.context-dna
       - work_log_lite_data:/data
     ports:
