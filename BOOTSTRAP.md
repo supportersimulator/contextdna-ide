@@ -13,6 +13,26 @@ That is the *Operational Invariance Promise*. This document is its litmus test. 
 
 ---
 
+## TL;DR — One-command onboarding
+
+If this is your first time, run the interactive installer. It walks through every step below, generates the age keypair, configures your backup bucket, writes the offline-recovery card, and schedules daily/weekly backups — in about ten minutes:
+
+```bash
+git clone git@github.com:supportersimulator/contextdna-ide.git
+cd contextdna-ide
+bash scripts/setup-mothership.sh
+```
+
+The installer is **idempotent** — safe to re-run anytime. To audit your setup without making changes:
+
+```bash
+bash scripts/setup-mothership.sh --check
+```
+
+The rest of this document is the manual recipe behind the installer. Read it if you want to understand what each step does, or if `setup-mothership.sh` can't do something automatically on your platform.
+
+---
+
 ## Prerequisites
 
 You need four things and four things only:
