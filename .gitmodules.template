@@ -1,0 +1,33 @@
+# .gitmodules.template — resolver-friendly submodule manifest (migrate2)
+#
+# Each `url =` line uses a ${SUBMODULE_<NAME>_URL} placeholder. wire-submodules.sh
+# resolves placeholders in priority order:
+#   1. --url-<name>=<url> CLI flag
+#   2. env var named exactly as the placeholder (e.g. SUBMODULE_3_SURGEONS_URL)
+#   3. .gitmodules.lock entry for the submodule path
+#   4. interactive prompt (TTY only)
+#   5. fail loudly (ZSF)
+#
+# Adding a 5th submodule is purely a template edit — no code changes.
+
+[submodule "engines/3-surgeons"]
+	path = engines/3-surgeons
+	url = ${SUBMODULE_3_SURGEONS_URL}
+	branch = main
+
+[submodule "engines/multi-fleet"]
+	path = engines/multi-fleet
+	url = ${SUBMODULE_MULTI_FLEET_URL}
+	branch = main
+
+# context-dna may still be a private/internal mirror as of 2026-05-13.
+# Set SUBMODULE_CONTEXT_DNA_URL or add a lock entry before wiring.
+[submodule "engines/context-dna"]
+	path = engines/context-dna
+	url = ${SUBMODULE_CONTEXT_DNA_URL}
+	branch = main
+
+[submodule "apps/ide-shell"]
+	path = apps/ide-shell
+	url = ${SUBMODULE_IDE_SHELL_URL}
+	branch = main

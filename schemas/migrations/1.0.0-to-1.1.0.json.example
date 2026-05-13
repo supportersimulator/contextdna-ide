@@ -1,0 +1,39 @@
+{
+  "_comment": [
+    "EXAMPLE migration record from schema_version 1.0.0 to 1.1.0.",
+    "Demonstrates the four operation types: add_field, rename_field, move_field, remove_field.",
+    "NOT a real migration — this file is the template authors copy when proposing a new schema_version.",
+    "When 1.1.0 is actually shipped, rename this file to '1.0.0-to-1.1.0.json' (drop the .example suffix).",
+    "Path selectors use literal dot-and-bracket notation (no wildcards, no JSONPath).",
+    "Every operation must be idempotent: re-running the same record on already-migrated data is a no-op.",
+    "See migrate2/docs/panels/manifest-spec.md section 10 for the full contract."
+  ],
+  "schema_version_from": "1.0.0",
+  "schema_version_to": "1.1.0",
+  "description": "Add optional `tags` array at root, rename `language_affinity` to `languages`, promote nested `mount.props.defaultTab` to root `default_tab`, drop unused `homepage` field.",
+  "operations": [
+    {
+      "op": "add_field",
+      "path": "tags",
+      "default": [],
+      "_note": "Add a new optional `tags` array at the root. Default is empty list. If the field already exists (e.g. from a hand-edited manifest), no-op."
+    },
+    {
+      "op": "rename_field",
+      "from": "language_affinity",
+      "to": "languages",
+      "_note": "Rename the `language_affinity` field to the shorter `languages`. Value is preserved verbatim. If `language_affinity` is missing, no-op. If `languages` already exists, the migration record is rejected as malformed (the substrate refuses to mount and surfaces PanelMigrationConflict)."
+    },
+    {
+      "op": "move_field",
+      "from": "mount.props.defaultTab",
+      "to": "default_tab",
+      "_note": "Promote a nested key to the root, useful when a field becomes important enough to warrant first-class status. If `mount.props.defaultTab` is missing, no-op."
+    },
+    {
+      "op": "remove_field",
+      "path": "homepage",
+      "_note": "Drop an unused optional field. Idempotent — no-op if `homepage` was never set."
+    }
+  ]
+}

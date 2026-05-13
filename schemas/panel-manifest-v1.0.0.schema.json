@@ -1,0 +1,199 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://contextdna.io/schemas/panel-manifest-v1.0.0.schema.json",
+  "title": "ContextDNA Panel Manifest",
+  "description": "Canonical JSON Schema (draft-07) for panel.manifest.json at schema_version 1.0.0. additionalProperties is false at the root so unknown keys force an explicit schema_version bump. See migrate2/docs/panels/manifest-spec.md for prose.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "id",
+    "name",
+    "version",
+    "mothership_min_version",
+    "author",
+    "description",
+    "domains",
+    "evidence_emits",
+    "evidence_subscribes",
+    "mount",
+    "permissions",
+    "license"
+  ],
+  "properties": {
+    "schema_version": {
+      "description": "Version of the manifest schema itself (NOT the panel's own version). Strict semver. The substrate routes through migrations from older versions per spec section 10.",
+      "type": "string",
+      "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+$",
+      "const": "1.0.0"
+    },
+    "id": {
+      "description": "Unique panel identifier. Reverse-DNS or kebab-case. Used as install directory name and namespace prefix for panel-scoped events.",
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9]*([-.][a-z0-9]+)*$",
+      "minLength": 2,
+      "maxLength": 128
+    },
+    "name": {
+      "description": "Human-readable label rendered in the DockView tab.",
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 80
+    },
+    "version": {
+      "description": "The panel's own semver. Distinct from schema_version (which versions the manifest contract).",
+      "type": "string",
+      "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+(?:-[0-9A-Za-z.-]+)?(?:\\+[0-9A-Za-z.-]+)?$"
+    },
+    "mothership_min_version": {
+      "description": "Minimum mothership runtime semver this panel was tested against. Substrate refuses to mount if running mothership is older.",
+      "type": "string",
+      "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+(?:-[0-9A-Za-z.-]+)?(?:\\+[0-9A-Za-z.-]+)?$"
+    },
+    "author": {
+      "description": "Author block. `name` is the only mandatory subfield.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name"],
+      "properties": {
+        "name": { "type": "string", "minLength": 1, "maxLength": 200 },
+        "email": { "type": "string", "format": "email" },
+        "github": { "type": "string", "pattern": "^[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})$" }
+      }
+    },
+    "description": {
+      "description": "One-line elevator pitch, surfaced in `context-dna-ide panel list`.",
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 140
+    },
+    "domains": {
+      "description": "Dotted domain tags. Drives domain-aware injection. Wildcard values (`*`, `all`) are rejected.",
+      "type": "array",
+      "minItems": 1,
+      "uniqueItems": true,
+      "items": {
+        "type": "string",
+        "pattern": "^(?!\\*$|all$)[a-z][a-z0-9-]*(\\.[a-z0-9][a-z0-9-]*)*$",
+        "minLength": 1,
+        "maxLength": 80
+      }
+    },
+    "language_affinity": {
+      "description": "Programming languages this panel cares about. Used as tiebreaker.",
+      "type": "array",
+      "uniqueItems": true,
+      "items": { "type": "string", "minLength": 1, "maxLength": 40 }
+    },
+    "evidence_emits": {
+      "description": "All event types the panel may emit. Substrate rejects any undeclared emit.",
+      "type": "array",
+      "uniqueItems": true,
+      "items": {
+        "type": "string",
+        "pattern": "^[a-z][a-z0-9_-]*(\\.[a-z0-9_-]+)+$",
+        "minLength": 3,
+        "maxLength": 120
+      }
+    },
+    "evidence_subscribes": {
+      "description": "All event types the panel wants delivered.",
+      "type": "array",
+      "uniqueItems": true,
+      "items": {
+        "type": "string",
+        "pattern": "^[a-z][a-z0-9_-]*(\\.[a-z0-9_-]+)+$",
+        "minLength": 3,
+        "maxLength": 120
+      }
+    },
+    "mount": {
+      "description": "How the substrate instantiates the UI. See spec section 4.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "entry"],
+      "properties": {
+        "type": { "type": "string", "enum": ["react", "iframe", "external-url"] },
+        "entry": { "type": "string", "minLength": 1, "maxLength": 1024 },
+        "props": { "type": "object" }
+      }
+    },
+    "requires_env": {
+      "description": "Map of env var name to {required, description, secret}. Substrate prompts user for missing required vars.",
+      "type": "object",
+      "additionalProperties": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["required", "description", "secret"],
+        "properties": {
+          "required": { "type": "boolean" },
+          "description": { "type": "string", "minLength": 1, "maxLength": 280 },
+          "secret": { "type": "boolean" }
+        }
+      },
+      "propertyNames": {
+        "pattern": "^[A-Z][A-Z0-9_]*$"
+      }
+    },
+    "requires_mcp_servers": {
+      "description": "MCP server names that must be running for this panel.",
+      "type": "array",
+      "uniqueItems": true,
+      "items": { "type": "string", "pattern": "^[a-z][a-z0-9-]*$", "minLength": 1, "maxLength": 80 }
+    },
+    "requires_credentials": {
+      "description": "Keychain or vault entries the panel needs.",
+      "type": "array",
+      "uniqueItems": true,
+      "items": {
+        "type": "string",
+        "pattern": "^(keychain|vault):[A-Za-z0-9_./*-]+$"
+      }
+    },
+    "permissions": {
+      "description": "Least-privilege declaration. See spec section 5.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["evidence_ledger", "filesystem", "network"],
+      "properties": {
+        "evidence_ledger": {
+          "type": "string",
+          "enum": ["read", "read-write"]
+        },
+        "filesystem": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "pattern": "^(read|write|read-write):(~|\\./|/)[^\\s]*$"
+          }
+        },
+        "network": {
+          "description": "Hostnames only — no bare `*`, no full URLs. `*.example.com` is allowed (single-level wildcard).",
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "pattern": "^(?!\\*$)(\\*\\.)?[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?$"
+          }
+        }
+      }
+    },
+    "homepage": {
+      "description": "Marketing or docs URL.",
+      "type": "string",
+      "format": "uri"
+    },
+    "repository": {
+      "description": "Source repository URL.",
+      "type": "string",
+      "format": "uri"
+    },
+    "license": {
+      "description": "SPDX license identifier. Surfaced on install.",
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 80
+    }
+  }
+}

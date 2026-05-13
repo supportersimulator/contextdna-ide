@@ -1,0 +1,226 @@
+# =============================================================================
+# ContextDNA IDE — EXTENSIBLE profile schema (v1.0.0)
+# -----------------------------------------------------------------------------
+# This is the *base schema* for extensible profiles. The two original presets
+# (`draft/profiles/heavy.yaml`, `draft/profiles/lite.yaml`) describe rigid,
+# self-contained stacks. This schema replaces them with a layered model:
+#
+#       extensible.yaml   ← root schema (this file: defaults + injection points)
+#               ▲
+#       heavy.yaml / lite.yaml   ← presets that extends: this schema
+#               ▲
+#       my-mac-studio.yaml   ← operator profile that extends: heavy
+#
+# Resolution rules (see scripts/profile-resolve.py for the implementation):
+#
+#   1. Profile chain is walked from leaf -> root via `extends:`.
+#   2. `services:` are merged by service name. Per-service `extends:` allows
+#      a service to inherit from a *named base service* defined in any
+#      ancestor profile, then override per-key.
+#   3. Top-level `overrides:` are applied LAST (LIFO), AFTER all service-level
+#      inheritance has resolved. They are environment-wide and win every tie.
+#   4. `extensions:` add brand-new services that no ancestor declared. They
+#      are NEVER merged with anything — extension names must be unique.
+#   5. `hooks:` are appended in walk-order (root → leaf). Leaf hooks run last,
+#      so operator scripts execute *after* preset scripts.
+#
+# Comment-document everything heavily — operators read this file top-to-bottom
+# and will copy sections wholesale into their own profiles.
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# Schema identity & compatibility
+# -----------------------------------------------------------------------------
+# `schema_version` follows semver. Bumps semantics:
+#   1.0  -> 1.1   additive only (new optional keys, new sections). Existing
+#                  profiles continue to load without change.
+#   1.x  -> 2.0   breaking. Resolver will refuse to load profiles whose
+#                  schema_version is below the resolver's `min_schema`.
+#
+# `mothership_min_version` constrains which ContextDNA mothership releases can
+# consume this profile. The resolver reads the running mothership version from
+# `pyproject.toml` and refuses to proceed on mismatch.
+# -----------------------------------------------------------------------------
+schema_version: "1.0.0"
+mothership_min_version: ">=0.1.0"
+
+# -----------------------------------------------------------------------------
+# Inheritance pointer
+# -----------------------------------------------------------------------------
+# `extends:` names a parent profile (a filename WITHOUT the `.yaml` suffix,
+# resolved against the same profiles/ directory).
+#
+#   null          this profile is a ROOT (no parent). Only `extensible.yaml`
+#                 itself should be a root.
+#   "heavy"       inherit everything from profiles/heavy.yaml first, then
+#                 apply this file as an override layer on top.
+#   "lite"        same, for the lite preset.
+#
+# A profile may only extend ONE parent (single inheritance — keeps merge
+# semantics tractable). To mix concerns from two presets, chain them: build
+# a `mid.yaml extends: heavy`, then `final.yaml extends: mid`.
+# -----------------------------------------------------------------------------
+extends: null
+
+# -----------------------------------------------------------------------------
+# Profile identity (informational; surfaced in `docker compose ps` labels)
+# -----------------------------------------------------------------------------
+profile: extensible-base
+description: >-
+  Root schema for layered ContextDNA profiles. Not directly runnable — exists
+  to define defaults and injection points that real profiles (heavy, lite,
+  operator-authored) inherit from. Concrete profiles set `extends: extensible`
+  (or another preset) and fill in their specifics.
+
+# -----------------------------------------------------------------------------
+# Hardware expectations
+# -----------------------------------------------------------------------------
+# Presets override these. The root schema lists the absolute floor below which
+# scripts/bootstrap-check.sh will refuse to bring the stack up.
+# -----------------------------------------------------------------------------
+resources:
+  ram_min_gb: 2
+  ram_recommended_gb: 4
+  disk_min_gb: 10
+  disk_recommended_gb: 30
+  cpu_min_cores: 2
+  cpu_recommended_cores: 2
+
+# -----------------------------------------------------------------------------
+# Services block
+# -----------------------------------------------------------------------------
+# Each service is a MAP keyed by service name (not a list — required so that
+# child profiles can address services by key during merge).
+#
+# Per-service keys:
+#   enabled:    bool   default true. Setting false in a child profile removes
+#                       the service at resolve time.
+#   image:      str    container image reference, OR omit and use `build:`.
+#   build:      str    path to Dockerfile (relative to repo root).
+#   env:        map    environment overrides for this service.
+#   ports:      list   port mappings; each entry: {host: int, container: int,
+#                       bind: str (default 0.0.0.0), description: str}.
+#   volumes:    list   bind/named volumes; each entry: {source: str,
+#                       target: str, type: bind|volume}.
+#   extends:    str    name of a base service to inherit from. The named
+#                       service must exist in some ancestor profile. Keys
+#                       declared here REPLACE inherited keys for primitives
+#                       (str/int/bool), and MERGE for maps/lists (lists are
+#                       *appended*, not deduplicated — operators can suppress
+#                       by setting `enabled: false` and redefining).
+#   role:       str    human-readable description (informational only).
+#
+# Naming a service here that ALSO appears in the parent profile triggers a
+# merge. Naming a service that does NOT appear anywhere upstream is an error
+# — use the `extensions:` block instead for that case.
+# -----------------------------------------------------------------------------
+services:
+  # The base profile defines no concrete services; presets fill these in.
+  # Example shape a preset would write:
+  #
+  # postgres:
+  #   enabled: true
+  #   image: pgvector/pgvector:pg16
+  #   env:
+  #     POSTGRES_USER: ${POSTGRES_USER:-contextdna}
+  #     POSTGRES_DB:   ${POSTGRES_DB:-contextdna}
+  #   ports:
+  #     - {host: 5432, container: 5432, bind: 0.0.0.0, description: "Postgres SQL"}
+  #   volumes:
+  #     - {source: postgres-data, target: /var/lib/postgresql/data, type: volume}
+  #   role: "Primary store + pgvector embeddings"
+  {}
+
+# -----------------------------------------------------------------------------
+# Environment-level overrides (LIFO, applied LAST)
+# -----------------------------------------------------------------------------
+# After per-service inheritance settles, the resolver walks the profile chain
+# top-down and applies `overrides:` blocks in order. Each override is a small
+# patch addressed to a specific service. Because they apply LAST, they win
+# every tie — even against keys declared in the same profile's `services:`
+# block.
+#
+# Order: root first, leaf last. The leaf override is therefore final word.
+#
+# Use overrides for cross-cutting tweaks that don't belong inside any single
+# service definition (e.g., "raise every container's memory limit by 50% on
+# this host", or "switch every image registry to a private mirror").
+# -----------------------------------------------------------------------------
+overrides: []
+# Example shape:
+# overrides:
+#   - service: postgres
+#     patch:
+#       env:
+#         POSTGRES_MAX_CONNECTIONS: "200"
+#   - service: redis
+#     patch:
+#       image: redis:7.4-alpine
+
+# -----------------------------------------------------------------------------
+# Lifecycle hooks
+# -----------------------------------------------------------------------------
+# Shell commands executed by the mothership at lifecycle transitions. Hooks
+# from every profile in the chain run; root hooks first, leaf hooks last.
+#
+# Hook environment receives:
+#   PROFILE_NAME       the leaf profile being brought up
+#   PROFILE_PATH       absolute path to the resolved compose file
+#   MOTHERSHIP_HOME    absolute path to the contextdna-ide-oss checkout
+#
+# Hooks fail loud — non-zero exit aborts the lifecycle action and rolls back
+# (e.g., a failing pre_up means `docker compose up` is never invoked).
+# -----------------------------------------------------------------------------
+hooks:
+  pre_up:    []   # run before `docker compose up`
+  post_up:   []   # run after `docker compose up` succeeds
+  pre_down:  []   # run before `docker compose down`
+  post_down: []   # run after `docker compose down` succeeds
+# Example:
+# hooks:
+#   pre_up:
+#     - "bash scripts/bootstrap-check.sh"
+#     - "bash scripts/seed-leaf-creds.sh"
+#   post_up:
+#     - "curl -sf http://127.0.0.1:8855/health || (echo 'fleet daemon down'; exit 1)"
+
+# -----------------------------------------------------------------------------
+# Operator extensions
+# -----------------------------------------------------------------------------
+# Brand-new services that no upstream preset defines. Same shape as a
+# `services:` entry, but with an extra requirement: the name MUST NOT collide
+# with any service name reachable up the inheritance chain. The resolver
+# validates this and aborts with a clear diagnostic on collision.
+#
+# Use `extensions:` for things like a side-car LLM proxy, a per-operator
+# Datadog agent, a private MLOps sidecar, etc.
+# -----------------------------------------------------------------------------
+extensions: {}
+# Example:
+# extensions:
+#   my-llm-proxy:
+#     enabled: true
+#     image: ghcr.io/my-org/llm-proxy:latest
+#     env:
+#       UPSTREAM: http://host.docker.internal:5044
+#     ports:
+#       - {host: 5099, container: 8080, bind: 127.0.0.1, description: "LLM proxy"}
+
+# -----------------------------------------------------------------------------
+# Required / optional environment (passthrough)
+# -----------------------------------------------------------------------------
+# These mirror the heavy/lite schema and are not transformed by the resolver
+# — they're surfaced to CI so the bootstrap script can check `.env` before
+# bringing the stack up. Children CONCATENATE onto these lists (no dedup).
+# -----------------------------------------------------------------------------
+required_env: []
+optional_env: []
+
+# -----------------------------------------------------------------------------
+# Sync block (passthrough)
+# -----------------------------------------------------------------------------
+# Free-form. The mothership reads this for NATS / leaf-node / pubsub config.
+# Children REPLACE this whole block (deep-merge would create chimeras that
+# neither role makes sense in).
+# -----------------------------------------------------------------------------
+sync: {}

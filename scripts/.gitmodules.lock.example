@@ -1,0 +1,22 @@
+# .gitmodules.lock.example — illustrative pinned-version bundle
+#
+# Copy this file to ../.gitmodules.lock (sibling of .gitmodules.template) to
+# pin the next clone to exact URLs + commit SHAs.
+#
+# Format (one submodule per line, whitespace-separated):
+#   <path>   url=<git-url>   sha=<commit-sha>
+#
+# - Lines starting with # and blank lines are ignored.
+# - Order is irrelevant; lookup is by <path>.
+# - `url=` is consulted only if neither CLI flag nor env var is provided.
+# - `sha=` pins the submodule to that commit at wire time (deep-fetched).
+# - Both fields are auto-rewritten by `wire-submodules.sh --pin-current`,
+#   so a freshly-wired tree can capture its own state for downstream clones.
+#
+# The four entries below match the four placeholders in .gitmodules.template.
+# SHAs are illustrative — real values appear after running --pin-current.
+
+engines/3-surgeons      url=https://github.com/supportersimulator/3-surgeons.git           sha=0000000000000000000000000000000000000000
+engines/multi-fleet     url=https://github.com/supportersimulator/multi-fleet.git          sha=1111111111111111111111111111111111111111
+engines/context-dna     url=https://github.com/supportersimulator/context-dna.git          sha=2222222222222222222222222222222222222222
+apps/ide-shell          url=https://github.com/supportersimulator/v0-Context-DNA-1.git     sha=3333333333333333333333333333333333333333
