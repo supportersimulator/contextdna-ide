@@ -1,0 +1,141 @@
+# Context DNA Background Helper Agent
+# The subconscious mind - autonomous background processing
+#
+# This image supports multiple entry points:
+# - API Service (FastAPI) - default
+# - Celery Worker (background tasks)
+# - Celery Beat (scheduler)
+#
+# Usage:
+#   # Run API service (default)
+#   docker run contextdna-agent
+#
+#   # Run Celery worker
+#   docker run contextdna-agent celery-worker
+#
+#   # Run Celery beat scheduler
+#   docker run contextdna-agent celery-beat
+#
+#   # Run worker + beat together
+#   docker run contextdna-agent celery-all
+#
+# SYNAPTIC 8TH INTELLIGENCE (SUPERHERO MODE)
+# ===========================================
+# Spawned agents can query Synaptic mid-task for patterns, intuitions, and gotchas.
+#
+# Endpoint: POST http://localhost:8080/contextdna/8th-intelligence
+# Parameters:
+#   - subtask: What the agent is working on (required)
+#   - agent_id: Agent identifier for tracking (optional)
+#   - context: Additional context (optional)
+#
+# Quick query from shell:
+#   curl -s -X POST "http://localhost:8080/contextdna/8th-intelligence?subtask=deploying+terraform"
+#
+# Or use the helper script:
+#   ./scripts/ask-synaptic.sh "deploying terraform" "my-agent-id"
+#
+# Response includes:
+#   - patterns: Past work patterns relevant to this task
+#   - gotchas: Warnings to avoid (learned from past mistakes)
+#   - intuitions: Professor's wisdom for this domain
+#   - stop_signal: If set, STOP immediately and verify
+
+FROM python:3.11-slim
+
+WORKDIR /app
+
+# Install system dependencies
+# ffmpeg required for voice authentication WebM to WAV conversion
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    curl \
+    git \
+    ffmpeg \
+    gcc \
+    python3-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+# Copy requirements and install Python dependencies
+COPY requirements-agent.txt .
+RUN pip install --no-cache-dir -r requirements-agent.txt
+
+# Copy memory modules
+COPY . /app/memory/
+
+# Set Python path
+ENV PYTHONPATH=/app
+
+# Environment variables for services (with defaults)
+ENV RABBITMQ_USER=acontext
+ENV RABBITMQ_PASSWORD=INSECURE_DEFAULT_CHANGE_ME
+ENV RABBITMQ_HOST=contextdna-rabbitmq
+ENV RABBITMQ_PORT=5672
+ENV REDIS_HOST=contextdna-redis
+ENV REDIS_PORT=6379
+ENV REDIS_PASSWORD=INSECURE_DEFAULT_CHANGE_ME
+ENV DATABASE_HOST=contextdna-pg
+ENV DATABASE_PORT=5432
+ENV DATABASE_USER=acontext
+ENV DATABASE_PASSWORD=INSECURE_DEFAULT_CHANGE_ME
+ENV DATABASE_NAME=acontext
+ENV OLLAMA_URL=http://contextdna-ollama:11434
+
+# Create entrypoint script
+RUN echo '#!/bin/bash\n\
+case "$1" in\n\
+  celery-worker)\n\
+    echo "Starting Celery worker..."\n\
+    exec celery -A memory.celery_config worker \\\n\
+      --loglevel=info \\\n\
+      --queues=scanner,distiller,relevance,llm,brain,celery \\\n\
+      --concurrency=4\n\
+    ;;\n\
+  celery-beat)\n\
+    echo "Starting Celery beat scheduler..."\n\
+    exec celery -A memory.celery_config beat --loglevel=info\n\
+    ;;\n\
+  celery-all)\n\
+    echo "Starting Celery worker + beat..."\n\
+    exec celery -A memory.celery_config worker --beat \\\n\
+      --loglevel=info \\\n\
+      --queues=scanner,distiller,relevance,llm,brain,celery \\\n\
+      --concurrency=4\n\
+    ;;\n\
+  api|"")\n\
+    echo "Starting FastAPI service..."\n\
+    exec python -m uvicorn memory.agent_service:app --host 0.0.0.0 --port 8080 --workers 1\n\
+    ;;\n\
+  *)\n\
+    exec "$@"\n\
+    ;;\n\
+esac' > /entrypoint.sh && chmod +x /entrypoint.sh
+
+# Health check script that works for both API and Celery modes
+RUN echo '#!/bin/bash\n\
+# Check which mode we are running in by looking at process list\n\
+if pgrep -f "uvicorn" > /dev/null; then\n\
+    # API mode - check HTTP endpoint\n\
+    curl -sf http://localhost:8080/health || exit 1\n\
+elif pgrep -f "celery.*worker" > /dev/null; then\n\
+    # Celery worker mode - check if process is responsive\n\
+    celery -A memory.celery_config inspect ping -d celery@$HOSTNAME 2>/dev/null | grep -q "pong" || exit 1\n\
+elif pgrep -f "celery.*beat" > /dev/null; then\n\
+    # Celery beat mode - just check if process exists\n\
+    exit 0\n\
+else\n\
+    # Unknown mode or starting up\n\
+    exit 0\n\
+fi' > /healthcheck.sh && chmod +x /healthcheck.sh
+
+# Health check (works for API and Celery modes)
+HEALTHCHECK --interval=30s --timeout=30s --retries=3 --start-period=60s \
+    CMD /healthcheck.sh
+
+# Expose port (API mode)
+EXPOSE 8080
+
+# Use entrypoint script
+ENTRYPOINT ["/entrypoint.sh"]
+
+# Default to API mode
+CMD ["api"]

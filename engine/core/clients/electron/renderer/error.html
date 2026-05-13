@@ -1,0 +1,182 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Context DNA - Server Not Running</title>
+  <style>
+    * {
+      margin: 0;
+      padding: 0;
+      box-sizing: border-box;
+    }
+
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+      background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%);
+      color: white;
+      min-height: 100vh;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      padding: 2rem;
+    }
+
+    .container {
+      text-align: center;
+      max-width: 500px;
+    }
+
+    .icon {
+      font-size: 4rem;
+      margin-bottom: 1.5rem;
+    }
+
+    h1 {
+      font-size: 1.5rem;
+      margin-bottom: 1rem;
+      color: #6366f1;
+    }
+
+    p {
+      color: #94a3b8;
+      margin-bottom: 1.5rem;
+      line-height: 1.6;
+    }
+
+    .code {
+      background: #0f172a;
+      border: 1px solid #334155;
+      border-radius: 8px;
+      padding: 1rem;
+      font-family: 'Monaco', 'Consolas', monospace;
+      font-size: 0.875rem;
+      color: #10b981;
+      margin-bottom: 1.5rem;
+    }
+
+    .buttons {
+      display: flex;
+      gap: 1rem;
+      justify-content: center;
+    }
+
+    button {
+      padding: 0.75rem 1.5rem;
+      border-radius: 8px;
+      border: none;
+      font-weight: 500;
+      cursor: pointer;
+      transition: all 0.2s;
+    }
+
+    .btn-primary {
+      background: #6366f1;
+      color: white;
+    }
+
+    .btn-primary:hover {
+      background: #4f46e5;
+    }
+
+    .btn-secondary {
+      background: #334155;
+      color: #e2e8f0;
+    }
+
+    .btn-secondary:hover {
+      background: #475569;
+    }
+
+    .status {
+      margin-top: 2rem;
+      padding: 1rem;
+      border-radius: 8px;
+      background: #0f172a;
+      display: none;
+    }
+
+    .status.checking {
+      display: block;
+      color: #f59e0b;
+    }
+
+    .status.connected {
+      display: block;
+      color: #10b981;
+    }
+
+    .status.error {
+      display: block;
+      color: #ef4444;
+    }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <div class="icon">🧬</div>
+    <h1>Context DNA Dashboard Not Running</h1>
+    <p>
+      The Context DNA dashboard server needs to be running to use this app.
+      Start it with the command below:
+    </p>
+    <div class="code">
+      context-dna serve
+    </div>
+    <div class="buttons">
+      <button class="btn-primary" onclick="retry()">
+        Retry Connection
+      </button>
+      <button class="btn-secondary" onclick="openDocs()">
+        Documentation
+      </button>
+    </div>
+    <div id="status" class="status"></div>
+  </div>
+
+  <script>
+    const API_URL = 'http://127.0.0.1:3456';
+    const DASHBOARD_URL = 'http://localhost:3457';
+    const statusEl = document.getElementById('status');
+
+    async function retry() {
+      statusEl.className = 'status checking';
+      statusEl.textContent = 'Checking connection...';
+
+      try {
+        const response = await fetch(`${API_URL}/api/health`, { timeout: 5000 });
+        if (response.ok) {
+          statusEl.className = 'status connected';
+          statusEl.textContent = 'Connected! Redirecting...';
+          setTimeout(() => {
+            window.location.href = DASHBOARD_URL;
+          }, 1000);
+        } else {
+          throw new Error('Server returned error');
+        }
+      } catch (error) {
+        statusEl.className = 'status error';
+        statusEl.textContent = 'Server not responding. Make sure to run: context-dna serve';
+      }
+    }
+
+    function openDocs() {
+      // This will be handled by Electron's shell.openExternal
+      if (window.contextDNA) {
+        // In Electron
+        require('electron').shell.openExternal('https://context-dna.dev/docs');
+      } else {
+        // In browser
+        window.open('https://context-dna.dev/docs', '_blank');
+      }
+    }
+
+    // Check connection on load
+    setTimeout(retry, 1000);
+
+    // Keep checking every 5 seconds
+    setInterval(retry, 5000);
+  </script>
+</body>
+</html>

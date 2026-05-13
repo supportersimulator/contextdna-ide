@@ -1,0 +1,74 @@
+╔══════════════════════════════════════════════════════════════════════╗
+║                    SECTION 7 TIMEOUT ARCHITECTURE                     ║
+╠══════════════════════════════════════════════════════════════════════╣
+║                                                                       ║
+║  TOTAL BUDGET: 10 seconds (hard cutoff)                              ║
+║                                                                       ║
+║  ┌─────────────────────────────────────────────────────────────┐    ║
+║  │ Phase 1: PRIMARY METHOD (5s timeout)                        │    ║
+║  │                                                               │    ║
+║  │  Method 1: Context DNA API Query                            │    ║
+║  │  ├─ ThreadPoolExecutor wrapper                              │    ║
+║  │  ├─ Timeout: 5 seconds                                      │    ║
+║  │  └─ Early Exit: If ≥10 SOPs found → DONE (skip Phase 2)    │    ║
+║  │                                                               │    ║
+║  │  Typical outcome:                                            │    ║
+║  │  • Success (0.5-2s): 15-20 SOPs returned → Early exit       │    ║
+║  │  • Partial (2-5s): 3-9 SOPs returned → Continue Phase 2     │    ║
+║  │  • Timeout (5s): 0 SOPs → Continue Phase 2                  │    ║
+║  └─────────────────────────────────────────────────────────────┘    ║
+║                                                                       ║
+║                           ⬇ If <10 SOPs                              ║
+║                                                                       ║
+║  ┌─────────────────────────────────────────────────────────────┐    ║
+║  │ Phase 2: PARALLEL FALLBACKS (5s timeout)                    │    ║
+║  │                                                               │    ║
+║  │  ┌──────────────────┐  ┌──────────────────┐  ┌────────────┐ │    ║
+║  │  │ Method 2:        │  │ Method 3:        │  │ Method 4:  │ │    ║
+║  │  │ query.py         │  │ Knowledge        │  │ Brain      │ │    ║
+║  │  │ subprocess       │  │ Graph            │  │ State      │ │    ║
+║  │  │ (4s timeout)     │  │ (no timeout)     │  │ (fast I/O) │ │    ║
+║  │  └────────┬─────────┘  └────────┬─────────┘  └─────┬──────┘ │    ║
+║  │           │                     │                   │         │    ║
+║  │           └──────────┬──────────┴───────────────────┘         │    ║
+║  │                      ▼                                         │    ║
+║  │         as_completed(futures, timeout=5)                      │    ║
+║  │         - First responder contributes immediately             │    ║
+║  │         - Collect results until 5s total elapsed              │    ║
+║  │         - Partial results OK (graceful degradation)           │    ║
+║  └─────────────────────────────────────────────────────────────┘    ║
+║                                                                       ║
+║  ┌─────────────────────────────────────────────────────────────┐    ║
+║  │ Output: Formatted Context                                    │    ║
+║  │                                                               │    ║
+║  │  - SOPs from Context DNA (if any)                            │    ║
+║  │  - Learnings from query.py (if available)                    │    ║
+║  │  - Knowledge graph paths (if available)                      │    ║
+║  │  - Brain state summary (if available)                        │    ║
+║  │                                                               │    ║
+║  │  GUARANTEE: Complete within 10 seconds (5s + 5s max)         │    ║
+║  └─────────────────────────────────────────────────────────────┘    ║
+║                                                                       ║
+╠══════════════════════════════════════════════════════════════════════╣
+║  PERFORMANCE COMPARISON                                               ║
+╠══════════════════════════════════════════════════════════════════════╣
+║                                                                       ║
+║  BEFORE (Sequential):                                                 ║
+║  ┌──────────┬──────────┬──────────┬──────────┐                       ║
+║  │ Method 1 │ Method 2 │ Method 3 │ Method 4 │                       ║
+║  │  (15s)   │  (15s)   │   (5s)   │   (2s)   │  = 37s worst case    ║
+║  └──────────┴──────────┴──────────┴──────────┘                       ║
+║                                                                       ║
+║  AFTER (Parallel + Timeout):                                          ║
+║  ┌──────────┐                                                         ║
+║  │ Method 1 │  ←─ 5s timeout, early exit if ≥10 SOPs                ║
+║  └─────┬────┘                                                         ║
+║        ↓ (if <10 SOPs)                                                ║
+║  ┌──────────┬──────────┬──────────┐                                  ║
+║  │ Method 2 │ Method 3 │ Method 4 │  ←─ 5s collective timeout        ║
+║  │  (4s)    │  (5s)    │  (1s)    │                                  ║
+║  └──────────┴──────────┴──────────┘                                  ║
+║                                                                       ║
+║  = 10s maximum (5s + 5s)                                              ║
+║                                                                       ║
+╚══════════════════════════════════════════════════════════════════════╝

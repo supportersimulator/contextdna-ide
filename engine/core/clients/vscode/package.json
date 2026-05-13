@@ -1,0 +1,173 @@
+{
+  "name": "context-dna-vscode",
+  "displayName": "Context DNA",
+  "description": "Autonomous learning system for developers - VS Code integration",
+  "version": "0.1.0",
+  "publisher": "context-dna",
+  "icon": "images/icon.png",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/context-dna/context-dna"
+  },
+  "engines": {
+    "vscode": "^1.95.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "activationEvents": [
+    "onStartupFinished"
+  ],
+  "main": "./out/extension.js",
+  "contributes": {
+    "languageModelTools": [
+      {
+        "name": "three-surgeons_cross-examine",
+        "displayName": "3-Surgeon Cross-Examination",
+        "modelDescription": "Run a multi-LLM cross-examination on a topic using 3 independent AI surgeons (Atlas/Claude, Cardiologist/GPT-4.1, Neurologist/Qwen3). Each surgeon analyzes independently, then cross-examines the others' findings. Supports single (1 pass), iterative (up to 3), and continuous (up to 5 with open exploration) review modes. Use for architecture decisions, code review, risk assessment, or any decision needing diverse AI perspectives.",
+        "inputSchema": {
+          "type": "object",
+          "properties": {
+            "topic": {
+              "type": "string",
+              "description": "The topic, question, or code to cross-examine"
+            },
+            "mode": {
+              "type": "string",
+              "enum": ["single", "iterative", "continuous"],
+              "description": "Review depth: single (1 pass), iterative (up to 3 passes), continuous (up to 5 passes with open exploration)",
+              "default": "single"
+            },
+            "depth": {
+              "type": "string",
+              "enum": ["full", "quick"],
+              "description": "Analysis depth: full (comprehensive) or quick (abbreviated)",
+              "default": "full"
+            }
+          },
+          "required": ["topic"]
+        }
+      },
+      {
+        "name": "three-surgeons_consult",
+        "displayName": "3-Surgeon Quick Consult",
+        "modelDescription": "Quick consultation with 2 independent AI surgeons (Cardiologist/GPT-4.1-mini and Neurologist/Qwen3-4B). Faster than cross-examination — each surgeon gives an independent opinion without cross-examining the other. Use for quick second opinions or when speed matters more than depth.",
+        "inputSchema": {
+          "type": "object",
+          "properties": {
+            "topic": {
+              "type": "string",
+              "description": "The topic or question to consult on"
+            }
+          },
+          "required": ["topic"]
+        }
+      },
+      {
+        "name": "three-surgeons_consensus",
+        "displayName": "3-Surgeon Consensus Check",
+        "modelDescription": "Check confidence-weighted consensus across 3 AI surgeons on a specific claim. Returns each surgeon's confidence level and assessment, plus a weighted aggregate score. Use to validate assumptions, check if a proposed approach has broad agreement, or identify areas of disagreement between models.",
+        "inputSchema": {
+          "type": "object",
+          "properties": {
+            "claim": {
+              "type": "string",
+              "description": "The claim or assertion to check consensus on"
+            }
+          },
+          "required": ["claim"]
+        }
+      },
+      {
+        "name": "three-surgeons_probe",
+        "displayName": "3-Surgeon Health Check",
+        "modelDescription": "Health check all 3 AI surgeons (Atlas, Cardiologist, Neurologist). Returns status, latency, and availability for each. Use to verify the 3-surgeon system is operational before running cross-examinations.",
+        "inputSchema": {
+          "type": "object",
+          "properties": {}
+        }
+      }
+    ],
+    "commands": [
+      {
+        "command": "context-dna.recordWin",
+        "title": "Context DNA: Record Win 🏆"
+      },
+      {
+        "command": "context-dna.recordFix",
+        "title": "Context DNA: Record Fix 🔧"
+      },
+      {
+        "command": "context-dna.search",
+        "title": "Context DNA: Search Learnings 🔍"
+      },
+      {
+        "command": "context-dna.consult",
+        "title": "Context DNA: Consult Brain 🧠"
+      },
+      {
+        "command": "context-dna.openDashboard",
+        "title": "Context DNA: Open Dashboard"
+      },
+      {
+        "command": "context-dna.showStats",
+        "title": "Context DNA: Show Stats"
+      },
+      {
+        "command": "context-dna.showFleetStatus",
+        "title": "Context DNA: Fleet Status"
+      }
+    ],
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "context-dna",
+          "title": "Context DNA",
+          "icon": "images/icon.svg"
+        }
+      ]
+    },
+    "views": {
+      "context-dna": [
+        {
+          "id": "context-dna.stats",
+          "name": "Stats"
+        },
+        {
+          "id": "context-dna.recent",
+          "name": "Recent Learnings"
+        }
+      ]
+    },
+    "configuration": {
+      "title": "Context DNA",
+      "properties": {
+        "context-dna.apiUrl": {
+          "type": "string",
+          "default": "http://127.0.0.1:3456",
+          "description": "Context DNA API server URL"
+        },
+        "context-dna.dashboardUrl": {
+          "type": "string",
+          "default": "http://localhost:3457",
+          "description": "Context DNA Dashboard URL"
+        },
+        "context-dna.fleetUrl": {
+          "type": "string",
+          "default": "http://127.0.0.1:8855",
+          "description": "Multi-Fleet daemon URL for fleet status"
+        }
+      }
+    }
+  },
+  "scripts": {
+    "vscode:prepublish": "npm run compile",
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./"
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "@types/vscode": "^1.95.0",
+    "typescript": "^5.0.0"
+  }
+}

@@ -1,0 +1,76 @@
+# Context DNA Helper Agent - Python Dependencies
+# Full subconscious background service with Celery workers
+
+# =============================================================================
+# WEB FRAMEWORK
+# =============================================================================
+fastapi>=0.104.0
+uvicorn[standard]>=0.24.0
+
+# =============================================================================
+# CELERY - The Nervous System
+# =============================================================================
+# Task queue for background agents (Scanner, Distiller, Relevance, LLM)
+celery[redis]>=5.3.0
+kombu>=5.3.0
+
+# =============================================================================
+# REDIS - Hot Cache + Coordination
+# =============================================================================
+redis>=5.0.0
+
+# =============================================================================
+# POSTGRESQL - Durable Storage
+# =============================================================================
+# For storing skills, events, hierarchies, snapshots
+psycopg2-binary>=2.9.0
+
+# =============================================================================
+# MESSAGE QUEUE
+# =============================================================================
+# RabbitMQ client (Celery broker)
+pika>=1.3.0
+# NATS Python client — required by memory/webhook_health_publisher.py:219
+# (lazy import). Webhook silent-failure root-caused 2026-04-26 (commit
+# 171915da): nats-py was pip-installed in venv.nosync but missing from this
+# requirements file → fresh installs would re-introduce the silent-mismatch
+# regression. Pinning to multifleet/pyproject.toml's tested range.
+nats-py>=2.14.0,<3.0
+
+# =============================================================================
+# NETWORK / HTTP
+# =============================================================================
+httpx>=0.25.0
+requests>=2.31.0
+websockets>=12.0
+
+# =============================================================================
+# DATA HANDLING
+# =============================================================================
+pydantic>=2.0.0
+aiofiles>=23.0.0
+
+# =============================================================================
+# SYSTEM MONITORING (Synaptic's Eyes)
+# =============================================================================
+# Required by system_monitor.py for resource awareness
+psutil>=5.9.0
+
+# =============================================================================
+# ACONTEXT SDK
+# =============================================================================
+acontext>=0.1.3
+
+# =============================================================================
+# VOICE AUTHENTICATION
+# =============================================================================
+# Speaker embedding for voice fingerprint auth
+resemblyzer>=0.1.3
+soundfile>=0.12.0
+numpy>=1.24.0
+
+# =============================================================================
+# VOICE TTS (Text-to-Speech)
+# =============================================================================
+# Required for Synaptic voice synthesis - graceful degradation if unavailable
+edge-tts>=6.1.0

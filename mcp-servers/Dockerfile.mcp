@@ -1,0 +1,27 @@
+# MCP Server Dockerfile
+# Lightweight Python container for Context DNA Webhook MCP Server
+
+FROM python:3.11-slim
+
+WORKDIR /app
+
+# Install minimal dependencies
+RUN pip install --no-cache-dir \
+    mcp==0.9.0 \
+    fastapi==0.115.0 \
+    uvicorn==0.30.0
+
+# Copy MCP server and memory system
+COPY mcp-servers/contextdna_webhook_mcp.py /app/
+COPY memory/ /app/memory/
+
+# Set Python path
+ENV PYTHONPATH=/app
+
+# Health check - simple Python import test
+HEALTHCHECK --interval=30s --timeout=3s --start-period=10s --retries=3 \
+    CMD python3 -c "import sys; sys.path.insert(0, '/app'); from memory.session_historian import SessionHistorian; print('ok')" || exit 1
+
+# Run MCP server as stdio server (managed by Cursor)
+# In production, this container just needs to be ready to serve requests
+CMD ["python3", "-c", "import time; print('MCP server ready'); time.sleep(infinity)"]

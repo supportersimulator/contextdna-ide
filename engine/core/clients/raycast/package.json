@@ -1,0 +1,79 @@
+{
+  "$schema": "https://www.raycast.com/schemas/extension.json",
+  "name": "context-dna",
+  "title": "Context DNA",
+  "description": "Autonomous learning system for developers",
+  "icon": "icon.png",
+  "author": "context-dna",
+  "categories": ["Developer Tools", "Productivity"],
+  "license": "MIT",
+  "commands": [
+    {
+      "name": "record-win",
+      "title": "Record Win",
+      "subtitle": "Context DNA",
+      "description": "Record a win to your learning history",
+      "mode": "view"
+    },
+    {
+      "name": "record-fix",
+      "title": "Record Fix",
+      "subtitle": "Context DNA",
+      "description": "Record a fix to your learning history",
+      "mode": "view"
+    },
+    {
+      "name": "search",
+      "title": "Search Learnings",
+      "subtitle": "Context DNA",
+      "description": "Search through your learning history",
+      "mode": "view"
+    },
+    {
+      "name": "stats",
+      "title": "Show Stats",
+      "subtitle": "Context DNA",
+      "description": "View your learning statistics",
+      "mode": "view"
+    },
+    {
+      "name": "recent",
+      "title": "Recent Learnings",
+      "subtitle": "Context DNA",
+      "description": "View your recent learnings",
+      "mode": "view"
+    },
+    {
+      "name": "consult",
+      "title": "Consult Brain",
+      "subtitle": "Context DNA",
+      "description": "Get context for a task from your learning history",
+      "mode": "view"
+    }
+  ],
+  "preferences": [
+    {
+      "name": "apiUrl",
+      "title": "API URL",
+      "description": "Context DNA API server URL",
+      "type": "textfield",
+      "default": "http://127.0.0.1:3456",
+      "required": false
+    }
+  ],
+  "dependencies": {
+    "@raycast/api": "^1.50.0",
+    "node-fetch": "^3.3.0"
+  },
+  "devDependencies": {
+    "@raycast/eslint-config": "^1.0.0",
+    "@types/node": "^20.0.0",
+    "@types/react": "^18.2.0",
+    "typescript": "^5.0.0"
+  },
+  "scripts": {
+    "build": "ray build -e dist",
+    "dev": "ray develop",
+    "lint": "ray lint"
+  }
+}

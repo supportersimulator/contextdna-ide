@@ -1,0 +1,82 @@
+{
+  "description": "Test messages for Synaptic Chat markdown rendering verification",
+  "target": "http://localhost:8888",
+  "tests": [
+    {
+      "id": 1,
+      "name": "Bold Text",
+      "message": "Testing bold: **this should be bold** and __this too__",
+      "expected_pass": "Words appear in bold formatting",
+      "expected_fail": "Literal asterisks shown: **this should be bold**"
+    },
+    {
+      "id": 2,
+      "name": "Italic Text",
+      "message": "Testing italic: *this should be italic* and _this too_",
+      "expected_pass": "Words appear in italic formatting",
+      "expected_fail": "Literal asterisks shown: *this should be italic*"
+    },
+    {
+      "id": 3,
+      "name": "Inline Code",
+      "message": "Testing inline code: use `console.log()` to debug and `pip install requests` for packages",
+      "expected_pass": "Code appears in monospace with background highlight",
+      "expected_fail": "Literal backticks shown around code"
+    },
+    {
+      "id": 4,
+      "name": "Code Block with Language",
+      "message": "Here's a Python example:\n\n```python\ndef hello():\n    print(\"Hello, Synaptic!\")\n    return True\n```\n\nAnd JavaScript:\n\n```javascript\nconst greet = () => {\n    console.log(\"Hi from JS\");\n};\n```",
+      "expected_pass": "Syntax-highlighted code blocks with proper formatting",
+      "expected_fail": "Literal triple backticks shown as text"
+    },
+    {
+      "id": 5,
+      "name": "Unordered List",
+      "message": "Things to remember:\n- First item\n- Second item\n- Third item with **bold**\n  - Nested item\n  - Another nested",
+      "expected_pass": "Bullet points with proper indentation and nesting",
+      "expected_fail": "Literal dashes at start of lines"
+    },
+    {
+      "id": 6,
+      "name": "Ordered List",
+      "message": "Steps to follow:\n1. First step\n2. Second step\n3. Third step with `code`\n4. Fourth step",
+      "expected_pass": "Numbered list with proper spacing",
+      "expected_fail": "Numbers with periods as plain text"
+    },
+    {
+      "id": 7,
+      "name": "Headers",
+      "message": "## Main Section Header\n\nSome content here.\n\n### Subsection Header\n\nMore content below.\n\n#### Smaller Header\n\nFinal details.",
+      "expected_pass": "Varying header sizes (h2, h3, h4)",
+      "expected_fail": "Literal hash symbols: ## Main Section Header"
+    },
+    {
+      "id": 8,
+      "name": "Tables",
+      "message": "Here's the comparison:\n\n| Feature | Status | Priority |\n|---------|--------|----------|\n| Bold    | Working | High    |\n| Tables  | Testing | Medium  |\n| Code    | Pending | High    |",
+      "expected_pass": "Formatted table with borders and aligned columns",
+      "expected_fail": "Literal pipe characters and dashes as text"
+    },
+    {
+      "id": 9,
+      "name": "Links",
+      "message": "Check the [documentation](https://example.com) and visit [GitHub](https://github.com).",
+      "expected_pass": "Clickable links with underline",
+      "expected_fail": "Literal brackets: [documentation](https://example.com)"
+    },
+    {
+      "id": 10,
+      "name": "Combined Markdown",
+      "message": "## Quick Summary\n\nHere's what we know:\n\n1. **Bold works** with asterisks\n2. *Italic works* with single asterisks\n3. Code like `npm install` uses backticks\n\n| Test | Result |\n|------|--------|\n| Pass | ✓      |\n| Fail | ✗      |\n\nCheck the [docs](https://example.com) for more.\n\n```python\n# Example code\nprint(\"Synaptic is operational\")\n```",
+      "expected_pass": "All elements rendered correctly together",
+      "expected_fail": "Raw markdown syntax visible throughout"
+    }
+  ],
+  "quick_test_sequence": [
+    "**bold** and *italic*",
+    "`inline code` test",
+    "- bullet\n- list",
+    "| col1 | col2 |\n|------|------|\n| a    | b    |"
+  ]
+}

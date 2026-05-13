@@ -1,0 +1,791 @@
+#!/usr/bin/env python3
+"""
+Synaptic Health Monitor - The 8th Intelligence Watches Over the System
+
+ENHANCED: Synaptic now PROACTIVELY FIXES issues before alerting Atlas.
+
+═══════════════════════════════════════════════════════════════════════════
+PHILOSOPHY (EVOLVED):
+═══════════════════════════════════════════════════════════════════════════
+
+Synaptic acts as a vigilant guardian AND skilled engineer.
+When Atlas receives a question, Synaptic:
+
+1. DETECTS issues (services down, unhealthy containers)
+2. ATTEMPTS FIXES automatically (safe operations only)
+3. RE-CHECKS health after remediation
+4. ONLY BARGES IN if issues persist after fix attempts
+
+This means Atlas sees one of:
+- Nothing (all healthy, or Synaptic fixed it silently)
+- Success message (Synaptic fixed issues proactively)
+- Alert with context (issues persist despite Synaptic's best efforts)
+
+SAFE OPERATIONS (Synaptic can perform autonomously):
+✅ docker compose up -d <service>  - Start missing containers
+✅ docker restart <container>       - Restart unhealthy containers
+✅ docker compose build <service>   - Rebuild if needed
+
+UNSAFE OPERATIONS (Synaptic will NEVER do):
+❌ docker stop/rm                   - Never stops running services
+❌ docker system prune              - Never deletes data
+❌ Modifying configs                - Never changes .env or compose files
+
+═══════════════════════════════════════════════════════════════════════════
+"""
+
+import subprocess
+import json
+import os
+import time
+from datetime import datetime
+from pathlib import Path
+from typing import Dict, List, Optional, Tuple
+from dataclasses import dataclass, field
+from enum import Enum
+
+
+class HealthStatus(Enum):
+    HEALTHY = "healthy"
+    DEGRADED = "degraded"
+    CRITICAL = "critical"
+    UNKNOWN = "unknown"
+
+
+class RemediationResult(Enum):
+    SUCCESS = "success"
+    PARTIAL = "partial"
+    FAILED = "failed"
+    NOT_NEEDED = "not_needed"
+    SKIPPED = "skipped"
+
+
+@dataclass
+class ServiceHealth:
+    """Health status of a single service."""
+    name: str
+    status: HealthStatus
+    running: bool
+    healthy: bool
+    message: str
+    importance: str  # "critical", "important", "optional"
+
+
+@dataclass
+class RemediationAttempt:
+    """Record of a remediation attempt."""
+    service: str
+    action: str
+    command: str
+    result: RemediationResult
+    message: str
+    duration_ms: int
+
+
+@dataclass
+class SystemHealthReport:
+    """Overall system health report."""
+    overall_status: HealthStatus
+    services: List[ServiceHealth]
+    critical_issues: List[str]
+    warnings: List[str]
+    timestamp: str
+    should_barge_in: bool
+    # NEW: Remediation tracking
+    remediation_attempted: bool = False
+    remediation_results: List[RemediationAttempt] = field(default_factory=list)
+    issues_fixed: int = 0
+    issues_remaining: int = 0
+
+
+class SynapticHealthMonitor:
+    """
+    Synaptic's health monitoring system with PROACTIVE REMEDIATION.
+
+    Flow:
+    1. Check all services
+    2. Identify issues
+    3. Attempt to fix issues (safe operations only)
+    4. Re-check health
+    5. Report results (with context of what was attempted)
+    """
+
+    # Services that MUST be running for full functionality
+    CRITICAL_SERVICES = {
+        "contextdna-pg": "PostgreSQL database",
+        "contextdna-redis": "Redis cache/message broker",
+        "contextdna-api": "Context DNA API",
+    }
+
+    # Services that SHOULD be running for best experience
+    IMPORTANT_SERVICES = {
+        "contextdna-core": "Context DNA Core",
+        "contextdna-helper-agent": "Background processor",
+        "contextdna-ui": "Dashboard UI",
+        "contextdna-rabbitmq": "RabbitMQ message broker",
+    }
+
+    # Services for Celery task processing
+    CELERY_SERVICES = {
+        "contextdna-celery-worker": "Celery task worker",
+        "contextdna-celery-beat": "Celery task scheduler",
+    }
+
+    # Optional services (don't auto-fix, just note)
+    OPTIONAL_SERVICES = {
+        "contextdna-opensearch": "Search engine",
+        "contextdna-seaweedfs": "Object storage",
+        "contextdna-jaeger": "Tracing",
+        "contextdna-prometheus": "Metrics",
+        "contextdna-grafana": "Dashboards",
+        "contextdna-traefik": "Reverse proxy",
+    }
+
+    # Services Synaptic will AUTO-FIX (all critical + important + celery)
+    AUTO_FIX_SERVICES = {
+        **CRITICAL_SERVICES,
+        **IMPORTANT_SERVICES,
+        **CELERY_SERVICES,
+    }
+
+    # NOTE: Ollama/LLM services intentionally NOT checked
+    # They are optional and may not be running locally
+
+    def __init__(self):
+        self.repo_root = Path("/Users/aarontjomsland/dev/er-simulator-superrepo")
+        self.compose_file = self.repo_root / "context-dna" / "infra" / "docker-compose.yaml"
+        self.remediation_log: List[RemediationAttempt] = []
+
+    def check_docker_available(self) -> bool:
+        """Check if Docker is running."""
+        try:
+            result = subprocess.run(
+                ["docker", "info"],
+                capture_output=True,
+                timeout=5
+            )
+            return result.returncode == 0
+        except Exception:
+            return False
+
+    def get_container_status(self) -> Dict[str, Dict]:
+        """Get status of all Docker containers."""
+        try:
+            result = subprocess.run(
+                ["docker", "ps", "-a", "--format", "{{json .}}"],
+                capture_output=True,
+                text=True,
+                timeout=10
+            )
+
+            containers = {}
+            for line in result.stdout.strip().split('\n'):
+                if line:
+                    try:
+                        data = json.loads(line)
+                        name = data.get("Names", "")
+                        containers[name] = {
+                            "status": data.get("Status", ""),
+                            "state": data.get("State", ""),
+                            "running": data.get("State", "") == "running",
+                            "healthy": "(healthy)" in data.get("Status", ""),
+                            "created": data.get("CreatedAt", ""),
+                        }
+                    except json.JSONDecodeError:
+                        continue
+
+            return containers
+        except Exception as e:
+            return {"error": str(e)}
+
+    def check_service_health(
+        self,
+        name: str,
+        description: str,
+        importance: str,
+        containers: Dict
+    ) -> ServiceHealth:
+        """Check health of a single service."""
+
+        if name not in containers:
+            return ServiceHealth(
+                name=name,
+                status=HealthStatus.CRITICAL if importance == "critical" else HealthStatus.DEGRADED,
+                running=False,
+                healthy=False,
+                message=f"Container not found (not created)",
+                importance=importance
+            )
+
+        info = containers[name]
+        running = info.get("running", False)
+        healthy = info.get("healthy", False)
+        status_str = info.get("status", "unknown")
+
+        if running and healthy:
+            return ServiceHealth(
+                name=name,
+                status=HealthStatus.HEALTHY,
+                running=True,
+                healthy=True,
+                message=f"Running and healthy",
+                importance=importance
+            )
+        elif running and not healthy:
+            # Check if it's still starting
+            if "(health: starting)" in status_str:
+                return ServiceHealth(
+                    name=name,
+                    status=HealthStatus.DEGRADED,
+                    running=True,
+                    healthy=False,
+                    message=f"Starting up (health check pending)",
+                    importance=importance
+                )
+            return ServiceHealth(
+                name=name,
+                status=HealthStatus.DEGRADED,
+                running=True,
+                healthy=False,
+                message=f"Running but unhealthy: {status_str}",
+                importance=importance
+            )
+        else:
+            return ServiceHealth(
+                name=name,
+                status=HealthStatus.CRITICAL if importance == "critical" else HealthStatus.DEGRADED,
+                running=False,
+                healthy=False,
+                message=f"Not running: {status_str}",
+                importance=importance
+            )
+
+    # =========================================================================
+    # PROACTIVE REMEDIATION - Synaptic's Expert-Level Auto-Fixing
+    # =========================================================================
+
+    def _run_docker_compose(self, *args, timeout: int = 120) -> Tuple[bool, str]:
+        """Run docker compose command safely."""
+        try:
+            cmd = ["docker", "compose", "-f", str(self.compose_file)] + list(args)
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+                cwd=str(self.compose_file.parent)
+            )
+            success = result.returncode == 0
+            output = result.stdout + result.stderr
+            return success, output
+        except subprocess.TimeoutExpired:
+            return False, "Command timed out"
+        except Exception as e:
+            return False, str(e)
+
+    def _attempt_start_service(self, service_name: str) -> RemediationAttempt:
+        """Attempt to start a stopped/missing service."""
+        start_time = time.time()
+
+        # Map container name to compose service name
+        compose_service = service_name.replace("contextdna-", "")
+
+        # First try: just start it
+        success, output = self._run_docker_compose("up", "-d", service_name)
+
+        duration_ms = int((time.time() - start_time) * 1000)
+
+        if success:
+            return RemediationAttempt(
+                service=service_name,
+                action="start",
+                command=f"docker compose up -d {service_name}",
+                result=RemediationResult.SUCCESS,
+                message=f"Started successfully",
+                duration_ms=duration_ms
+            )
+
+        # Second try: rebuild and start (for services with custom Dockerfiles)
+        if "build" in output.lower() or "no such" in output.lower():
+            success, output = self._run_docker_compose("up", "-d", "--build", service_name, timeout=180)
+            duration_ms = int((time.time() - start_time) * 1000)
+
+            if success:
+                return RemediationAttempt(
+                    service=service_name,
+                    action="build_and_start",
+                    command=f"docker compose up -d --build {service_name}",
+                    result=RemediationResult.SUCCESS,
+                    message=f"Built and started successfully",
+                    duration_ms=duration_ms
+                )
+
+        return RemediationAttempt(
+            service=service_name,
+            action="start",
+            command=f"docker compose up -d {service_name}",
+            result=RemediationResult.FAILED,
+            message=f"Failed: {output[:200]}",
+            duration_ms=duration_ms
+        )
+
+    def _attempt_restart_service(self, service_name: str) -> RemediationAttempt:
+        """Attempt to restart an unhealthy service."""
+        start_time = time.time()
+
+        try:
+            result = subprocess.run(
+                ["docker", "restart", service_name],
+                capture_output=True,
+                text=True,
+                timeout=60
+            )
+            duration_ms = int((time.time() - start_time) * 1000)
+
+            if result.returncode == 0:
+                return RemediationAttempt(
+                    service=service_name,
+                    action="restart",
+                    command=f"docker restart {service_name}",
+                    result=RemediationResult.SUCCESS,
+                    message="Restarted successfully",
+                    duration_ms=duration_ms
+                )
+            else:
+                return RemediationAttempt(
+                    service=service_name,
+                    action="restart",
+                    command=f"docker restart {service_name}",
+                    result=RemediationResult.FAILED,
+                    message=f"Failed: {result.stderr[:200]}",
+                    duration_ms=duration_ms
+                )
+        except Exception as e:
+            return RemediationAttempt(
+                service=service_name,
+                action="restart",
+                command=f"docker restart {service_name}",
+                result=RemediationResult.FAILED,
+                message=f"Error: {str(e)}",
+                duration_ms=int((time.time() - start_time) * 1000)
+            )
+
+    def attempt_remediation(self, services: List[ServiceHealth]) -> List[RemediationAttempt]:
+        """
+        Attempt to fix unhealthy services.
+
+        Synaptic applies expert-level knowledge:
+        1. Missing containers → Start them
+        2. Unhealthy containers → Restart them
+        3. Containers that need building → Build and start
+        """
+        attempts = []
+
+        for service in services:
+            # Only auto-fix services in our approved list
+            if service.name not in self.AUTO_FIX_SERVICES:
+                continue
+
+            # Skip healthy services
+            if service.status == HealthStatus.HEALTHY:
+                continue
+
+            # Skip services that are starting up (give them time)
+            if "Starting up" in service.message or "(health: starting)" in service.message.lower():
+                attempts.append(RemediationAttempt(
+                    service=service.name,
+                    action="wait",
+                    command="(waiting for health check)",
+                    result=RemediationResult.SKIPPED,
+                    message="Service is starting, giving it time",
+                    duration_ms=0
+                ))
+                continue
+
+            # Service not running → Start it
+            if not service.running:
+                attempt = self._attempt_start_service(service.name)
+                attempts.append(attempt)
+
+            # Service running but unhealthy → Restart it
+            elif not service.healthy:
+                attempt = self._attempt_restart_service(service.name)
+                attempts.append(attempt)
+
+        return attempts
+
+    def check_system_health(self, auto_fix: bool = True) -> SystemHealthReport:
+        """
+        Perform comprehensive system health check with optional auto-remediation.
+
+        Args:
+            auto_fix: If True, Synaptic will attempt to fix issues before reporting
+
+        Returns:
+            SystemHealthReport with all service statuses and remediation results
+        """
+        timestamp = datetime.now().isoformat()
+        services = []
+        critical_issues = []
+        warnings = []
+        remediation_attempts = []
+
+        # Check Docker first
+        if not self.check_docker_available():
+            return SystemHealthReport(
+                overall_status=HealthStatus.CRITICAL,
+                services=[],
+                critical_issues=["Docker is not running! Start Docker Desktop first."],
+                warnings=[],
+                timestamp=timestamp,
+                should_barge_in=True,
+                remediation_attempted=False,
+                issues_remaining=1
+            )
+
+        # Get all container statuses
+        containers = self.get_container_status()
+
+        if "error" in containers:
+            return SystemHealthReport(
+                overall_status=HealthStatus.UNKNOWN,
+                services=[],
+                critical_issues=[f"Cannot check Docker containers: {containers['error']}"],
+                warnings=[],
+                timestamp=timestamp,
+                should_barge_in=True,
+                remediation_attempted=False,
+                issues_remaining=1
+            )
+
+        # Check all services
+        for name, desc in self.CRITICAL_SERVICES.items():
+            services.append(self.check_service_health(name, desc, "critical", containers))
+
+        for name, desc in self.IMPORTANT_SERVICES.items():
+            services.append(self.check_service_health(name, desc, "important", containers))
+
+        for name, desc in self.CELERY_SERVICES.items():
+            services.append(self.check_service_health(name, desc, "important", containers))
+
+        for name, desc in self.OPTIONAL_SERVICES.items():
+            services.append(self.check_service_health(name, desc, "optional", containers))
+
+        # Count initial issues
+        initial_issues = [s for s in services if s.status != HealthStatus.HEALTHY and s.importance != "optional"]
+
+        # PROACTIVE REMEDIATION
+        if auto_fix and initial_issues:
+            remediation_attempts = self.attempt_remediation(services)
+
+            # Wait a moment for services to start
+            successful_fixes = [a for a in remediation_attempts if a.result == RemediationResult.SUCCESS]
+            if successful_fixes:
+                time.sleep(3)  # Brief wait for services to initialize
+
+                # Re-check container status
+                containers = self.get_container_status()
+
+                # Re-evaluate services
+                services = []
+                for name, desc in self.CRITICAL_SERVICES.items():
+                    services.append(self.check_service_health(name, desc, "critical", containers))
+                for name, desc in self.IMPORTANT_SERVICES.items():
+                    services.append(self.check_service_health(name, desc, "important", containers))
+                for name, desc in self.CELERY_SERVICES.items():
+                    services.append(self.check_service_health(name, desc, "important", containers))
+                for name, desc in self.OPTIONAL_SERVICES.items():
+                    services.append(self.check_service_health(name, desc, "optional", containers))
+
+        # Compile issues after remediation
+        for service in services:
+            if service.importance == "critical" and service.status == HealthStatus.CRITICAL:
+                critical_issues.append(f"🔴 {self.CRITICAL_SERVICES.get(service.name, service.name)} ({service.name}) is DOWN")
+            elif service.importance == "important" and not service.running:
+                # Check if it's Celery
+                if service.name in self.CELERY_SERVICES:
+                    warnings.append(f"⚠️ {service.name} is not running - async tasks will fail")
+                else:
+                    warnings.append(f"🟡 {self.IMPORTANT_SERVICES.get(service.name, service.name)} ({service.name}) is not running")
+
+        # Calculate remediation stats
+        issues_fixed = len([a for a in remediation_attempts if a.result == RemediationResult.SUCCESS])
+        issues_remaining = len(critical_issues) + len([w for w in warnings if "not running" in w])
+
+        # Determine overall status
+        if critical_issues:
+            overall_status = HealthStatus.CRITICAL
+        elif warnings:
+            overall_status = HealthStatus.DEGRADED
+        else:
+            overall_status = HealthStatus.HEALTHY
+
+        # Should we barge in?
+        # Only barge in if there are REMAINING issues after remediation
+        celery_down = any("Celery" in w or "celery" in w for w in warnings)
+        should_barge_in = bool(critical_issues) or (len(warnings) >= 2) or celery_down
+
+        # If we fixed everything, don't barge in (just log success)
+        if issues_fixed > 0 and issues_remaining == 0:
+            should_barge_in = False  # Silent success!
+
+        return SystemHealthReport(
+            overall_status=overall_status,
+            services=services,
+            critical_issues=critical_issues,
+            warnings=warnings,
+            timestamp=timestamp,
+            should_barge_in=should_barge_in,
+            remediation_attempted=bool(remediation_attempts),
+            remediation_results=remediation_attempts,
+            issues_fixed=issues_fixed,
+            issues_remaining=issues_remaining
+        )
+
+    def to_barge_in_message(self, report: SystemHealthReport) -> Optional[str]:
+        """
+        Generate a "barge in" message if there are issues.
+
+        Now includes context about what Synaptic already tried.
+        Returns None if:
+        - System is healthy
+        - Synaptic fixed all issues (silent success)
+        """
+        # If we fixed everything, provide a brief success note instead of barging in
+        if report.issues_fixed > 0 and report.issues_remaining == 0:
+            return None  # Silent success - no need to interrupt
+
+        if not report.should_barge_in:
+            return None
+
+        lines = [
+            "╔══════════════════════════════════════════════════════════════════════╗",
+            "║  ⚠️  SYNAPTIC SYSTEM ALERT - Infrastructure Issues Detected          ║",
+            "╠══════════════════════════════════════════════════════════════════════╣",
+            "",
+        ]
+
+        # Status indicator
+        status_emoji = {
+            HealthStatus.CRITICAL: "🔴 CRITICAL",
+            HealthStatus.DEGRADED: "🟡 DEGRADED",
+            HealthStatus.HEALTHY: "🟢 HEALTHY",
+            HealthStatus.UNKNOWN: "⚪ UNKNOWN",
+        }
+        lines.append(f"System Status: {status_emoji.get(report.overall_status, '⚪')}")
+        lines.append("")
+
+        # Show what Synaptic already tried
+        if report.remediation_attempted:
+            lines.append("🔧 SYNAPTIC'S REMEDIATION ATTEMPTS:")
+            for attempt in report.remediation_results:
+                if attempt.result == RemediationResult.SUCCESS:
+                    lines.append(f"   ✅ {attempt.service}: {attempt.message}")
+                elif attempt.result == RemediationResult.FAILED:
+                    lines.append(f"   ❌ {attempt.service}: {attempt.message[:60]}")
+                elif attempt.result == RemediationResult.SKIPPED:
+                    lines.append(f"   ⏳ {attempt.service}: {attempt.message}")
+
+            if report.issues_fixed > 0:
+                lines.append(f"   → Fixed {report.issues_fixed} issue(s)")
+            if report.issues_remaining > 0:
+                lines.append(f"   → {report.issues_remaining} issue(s) still need attention")
+            lines.append("")
+
+        # Critical issues first
+        if report.critical_issues:
+            lines.append("🚨 CRITICAL ISSUES (Must fix before proceeding):")
+            for issue in report.critical_issues:
+                lines.append(f"   {issue}")
+            lines.append("")
+
+        # Warnings
+        if report.warnings:
+            lines.append("⚠️ WARNINGS (May affect functionality):")
+            for warning in report.warnings:
+                lines.append(f"   {warning}")
+            lines.append("")
+
+        # Quick fix suggestions (only for issues Synaptic couldn't fix)
+        lines.append("💡 MANUAL INTERVENTION NEEDED:")
+        if "Docker is not running" in str(report.critical_issues):
+            lines.append("   → Start Docker Desktop")
+        else:
+            lines.append("   → Check Docker logs: docker logs <container_name>")
+            lines.append("   → Try manual restart: docker compose -f context-dna/infra/docker-compose.yaml up -d")
+
+            if any("build" in str(a.message).lower() for a in report.remediation_results):
+                lines.append("   → May need to rebuild: docker compose build --no-cache <service>")
+
+        lines.extend([
+            "",
+            "╠══════════════════════════════════════════════════════════════════════╣",
+            "║  Synaptic tried to fix these issues but needs your help.             ║",
+            "╚══════════════════════════════════════════════════════════════════════╝"
+        ])
+
+        return "\n".join(lines)
+
+    def to_success_message(self, report: SystemHealthReport) -> Optional[str]:
+        """
+        Generate a brief success message when Synaptic fixed issues.
+
+        Only returns a message if issues were fixed.
+        """
+        if report.issues_fixed == 0:
+            return None
+
+        if report.issues_remaining > 0:
+            return None  # Will use barge_in instead
+
+        lines = [
+            "╔══════════════════════════════════════════════════════════════════════╗",
+            "║  ✅ SYNAPTIC AUTO-HEALED - Issues Fixed Proactively                  ║",
+            "╠══════════════════════════════════════════════════════════════════════╣",
+            "",
+        ]
+
+        for attempt in report.remediation_results:
+            if attempt.result == RemediationResult.SUCCESS:
+                lines.append(f"   ✅ {attempt.service}: {attempt.action} ({attempt.duration_ms}ms)")
+
+        lines.extend([
+            "",
+            f"   Synaptic fixed {report.issues_fixed} issue(s) automatically.",
+            "   System is now healthy. Continuing with your request...",
+            "",
+            "╚══════════════════════════════════════════════════════════════════════╝"
+        ])
+
+        return "\n".join(lines)
+
+    def get_health_summary(self) -> str:
+        """Get a brief health summary (for inclusion in other sections)."""
+        report = self.check_system_health(auto_fix=False)  # Quick check without fixing
+
+        if report.overall_status == HealthStatus.HEALTHY:
+            running = sum(1 for s in report.services if s.running)
+            return f"🟢 System healthy ({running} services running)"
+        elif report.overall_status == HealthStatus.DEGRADED:
+            return f"🟡 System degraded: {report.warnings[0] if report.warnings else 'Check services'}"
+        elif report.overall_status == HealthStatus.CRITICAL:
+            return f"🔴 CRITICAL: {report.critical_issues[0] if report.critical_issues else 'Services down'}"
+        else:
+            return "⚪ System status unknown"
+
+
+# Global instance
+_monitor = None
+
+
+def get_monitor() -> SynapticHealthMonitor:
+    """Get or create the global health monitor instance."""
+    global _monitor
+    if _monitor is None:
+        _monitor = SynapticHealthMonitor()
+    return _monitor
+
+
+def check_health(auto_fix: bool = True) -> SystemHealthReport:
+    """Check system health with optional auto-remediation."""
+    return get_monitor().check_system_health(auto_fix=auto_fix)
+
+
+def barge_in() -> Optional[str]:
+    """
+    Get Synaptic's barge-in message if there are issues.
+
+    This now ATTEMPTS FIXES FIRST, then only barges in if issues persist.
+    Returns None if everything is healthy (or was fixed).
+    """
+    report = check_health(auto_fix=True)
+
+    # If we fixed issues and everything is now healthy, return success message
+    if report.issues_fixed > 0 and report.issues_remaining == 0:
+        return get_monitor().to_success_message(report)
+
+    # Otherwise return barge-in message (or None if healthy)
+    return get_monitor().to_barge_in_message(report)
+
+
+def health_summary() -> str:
+    """Get brief health summary."""
+    return get_monitor().get_health_summary()
+
+
+if __name__ == "__main__":
+    import sys
+
+    monitor = SynapticHealthMonitor()
+
+    # Check for flags
+    auto_fix = "--no-fix" not in sys.argv
+    json_output = "--json" in sys.argv
+
+    report = monitor.check_system_health(auto_fix=auto_fix)
+
+    if json_output:
+        # JSON output for programmatic use
+        output = {
+            "overall_status": report.overall_status.value,
+            "critical_issues": report.critical_issues,
+            "warnings": report.warnings,
+            "timestamp": report.timestamp,
+            "should_barge_in": report.should_barge_in,
+            "remediation_attempted": report.remediation_attempted,
+            "issues_fixed": report.issues_fixed,
+            "issues_remaining": report.issues_remaining,
+            "remediation_results": [
+                {
+                    "service": r.service,
+                    "action": r.action,
+                    "result": r.result.value,
+                    "message": r.message,
+                    "duration_ms": r.duration_ms
+                }
+                for r in report.remediation_results
+            ],
+            "services": [
+                {
+                    "name": s.name,
+                    "status": s.status.value,
+                    "running": s.running,
+                    "healthy": s.healthy,
+                    "message": s.message,
+                    "importance": s.importance
+                }
+                for s in report.services
+            ]
+        }
+        print(json.dumps(output, indent=2))
+    else:
+        # Human-readable output
+
+        # Show success message if we fixed things
+        success_msg = monitor.to_success_message(report)
+        if success_msg:
+            print(success_msg)
+            print()
+
+        # Show barge-in if issues remain
+        barge_msg = monitor.to_barge_in_message(report)
+        if barge_msg:
+            print(barge_msg)
+        elif not success_msg:
+            print("╔══════════════════════════════════════════════════════════════════════╗")
+            print("║  ✅ SYNAPTIC HEALTH CHECK - All Systems Operational                  ║")
+            print("╚══════════════════════════════════════════════════════════════════════╝")
+            print()
+
+            # Show service summary
+            running = [s for s in report.services if s.running]
+            print(f"🟢 {len(running)}/{len(report.services)} services running")
+            print()
+
+            for s in report.services:
+                if s.running:
+                    icon = "✅" if s.healthy else "🟡"
+                    print(f"  {icon} {s.name}: {s.message}")
+                else:
+                    icon = "🔴" if s.importance == "critical" else "⚪"
+                    print(f"  {icon} {s.name}: {s.message}")

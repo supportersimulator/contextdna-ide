@@ -1,0 +1,136 @@
+# ===== SECRETS & ENVIRONMENT =====
+.env
+.env.local
+.env.production
+.env.staging
+# Keep the template
+!.env.example
+
+# API keys that may appear in config files
+*.key
+*.pem
+*.p12
+
+# ===== RUNTIME DATABASE & STATE =====
+memory/*.db
+memory/*.sqlite
+memory/*.db-shm
+memory/*.db-wal
+memory/.*.json
+memory/.work_log_archives/
+
+# Specific runtime state files
+.ab_testing_log.json
+.active_session_injections.json
+.agent_service_heartbeat.json
+.agent_service_startup.lock
+.auto_capture_state.json
+.brain_cache.json
+.context_ab_tracking.db
+.ecosystem_health_stderr.log
+.ecosystem_health_stdout.log
+.evidence_ledger_append_counters.json
+.evidence_ledger_redact_counters.json
+.failure_patterns.db
+.governance_kill_switch.json
+.heartbeat_config.json
+.hindsight_validator.db
+.hindsight_validator.db-shm
+.hindsight_validator.db-wal
+.session_index.db
+
+# ===== PERSONAL / PRIVATE DIRECTORIES =====
+google-drive-code/
+docs/reflect/
+docs/inbox/
+memory/family_wisdom/
+
+# ===== RUNTIME ARTIFACTS =====
+submissions/
+logs/
+artifacts/
+dashboard_exports/
+.fleet-messages/
+/tmp/
+
+# ===== ER SIMULATOR PRODUCT (separate repo) =====
+admin.ersimulator.com/
+ersim-voice-stack/
+backend/
+er-simulator/
+
+# ===== CUSTOMER / PII DATA =====
+# Any file that may contain customer emails, phones, or health data
+*.customer.json
+*.pii.*
+customer_data/
+
+# ===== PYTHON =====
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+.venv/
+venv/
+ENV/
+env/
+
+# ===== NODE / TYPESCRIPT =====
+node_modules/
+.npm
+.yarn-integrity
+*.tsbuildinfo
+.next/
+out/
+dist/
+
+# ===== MACOS =====
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+.Spotlight-V100
+.Trashes
+.fseventsd
+
+# ===== EDITORS =====
+.idea/
+.vscode/settings.json
+*.swp
+*.swo
+*~
+
+# ===== TESTING & COVERAGE =====
+.coverage
+htmlcov/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# ===== NATS / INFRA DATA =====
+nats-server.pid
+jetstream/
+
+# ===== LARGE BINARY ASSETS =====
+*.bin
+*.weights
+*.gguf
+*.onnx

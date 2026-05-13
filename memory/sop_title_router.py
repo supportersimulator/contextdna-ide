@@ -1,0 +1,700 @@
+"""
+SOP TITLE ROUTER - Study First, Then Route
+
+This module coordinates SOP title generation by:
+1. STUDYING the content to determine SOP type (bug-fix vs process)
+2. DETECTING if title is already formatted (enhance path) or raw (create path)
+3. ROUTING to the appropriate creator or enhancer
+
+PHILOSOPHY: Study before acting. Know what you're dealing with before choosing the tool.
+
+TYPE DETECTION uses multi-signal scoring:
+- Keyword weights (strong=3, medium=2, weak=1)
+- Contextual patterns (sentence structure analysis)
+- POTENTIAL LENGTH signals (growth vs finality):
+  * Growth signals → process (will accumulate routes over time)
+    "another way", "alternative", "preferred method", "depends on"
+  * Finality signals → bugfix (single solution, done)
+    "the fix was", "root cause was", "finally fixed", "culprit was"
+
+WHY POTENTIAL LENGTH MATTERS:
+- Bug-fix SOPs: Convergent → one problem, one fix, DONE
+- Process SOPs: Divergent → one goal, many routes, GROWS over time
+Content implying future growth routes to process; content implying
+single-answer finality routes to bugfix.
+
+Flow:
+    Content → Study → Detect Format → Route → Creator or Enhancer
+
+Usage:
+    from memory.sop_title_router import generate_sop_title
+
+    # Raw content - will create fresh title
+    title = generate_sop_title("Fixed timeout in API", "Added retry logic")
+    # → "[bug-fix SOP] Fixed timeout in API: timeout → add retry → responsive"
+
+    # Already formatted - will enhance if needed
+    title = generate_sop_title("[process SOP] Deploy app", "Used terraform")
+    # → "[process SOP] Deploy app: via (terraform) → deploy" (enhanced)
+
+Creators vs Enhancers:
+    - Creator: Raw task → Full structured title (always generates)
+    - Enhancer: Existing title → Improved if needed (may pass through)
+"""
+
+import re
+from typing import Optional, Tuple
+
+# =============================================================================
+# STUDY: Determine SOP Type
+# =============================================================================
+
+def study_sop_type(content: str) -> str:
+    """
+    Study content to determine if it describes a bug-fix or process.
+
+    This is THE decision point - all routing flows from this.
+
+    Uses SCORING approach with multiple signal types:
+    1. EXPLICIT TYPE HINT (overrides everything) - [EXPLICIT_TYPE:bugfix|process]
+    2. Keyword weights (strong=3, medium=2, weak=1)
+    3. Contextual patterns (sentence structure, regex)
+    4. Potential length signals (growth → process, finality → bugfix)
+
+    Higher score wins. Ties go to bugfix (safer to track problems).
+
+    Returns:
+        'bugfix' or 'process'
+    """
+    # === CHECK FOR EXPLICIT TYPE OVERRIDE ===
+    # Format: [EXPLICIT_TYPE:bugfix] or [EXPLICIT_TYPE:process]
+    # This is set by `brain.py success --type=X` for ambiguous cases
+    import re as _re
+    explicit_match = _re.search(r'\[EXPLICIT_TYPE:(bugfix|process)\]', content)
+    if explicit_match:
+        return explicit_match.group(1)
+
+    content_lower = content.lower()
+
+    # === SCORE BUGFIX INDICATORS ===
+    bugfix_score = 0
+
+    # Strong bugfix signals (weight 3)
+    strong_bugfix = ['crash', 'crashed', 'error', 'errors', 'exception', 'traceback', 'broken']
+    for word in strong_bugfix:
+        if re.search(r'\b' + re.escape(word) + r'\b', content_lower):
+            bugfix_score += 3
+
+    # Medium bugfix signals (weight 2)
+    medium_bugfix = ['fix', 'fixed', 'fail', 'failed', 'failing', 'bug', 'issue', 'wrong', 'timeout', 'hang', 'hung']
+    for word in medium_bugfix:
+        if re.search(r'\b' + re.escape(word) + r'\b', content_lower):
+            bugfix_score += 2
+
+    # Weak bugfix signals (weight 1)
+    weak_bugfix = ['missing', 'slow', 'stuck', 'latency', 'block', 'freeze']
+    for word in weak_bugfix:
+        if re.search(r'\b' + re.escape(word) + r'\b', content_lower):
+            bugfix_score += 1
+
+    # HTTP error codes (weight 2)
+    http_errors = ['500', '502', '503', '504', '400', '401', '403', '404']
+    for code in http_errors:
+        if code in content_lower:
+            bugfix_score += 2
+
+    # === SCORE PROCESS INDICATORS ===
+    process_score = 0
+
+    # Strong process signals (weight 3)
+    strong_process = ['deploy', 'install', 'setup', 'configure', 'migrate']
+    for word in strong_process:
+        if re.search(r'\b' + re.escape(word) + r'\b', content_lower):
+            process_score += 3
+
+    # Medium process signals (weight 2)
+    medium_process = ['backup', 'restore', 'create', 'build', 'update', 'upgrade']
+    for word in medium_process:
+        if re.search(r'\b' + re.escape(word) + r'\b', content_lower):
+            process_score += 2
+
+    # Weak process signals (weight 1)
+    weak_process = ['start', 'stop', 'restart', 'enable', 'disable', 'scale']
+    for word in weak_process:
+        if re.search(r'\b' + re.escape(word) + r'\b', content_lower):
+            process_score += 1
+
+    # === CONTEXTUAL PATTERNS (weight 2 each) ===
+    # These look at sentence structure, not just keywords
+
+    # Bugfix contextual patterns
+    bugfix_patterns = [
+        r'\b(why did|why does|why is)\b',           # Diagnostic questions
+        r'\b(caused by|due to|because of)\b',       # Causality (root cause)
+        r'\b(doesn\'t|didn\'t|won\'t|can\'t)\b',    # Negation (something wrong)
+        r'\b(after|when|whenever).*\b(crash|fail|error|break)',  # Temporal failure
+        r'\b(should have|was supposed to)\b',       # Expectation violation
+        r'\b(instead of|rather than)\b',            # Wrong behavior
+        r'\bno longer\b',                           # Regression
+        r'\b(deploy|setup|install|build|start|restart)\s+(fail|crash|error)',  # Process + failure
+        r'\b(fail|crash|error)\s+(during|after|on)\b',  # Failure timing
+    ]
+    for pattern in bugfix_patterns:
+        if re.search(pattern, content_lower):
+            bugfix_score += 2
+
+    # Process contextual patterns
+    process_patterns = [
+        r'\b(how to|how do|steps to|guide for)\b',  # Procedural questions
+        r'\b(in order to|so that|to enable)\b',     # Goal-oriented
+        r'\b(first|then|next|finally)\b',           # Sequential steps
+        r'\b(using|via|with|through)\b.*\b(tool|script|command)',  # Tool usage
+        r'\b(set up|spin up|stand up)\b',           # Infrastructure verbs
+        r'\b(new|add|create|implement)\b.*\b(feature|service|endpoint)',  # Creation
+    ]
+    for pattern in process_patterns:
+        if re.search(pattern, content_lower):
+            process_score += 2
+
+    # === POTENTIAL LENGTH / GROWTH SIGNALS (CONTEXTUALLY AWARE) ===
+    # Process SOPs are living documents that grow; bugfix SOPs are point-in-time
+    #
+    # KEY INSIGHT: Phrase meaning depends on tense and surrounding words:
+    #   "The alternative was to restart" → FINALITY (past tense = solution found)
+    #   "An alternative approach would be" → GROWTH (present/future = still considering)
+    #   "The only option" → FINALITY (single path)
+    #   "Another option" → GROWTH (multiple paths)
+
+    # --- GROWTH SIGNALS (process, weight 2) ---
+    # These indicate FUTURE optionality - the SOP will grow with more routes
+
+    growth_signals = [
+        # Forward-looking alternatives (present/future tense, indefinite article)
+        r'\b(an|another)\s+(alternative|route|option|way)\b', # "another route" = more routes
+        r'\balternative\s+(approaches?|methods?|ways?|routes?)\s+(is|are|would|could|include)\b',
+        r'\b(can|could|might)\s+also\b',                      # additional possibilities
+        r'\b(or|alternatively)\s+you\s+(can|could)\b',        # user has choices
+        r'\b(there are|here are)\s+(several|multiple|many)\b',  # explicit multiplicity
+        r'\b(best practice|recommended|preferred)\s+(is|to)\b',  # preferences exist
+        r'\bdepends\s+on\s+(the|your|which)\b',               # conditional routing
+        r'\b(choose|select)\s+(between|from|a)\b',            # decision required
+        r'\b(multiple|several|various)\s+(ways|methods|approaches|options|routes)\b',
+        r'\balternatives?\s+(include|are)\b',                 # "alternatives include"
+    ]
+
+    for pattern in growth_signals:
+        if re.search(pattern, content_lower):
+            process_score += 2
+
+    # --- FINALITY SIGNALS (bugfix, weight 2) ---
+    # These indicate PAST resolution - one problem, one fix, DONE
+
+    finality_signals = [
+        # Past-tense resolution (the answer was found)
+        r'\b(the|this)\s+(fix|solution|answer)\s+(was|is)\b',  # definite article + past
+        r'\balternative\s+was\s+to\b',                         # "alternative was" = that WAS the fix
+        r'\bthe\s+only\s+(option|way|solution)\b',             # single path, no growth
+        r'\bjust\s+(needed|had)\s+to\b',                       # minimal single action
+        r'\bonly\s+(needed|required|had)\s+to\b',              # single action sufficed
+        r'\b(root\s+cause|culprit|issue|problem)\s+was\b',     # diagnosis complete
+        r'\bturned\s+out\s+to\s+be\b',                         # discovery/finality
+        r'\bactually\s+(was|needed|required)\b',               # revelation of single cause
+        r'\b(finally|eventually)\s+(fixed|solved|resolved)\b', # search is over
+        r'\bthis\s+(fixed|solved|resolved)\s+(the|it)\b',      # solution applied
+        r'\bafter\s+.{0,20}\s+it\s+(worked|fixed)\b',          # action led to resolution
+    ]
+
+    for pattern in finality_signals:
+        if re.search(pattern, content_lower):
+            bugfix_score += 2
+
+    # --- AMBIGUITY BREAKERS (weight 1) ---
+    # These help when both growth and finality patterns fire
+
+    # Tense-aware modifiers that tip the scale
+    if re.search(r'\b(was|were|had been)\s+the\s+(only|single)\b', content_lower):
+        bugfix_score += 1  # Past definite = finality
+    if re.search(r'\b(is|are|will be)\s+(another|one)\s+option\b', content_lower):
+        process_score += 1  # Present/future indefinite = growth
+
+    # === DECIDE ===
+    # Higher score wins, ties go to bugfix (safer to track problems)
+    return 'bugfix' if bugfix_score >= process_score else 'process'
+
+
+def study_sop_type_with_confidence(content: str) -> tuple:
+    """
+    Study content to determine SOP type WITH confidence score.
+
+    Future-proofing: Returns confidence so callers can handle ambiguity.
+
+    Returns:
+        Tuple of (sop_type, confidence_percent)
+        - confidence >= 70: High confidence, use directly
+        - confidence 50-69: Medium confidence, may want user confirmation
+        - confidence < 50: Low confidence, suggest explicit tagging
+
+    Example:
+        sop_type, confidence = study_sop_type_with_confidence(text)
+        if confidence < 70:
+            print(f"⚠️ Low confidence ({confidence}%) - consider explicit --type flag")
+    """
+    content_lower = content.lower()
+
+    bugfix_score = 0
+    process_score = 0
+
+    # === KEYWORD SCORING (same as study_sop_type) ===
+    strong_bugfix = ['crash', 'crashed', 'error', 'errors', 'exception', 'traceback', 'broken']
+    for word in strong_bugfix:
+        if re.search(r'\b' + re.escape(word) + r'\b', content_lower):
+            bugfix_score += 3
+
+    medium_bugfix = ['fix', 'fixed', 'fail', 'failed', 'failing', 'bug', 'issue', 'wrong', 'timeout', 'hang', 'hung']
+    for word in medium_bugfix:
+        if re.search(r'\b' + re.escape(word) + r'\b', content_lower):
+            bugfix_score += 2
+
+    weak_bugfix = ['missing', 'slow', 'stuck', 'latency', 'block', 'freeze']
+    for word in weak_bugfix:
+        if re.search(r'\b' + re.escape(word) + r'\b', content_lower):
+            bugfix_score += 1
+
+    strong_process = ['deploy', 'install', 'setup', 'configure', 'migrate']
+    for word in strong_process:
+        if re.search(r'\b' + re.escape(word) + r'\b', content_lower):
+            process_score += 3
+
+    medium_process = ['backup', 'restore', 'create', 'build', 'update', 'upgrade']
+    for word in medium_process:
+        if re.search(r'\b' + re.escape(word) + r'\b', content_lower):
+            process_score += 2
+
+    weak_process = ['start', 'stop', 'restart', 'enable', 'disable', 'scale']
+    for word in weak_process:
+        if re.search(r'\b' + re.escape(word) + r'\b', content_lower):
+            process_score += 1
+
+    # === CONTEXTUAL GROWTH/FINALITY SCORING ===
+    growth_signals = [
+        r'\b(an|another)\s+(alternative|route|option|way)\b',
+        r'\balternative\s+(approaches?|methods?|ways?|routes?)\s+(is|are|would|could|include)\b',
+        r'\b(can|could|might)\s+also\b',
+        r'\b(there are|here are)\s+(several|multiple|many)\b',
+        r'\b(best practice|recommended|preferred)\s+(is|to)\b',
+        r'\b(multiple|several|various)\s+(ways|methods|approaches|options|routes)\b',
+        r'\balternatives?\s+(include|are)\b',
+    ]
+    for pattern in growth_signals:
+        if re.search(pattern, content_lower):
+            process_score += 2
+
+    finality_signals = [
+        r'\b(the|this)\s+(fix|solution|answer)\s+(was|is)\b',
+        r'\balternative\s+was\s+to\b',
+        r'\bthe\s+only\s+(option|way|solution)\b',
+        r'\b(root\s+cause|culprit|issue|problem)\s+was\b',
+        r'\bturned\s+out\s+to\s+be\b',
+        r'\b(finally|eventually)\s+(fixed|solved|resolved)\b',
+        r'\bthis\s+(fixed|solved|resolved)\s+(the|it)\b',
+    ]
+    for pattern in finality_signals:
+        if re.search(pattern, content_lower):
+            bugfix_score += 2
+
+    # === CALCULATE CONFIDENCE ===
+    total_score = bugfix_score + process_score
+    if total_score == 0:
+        # No signals at all - very low confidence
+        return ('process', 30)  # Default to process with low confidence
+
+    winning_score = max(bugfix_score, process_score)
+    margin = abs(bugfix_score - process_score)
+
+    # Confidence based on margin and total signals
+    # High margin + high total = high confidence
+    # Low margin (close scores) = low confidence
+    confidence = min(95, 50 + (margin * 10) + (total_score * 2))
+
+    sop_type = 'bugfix' if bugfix_score >= process_score else 'process'
+    return (sop_type, confidence)
+
+
+# =============================================================================
+# DETECT: Check if Already Formatted
+# =============================================================================
+
+def detect_format_state(task: str) -> str:
+    """
+    Detect if the task/title is already formatted or needs creation.
+
+    Returns:
+        'raw' - Needs fresh title creation
+        'partial' - Has some structure, may need enhancement
+        'complete' - Fully formatted, should pass through
+    """
+    # Check for complete formatting (tag + zones)
+    has_tag = task.startswith('[bug-fix SOP]') or task.startswith('[process SOP]')
+    has_arrows = '→' in task
+    has_zones = ':' in task and ('→' in task or '(' in task.split(':')[-1])
+
+    if has_tag and has_arrows and has_zones:
+        return 'complete'  # Fully formatted
+    elif has_tag or has_arrows:
+        return 'partial'   # Has some structure
+    else:
+        return 'raw'       # Needs creation
+
+
+# =============================================================================
+# ROUTE: Dispatch to Appropriate Handler
+# =============================================================================
+
+def generate_sop_title(task: str, details: str = None) -> str:
+    """
+    Main entry point - studies content, then routes to appropriate handler.
+
+    Flow:
+    1. STUDY: Analyze content to determine type (bug-fix vs process)
+    2. DETECT: Check format state (raw, partial, complete)
+    3. ROUTE: Call appropriate creator or enhancer
+
+    Args:
+        task: Task description or existing title
+        details: Additional context for zone extraction
+
+    Returns:
+        Formatted SOP title with appropriate tag and zones
+    """
+    combined = f"{task} {details or ''}"
+
+    # === STEP 1: STUDY - Determine SOP type ===
+    sop_type = study_sop_type(combined)
+
+    # === STEP 2: DETECT - Check format state ===
+    format_state = detect_format_state(task)
+
+    # === STEP 3: ROUTE - Dispatch to appropriate handler ===
+    if sop_type == 'bugfix':
+        if format_state == 'complete':
+            # Already complete - pass through
+            return task
+        elif format_state == 'partial':
+            # Needs enhancement
+            return enhance_bugfix_title(task, details)
+        else:
+            # Raw - needs creation
+            return create_bugfix_title(task, details)
+    else:
+        if format_state == 'complete':
+            # Already complete - pass through
+            return task
+        elif format_state == 'partial':
+            # Needs enhancement
+            return enhance_process_title(task, details)
+        else:
+            # Raw - needs creation
+            return create_process_title(task, details)
+
+
+# =============================================================================
+# BUG-FIX TITLE FUNCTIONS
+# =============================================================================
+
+def create_bugfix_title(task: str, details: str = None) -> str:
+    """
+    Create a fresh bug-fix SOP title from raw content.
+
+    Always generates full 6-zone structure:
+    [bug-fix SOP] [HEART]: bad_sign (antecedent) → fix (stack) → outcome
+
+    This is the CREATOR - assumes raw input, generates complete title.
+    """
+    # Import here to avoid circular imports
+    try:
+        from memory.bugfix_sop_enhancer import extract_bugfix_zones
+    except ImportError:
+        from bugfix_sop_enhancer import extract_bugfix_zones
+
+    combined = f"{task} {details or ''}"
+
+    # Generate heart (the descriptive core)
+    # For bug-fix, we use multi-candidate scoring
+    heart = _generate_bugfix_heart(task, details)
+
+    # Extract zones (bad_sign, antecedent, fix, stack, outcome)
+    zones = extract_bugfix_zones(combined)
+
+    # Combine
+    if zones:
+        title = f"{heart}: {zones}"
+    else:
+        title = heart
+
+    # Capitalize and add tag
+    if title:
+        title = title[0].upper() + title[1:]
+
+    return f"[bug-fix SOP] {title}"
+
+
+def enhance_bugfix_title(task: str, details: str = None) -> str:
+    """
+    Enhance an existing bug-fix title if needed.
+
+    This is the ENHANCER - checks if improvement needed, may pass through.
+
+    Only enhances if:
+    - Has tag but missing zones
+    - Has partial structure that can be improved
+
+    Passes through if already complete.
+    """
+    try:
+        from memory.bugfix_sop_enhancer import extract_bugfix_zones
+    except ImportError:
+        from bugfix_sop_enhancer import extract_bugfix_zones
+
+    combined = f"{task} {details or ''}"
+
+    # If already has arrows and zones, pass through
+    if '→' in task and ':' in task:
+        return task
+
+    # Extract existing heart (before colon if present)
+    if ':' in task:
+        heart = task.split(':')[0].strip()
+        # Remove tag if present for clean heart
+        heart = heart.replace('[bug-fix SOP]', '').strip()
+    else:
+        heart = task.replace('[bug-fix SOP]', '').strip()
+
+    # Extract zones from combined content
+    zones = extract_bugfix_zones(combined)
+
+    # Combine
+    if zones:
+        title = f"{heart}: {zones}"
+    else:
+        title = heart
+
+    # Capitalize
+    if title:
+        title = title[0].upper() + title[1:]
+
+    # Ensure tag
+    if not title.startswith('[bug-fix SOP]'):
+        title = f"[bug-fix SOP] {title}"
+
+    return title
+
+
+def _generate_bugfix_heart(task: str, details: str = None) -> str:
+    """
+    Generate the heart (core title) for a bug-fix SOP.
+
+    Bug-fix hearts capture the PROBLEM essence.
+    Uses multi-candidate scoring for best result.
+    """
+    # For now, use simple extraction - can be expanded
+    # Remove common filler and preserve the problem description
+
+    filler = {'the', 'a', 'an', 'is', 'was', 'were', 'been', 'have', 'has',
+              'successfully', 'completed', 'remember', 'fixed', 'resolved'}
+
+    words = task.split()
+    meaningful = [w for w in words if w.lower() not in filler]
+
+    if meaningful:
+        heart = ' '.join(meaningful[:8])  # Max 8 words
+    else:
+        heart = task[:60]
+
+    return heart.strip()
+
+
+# =============================================================================
+# PROCESS TITLE FUNCTIONS
+# =============================================================================
+
+def create_process_title(task: str, details: str = None) -> str:
+    """
+    Create a fresh process SOP title from raw content.
+
+    Always generates chain structure:
+    [process SOP] [GOAL]: via (tools) → step1 → step2 → ✓ verification
+
+    This is the CREATOR - assumes raw input, generates complete title.
+    """
+    try:
+        from memory.process_sop_enhancer import (
+            generate_goal_heart, extract_process_zones
+        )
+    except ImportError:
+        from process_sop_enhancer import (
+            generate_goal_heart, extract_process_zones
+        )
+
+    combined = f"{task} {details or ''}"
+
+    # Generate heart (the goal)
+    heart = generate_goal_heart(task)
+
+    # Extract zones (via, steps, verification)
+    zones = extract_process_zones(combined)
+
+    # Combine
+    if zones:
+        title = f"{heart}: {zones}"
+    else:
+        title = heart
+
+    # Capitalize and add tag
+    if title:
+        title = title[0].upper() + title[1:]
+
+    return f"[process SOP] {title}"
+
+
+def enhance_process_title(task: str, details: str = None) -> str:
+    """
+    Enhance an existing process title if needed.
+
+    This is the ENHANCER - checks if improvement needed, may pass through.
+
+    Only enhances if:
+    - Has tag but missing zones
+    - Has partial structure that can be improved
+
+    Passes through if already complete.
+    """
+    try:
+        from memory.process_sop_enhancer import extract_process_zones
+    except ImportError:
+        from process_sop_enhancer import extract_process_zones
+
+    combined = f"{task} {details or ''}"
+
+    # If already has arrows and zones, pass through
+    if '→' in task and ':' in task:
+        return task
+
+    # Extract existing heart (before colon if present)
+    if ':' in task:
+        heart = task.split(':')[0].strip()
+        # Remove tag if present for clean heart
+        heart = heart.replace('[process SOP]', '').strip()
+    else:
+        heart = task.replace('[process SOP]', '').strip()
+
+    # Extract zones from combined content
+    zones = extract_process_zones(combined)
+
+    # Combine
+    if zones:
+        title = f"{heart}: {zones}"
+    else:
+        title = heart
+
+    # Capitalize
+    if title:
+        title = title[0].upper() + title[1:]
+
+    # Ensure tag
+    if not title.startswith('[process SOP]'):
+        title = f"[process SOP] {title}"
+
+    return title
+
+
+# =============================================================================
+# CLI
+# =============================================================================
+
+def main():
+    """CLI for testing the router."""
+    import sys
+
+    if len(sys.argv) < 2:
+        print("Usage: python sop_title_router.py <command> [args]")
+        print("")
+        print("Commands:")
+        print("  study <text>           Study content to determine SOP type")
+        print("  detect <text>          Detect format state of title")
+        print("  generate <task> [details]  Generate SOP title (smart routing)")
+        print("  test                   Run test cases")
+        sys.exit(1)
+
+    cmd = sys.argv[1]
+
+    if cmd == "study":
+        if len(sys.argv) < 3:
+            print("Usage: python sop_title_router.py study <text>")
+            sys.exit(1)
+        text = ' '.join(sys.argv[2:])
+        sop_type = study_sop_type(text)
+        print(f"SOP Type: {sop_type}")
+
+    elif cmd == "detect":
+        if len(sys.argv) < 3:
+            print("Usage: python sop_title_router.py detect <text>")
+            sys.exit(1)
+        text = ' '.join(sys.argv[2:])
+        state = detect_format_state(text)
+        print(f"Format State: {state}")
+
+    elif cmd == "generate":
+        if len(sys.argv) < 3:
+            print("Usage: python sop_title_router.py generate <task> [details]")
+            sys.exit(1)
+        task = sys.argv[2]
+        details = sys.argv[3] if len(sys.argv) > 3 else None
+        title = generate_sop_title(task, details)
+        print(title)
+
+    elif cmd == "test":
+        print("=== SOP TITLE ROUTER TESTS ===\n")
+
+        test_cases = [
+            # Raw bug-fix (should CREATE)
+            ("Fixed timeout error", "Added retry logic", "bugfix", "raw"),
+            ("Container crash on startup", "Missing HOME env", "bugfix", "raw"),
+
+            # Raw process (should CREATE)
+            ("Deploy Django to production", "systemctl restart", "process", "raw"),
+            ("Backup database", "pg_dump to S3", "process", "raw"),
+
+            # Partial bug-fix (should ENHANCE)
+            ("[bug-fix SOP] Fixed timeout", "Added retry", "bugfix", "partial"),
+
+            # Partial process (should ENHANCE)
+            ("[process SOP] Deploy app", "terraform apply", "process", "partial"),
+
+            # Complete (should PASS THROUGH)
+            ("[bug-fix SOP] Fixed timeout: error → retry → working", None, "bugfix", "complete"),
+            ("[process SOP] Deploy: via (terraform) → deploy → ✓ healthy", None, "process", "complete"),
+        ]
+
+        for task, details, expected_type, expected_state in test_cases:
+            combined = f"{task} {details or ''}"
+            actual_type = study_sop_type(combined)
+            actual_state = detect_format_state(task)
+
+            type_ok = "✓" if actual_type == expected_type else "✗"
+            state_ok = "✓" if actual_state == expected_state else "✗"
+
+            print(f"{type_ok} Type: {actual_type} (expected: {expected_type})")
+            print(f"{state_ok} State: {actual_state} (expected: {expected_state})")
+
+            title = generate_sop_title(task, details)
+            print(f"  Input: {task[:50]}...")
+            print(f"  Output: {title[:70]}...")
+            print()
+
+    else:
+        print(f"Unknown command: {cmd}")
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()

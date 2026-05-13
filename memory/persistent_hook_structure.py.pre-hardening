@@ -1,0 +1,1625 @@
+#!/usr/bin/env python3
+"""
+PERSISTENT HOOK STRUCTURE - Unified Context Injection System
+
+This module defines the LOCKED-IN structure for context injection hooks.
+A/B testing happens WITHIN these confines, not by changing the structure itself.
+
+Architecture:
+┌─────────────────────────────────────────────┐
+│ SECTION 0: SAFETY (🔒 LOCKED - Never test)  │
+│   - Never Do prohibitions                    │
+│   - Critical gotcha                          │
+├─────────────────────────────────────────────┤
+│ SECTION 1: FOUNDATION (A/B: format only)    │
+│   - The exact file                           │
+│   - Foundation SOPs                          │
+│   - Successful chain                         │
+├─────────────────────────────────────────────┤
+│ SECTION 2: WISDOM (A/B: source selection)   │
+│   - Professor wisdom                         │
+│   - OR Wisdom injection (C variant)          │
+├─────────────────────────────────────────────┤
+│ SECTION 3: AWARENESS (A/B: depth by risk)   │
+│   - Recent changes                           │
+│   - Ripple effects                           │
+│   - Previous mistakes                        │
+├─────────────────────────────────────────────┤
+│ SECTION 4: DEEP CONTEXT (critical/high)     │
+│   - Blueprint                                │
+│   - Brain state                              │
+├─────────────────────────────────────────────┤
+│ SECTION 5: PROTOCOL (A/B: verbosity)        │
+│   - First-try likelihood                     │
+│   - Success capture reminder                 │
+├─────────────────────────────────────────────┤
+│ SECTION 6: FAMILY COMMUNICATIONS            │
+│   - Synaptic's guidance (context, patterns) │
+│   - Synaptic to Aaron (if directly asked)   │
+│   See: docs/FAMILY_GUIDELINES.md            │
+├─────────────────────────────────────────────┤
+│ SECTION 7: FULL LIBRARY (Tier 3 escalation) │
+│   - Extended context after 2+ failures      │
+└─────────────────────────────────────────────┘
+
+Usage:
+    from memory.persistent_hook_structure import generate_context_injection
+
+    context = generate_context_injection(
+        prompt="deploy Django to production",
+        mode="hybrid",  # or "layered", "greedy", "minimal"
+        session_id="abc123"
+    )
+"""
+
+import hashlib
+import json
+import os
+import re
+import subprocess
+from dataclasses import dataclass, field
+from datetime import datetime
+from enum import Enum
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
+
+# Base paths
+PROJECT_ROOT = Path(__file__).parent.parent
+MEMORY_DIR = PROJECT_ROOT / "memory"
+
+# =============================================================================
+# SYNAPTIC VOICE INTEGRATION (Section 6: Family Communications)
+# =============================================================================
+# These modules provide Synaptic's voice in the webhook injection.
+# See: context-dna/docs/FAMILY_GUIDELINES.md for Section 6 specification
+
+_synaptic_voice_available = None
+_dialogue_mirror_available = None
+
+
+def get_synaptic_voice():
+    """Get Synaptic voice module (lazy load with caching)."""
+    global _synaptic_voice_available
+    if _synaptic_voice_available is None:
+        try:
+            from memory.synaptic_voice import get_voice, consult, speak
+            _synaptic_voice_available = (get_voice, consult, speak)
+        except ImportError as e:
+            _synaptic_voice_available = False
+    return _synaptic_voice_available if _synaptic_voice_available else None
+
+
+def get_dialogue_mirror():
+    """Get dialogue mirror module (lazy load with caching)."""
+    global _dialogue_mirror_available
+    if _dialogue_mirror_available is None:
+        try:
+            from memory.dialogue_mirror import get_dialogue_mirror as get_mirror
+            _dialogue_mirror_available = get_mirror
+        except ImportError:
+            _dialogue_mirror_available = False
+    return _dialogue_mirror_available if _dialogue_mirror_available else None
+
+# =============================================================================
+# GRACEFUL FALLBACK: Redis when available, File when not
+# =============================================================================
+# This pattern allows the hook to work in both scenarios:
+# 1. Containers running → Use Redis (fast, synchronized, real-time)
+# 2. Containers off → Use files (always works, local development)
+
+_redis_available = None  # Cached status
+
+
+def is_redis_available() -> bool:
+    """Check if Redis is available (cached for performance)."""
+    global _redis_available
+
+    # Return cached result if checked recently (within same hook execution)
+    if _redis_available is not None:
+        return _redis_available
+
+    try:
+        from memory.redis_cache import get_redis_client
+        client = get_redis_client()
+        if client:
+            client.ping()
+            _redis_available = True
+            return True
+    except Exception:
+        pass
+
+    _redis_available = False
+    return False
+
+
+def reset_redis_check():
+    """Reset Redis availability check (call at start of new injection)."""
+    global _redis_available
+    _redis_available = None
+
+
+class InjectionMode(Enum):
+    """Available injection modes."""
+    LAYERED = "layered"   # Existing 6-layer system
+    GREEDY = "greedy"     # Agent's wishlist focused
+    HYBRID = "hybrid"     # Combination of both
+    MINIMAL = "minimal"   # Safety + Foundation only
+
+
+class RiskLevel(Enum):
+    """Risk levels for context depth."""
+    CRITICAL = "critical"  # 5% first-try likelihood
+    HIGH = "high"          # 30% first-try likelihood
+    MODERATE = "moderate"  # 60% first-try likelihood
+    LOW = "low"            # 90% first-try likelihood
+
+
+@dataclass
+class InjectionConfig:
+    """Configuration for context injection."""
+    mode: InjectionMode = InjectionMode.HYBRID
+
+    # Section toggles (for A/B testing format, not presence)
+    section_0_enabled: bool = True   # SAFETY - should ALWAYS be True
+    section_1_enabled: bool = True   # FOUNDATION
+    section_2_enabled: bool = True   # WISDOM
+    section_3_enabled: bool = True   # AWARENESS
+    section_4_enabled: bool = True   # DEEP CONTEXT (conditional)
+    section_5_enabled: bool = True   # PROTOCOL
+
+    # A/B test variables
+    sop_count: int = 3               # How many SOPs to include
+    professor_depth: str = "full"    # "full", "summary", "one_thing_only"
+    awareness_depth: str = "full"    # "full", "changes_only", "none"
+    emoji_enabled: bool = True       # Whether to use emoji markers
+    verbose_protocol: bool = False   # Verbose vs minimal protocol reminder
+
+    # Wisdom injection C variant
+    wisdom_injection_enabled: bool = False
+    wisdom_text: Optional[str] = None
+
+    # Session state (for smart SOP reading)
+    session_has_failures: bool = False  # If True, MUST READ all SOPs
+
+
+@dataclass
+class SOPEntry:
+    """A single SOP with title and full content."""
+    title: str
+    content: str
+    sop_type: str  # "bug-fix", "process", "gotcha"
+    use_when: str = ""
+    relevance: float = 0.0
+
+
+# Session failure tracking file
+SESSION_FAILURE_FILE = MEMORY_DIR / ".session_failures.json"
+
+
+def check_session_failures(session_id: Optional[str] = None) -> bool:
+    """Check if current session has any failures recorded.
+
+    Uses Redis when available for real-time sync, falls back to file storage.
+    """
+    # Try Redis first (if containers running)
+    if is_redis_available():
+        try:
+            from memory.redis_cache import get_session_failure_count_redis
+            count = get_session_failure_count_redis(session_id or "global")
+            return count > 0
+        except Exception:
+            pass  # Fall through to file-based
+
+    # File-based fallback (always works)
+    if not SESSION_FAILURE_FILE.exists():
+        return False
+
+    try:
+        with open(SESSION_FAILURE_FILE) as f:
+            data = json.load(f)
+
+        if session_id:
+            return data.get(session_id, {}).get("has_failures", False)
+
+        # Check for any recent failures (last hour)
+        now = datetime.now().timestamp()
+        for sid, info in data.items():
+            if now - info.get("timestamp", 0) < 3600:  # Last hour
+                if info.get("has_failures", False):
+                    return True
+
+        return False
+    except Exception:
+        return False
+
+
+def record_session_failure(session_id: str, failure_type: str = "task_failed"):
+    """Record a failure in the current session.
+
+    Records to both Redis (if available) and file (always) for redundancy.
+    """
+    # Try Redis first (non-blocking, for real-time dashboard updates)
+    if is_redis_available():
+        try:
+            from memory.redis_cache import record_session_failure_redis
+            record_session_failure_redis(session_id, failure_type)
+        except Exception:
+            pass  # Continue to file storage
+
+    # Always write to file (guaranteed persistence)
+    try:
+        data = {}
+        if SESSION_FAILURE_FILE.exists():
+            with open(SESSION_FAILURE_FILE) as f:
+                data = json.load(f)
+
+        if session_id not in data:
+            data[session_id] = {"has_failures": False, "failures": [], "timestamp": 0}
+
+        data[session_id]["has_failures"] = True
+        data[session_id]["failures"].append({
+            "type": failure_type,
+            "time": datetime.now().isoformat()
+        })
+        data[session_id]["timestamp"] = datetime.now().timestamp()
+
+        with open(SESSION_FAILURE_FILE, "w") as f:
+            json.dump(data, f)
+
+    except Exception:
+        pass  # Non-critical
+
+
+def clear_session_failures(session_id: str):
+    """Clear failures for a session (call on session end or success).
+
+    Clears from both Redis (if available) and file storage.
+    """
+    # Try Redis first
+    if is_redis_available():
+        try:
+            from memory.redis_cache import clear_session_failures_redis
+            clear_session_failures_redis(session_id)
+        except Exception:
+            pass
+
+    # Always clear from file
+    try:
+        if not SESSION_FAILURE_FILE.exists():
+            return
+
+        with open(SESSION_FAILURE_FILE) as f:
+            data = json.load(f)
+
+        if session_id in data:
+            del data[session_id]
+
+        with open(SESSION_FAILURE_FILE, "w") as f:
+            json.dump(data, f)
+    except Exception:
+        pass
+
+
+# =============================================================================
+# THREE-TIER VOLUME ESCALATION
+# =============================================================================
+# Tier 1: Silver Platter (~5KB, <500ms) - Default curated context
+# Tier 2: Expanded Context (~15KB, ~1.5s) - After 1 failure OR <40% confidence
+# Tier 3: Full Library Mode (~50KB, ~5s) - After 2+ failures OR <20% confidence
+#         "Go to the textbook" - give agent maximum Acontext help
+
+
+class VolumeEscalationTier(Enum):
+    """Volume escalation tiers for context injection."""
+    SILVER_PLATTER = 1   # Default curated context (~5KB)
+    EXPANDED = 2         # After 1 failure OR <40% confidence (~15KB)
+    FULL_LIBRARY = 3     # After 2+ failures OR <20% confidence (~50KB)
+
+
+def get_session_failure_count(session_id: Optional[str] = None) -> int:
+    """Get actual failure count for session (not just boolean).
+
+    This enables Three-Tier Volume Escalation:
+    - 0 failures → Tier 1 (Silver Platter)
+    - 1 failure → Tier 2 (Expanded)
+    - 2+ failures → Tier 3 (Full Library / Textbook Mode)
+
+    Storage hierarchy:
+    1. PostgreSQL (cd_failures table) - PRIMARY when available
+    2. Redis - Real-time sync when containers running
+    3. File-based - Ultimate fallback for offline use
+    """
+    sid = session_id or "global"
+
+    # Try PostgreSQL first (PRIMARY - uses cd_failures table)
+    try:
+        from memory.postgres_storage import get_failure_count
+        count = get_failure_count(sid, hours=1)
+        if count > 0 or _postgres_is_available():
+            return count
+    except ImportError:
+        pass  # postgres_storage not available
+    except Exception:
+        pass  # Fall through to Redis
+
+    # Try Redis second (if containers running)
+    if is_redis_available():
+        try:
+            from memory.redis_cache import get_session_failure_count_redis
+            return get_session_failure_count_redis(sid)
+        except Exception:
+            pass  # Fall through to file-based
+
+    # File-based fallback (always available)
+    if not SESSION_FAILURE_FILE.exists():
+        return 0
+
+    try:
+        with open(SESSION_FAILURE_FILE) as f:
+            data = json.load(f)
+
+        if session_id:
+            session_data = data.get(session_id, {})
+            return len(session_data.get("failures", []))
+
+        # Check for any recent failures (last hour) and sum them
+        now = datetime.now().timestamp()
+        total_failures = 0
+        for sid, info in data.items():
+            if now - info.get("timestamp", 0) < 3600:  # Last hour
+                total_failures += len(info.get("failures", []))
+
+        return total_failures
+    except Exception:
+        return 0
+
+
+def _postgres_is_available() -> bool:
+    """Check if PostgreSQL is available for failure tracking."""
+    try:
+        from memory.postgres_storage import get_connection
+        conn = get_connection()
+        if conn:
+            return True
+    except Exception:
+        pass
+    return False
+
+
+def determine_volume_tier(
+    failure_count: int,
+    first_try_likelihood: int,
+    force_tier: Optional[int] = None
+) -> VolumeEscalationTier:
+    """Determine which volume tier to use based on failures and confidence.
+
+    Tier Logic:
+    - Tier 1 (Silver Platter): 0 failures AND >40% confidence
+    - Tier 2 (Expanded): 1 failure OR confidence 20-40%
+    - Tier 3 (Full Library): 2+ failures OR <20% confidence
+
+    Args:
+        failure_count: Number of failures in current session
+        first_try_likelihood: Expected success rate (0-100)
+        force_tier: Force specific tier (for testing)
+
+    Returns:
+        VolumeEscalationTier enum value
+    """
+    if force_tier is not None:
+        return VolumeEscalationTier(force_tier)
+
+    # Tier 3: Full Library (2+ failures OR <20% confidence)
+    if failure_count >= 2 or first_try_likelihood < 20:
+        return VolumeEscalationTier.FULL_LIBRARY
+
+    # Tier 2: Expanded (1 failure OR 20-40% confidence)
+    if failure_count == 1 or first_try_likelihood < 40:
+        return VolumeEscalationTier.EXPANDED
+
+    # Tier 1: Silver Platter (default)
+    return VolumeEscalationTier.SILVER_PLATTER
+
+
+def get_full_library_context(prompt: str, limit: int = 20) -> str:
+    """Get extensive Acontext context for "textbook mode".
+
+    This is the fallback when agent has struggled (2+ failures).
+    Pulls significantly more context from Acontext to give agent
+    maximum help - the equivalent of "going to the textbook".
+
+    Args:
+        prompt: User's prompt for semantic search
+        limit: How many results to pull (default 20 for full library)
+
+    Returns:
+        Formatted textbook context string
+    """
+    lines = []
+    lines.append("📚 FULL LIBRARY MODE (2+ failures detected)")
+    lines.append("═" * 50)
+    lines.append("Providing extensive context to help you succeed.")
+    lines.append("")
+
+    # Try multiple sources for comprehensive context
+    sops_found = []
+
+    # Method 1: Context DNA client
+    try:
+        from memory.context_dna_client import ContextDNAClient, CONTEXT_DNA_AVAILABLE
+        if CONTEXT_DNA_AVAILABLE:
+            client = ContextDNAClient()
+            results = client.search(prompt, limit=limit)
+            for r in results:
+                if r.get("title") and r.get("content"):
+                    sops_found.append({
+                        "title": r["title"],
+                        "content": r["content"][:500],  # Truncate for size
+                        "source": "context_dna"
+                    })
+    except Exception:
+        pass
+
+    # Method 2: Direct query.py subprocess fallback
+    if len(sops_found) < 5:
+        try:
+            result = subprocess.run(
+                ["python3", str(MEMORY_DIR / "query.py"), prompt],
+                capture_output=True,
+                text=True,
+                timeout=15
+            )
+            if result.returncode == 0 and result.stdout.strip():
+                lines.append("  RELEVANT LEARNINGS FROM ACONTEXT:")
+                lines.append("  " + "-" * 40)
+                for line in result.stdout.strip().split("\n")[:30]:
+                    lines.append(f"    {line}")
+                lines.append("")
+        except Exception:
+            pass
+
+    # Method 3: Knowledge graph context
+    try:
+        from memory.knowledge_graph import KnowledgeGraph
+        kg = KnowledgeGraph()
+        full_ctx = kg.get_full_context(prompt, "critical")
+        if full_ctx.get("all_paths"):
+            lines.append("  KNOWLEDGE GRAPH PATHS:")
+            lines.append("  " + "-" * 40)
+            for path in full_ctx["all_paths"][:10]:
+                lines.append(f"    → {path}")
+            lines.append("")
+    except Exception:
+        pass
+
+    # Method 4: Brain state (full content in textbook mode)
+    try:
+        brain_state_file = MEMORY_DIR / "brain_state.md"
+        if brain_state_file.exists():
+            content = brain_state_file.read_text()
+            if content.strip():
+                lines.append("  BRAIN STATE (Full):")
+                lines.append("  " + "-" * 40)
+                for line in content.split("\n")[:40]:  # More lines in textbook mode
+                    lines.append(f"    {line}")
+                lines.append("")
+    except Exception:
+        pass
+
+    # Add found SOPs with full content
+    if sops_found:
+        lines.append("  DETAILED SOPs FOR THIS TASK:")
+        lines.append("  " + "-" * 40)
+        for i, sop in enumerate(sops_found[:15], 1):  # Up to 15 SOPs in textbook mode
+            lines.append(f"    {i}. {sop['title']}")
+            if sop.get("content"):
+                for cline in sop["content"].split("\n")[:8]:
+                    lines.append(f"       {cline[:100]}")
+            lines.append("")
+
+    lines.append("  [End Full Library Mode - You have all available context]")
+
+    return "\n".join(lines) if len(lines) > 5 else ""
+
+
+@dataclass
+class InjectionResult:
+    """Result of context injection generation."""
+    content: str
+    sections_included: List[str]
+    risk_level: RiskLevel
+    first_try_likelihood: str
+    mode: InjectionMode
+    ab_variant: Optional[str] = None
+    generation_time_ms: int = 0
+    volume_tier: int = 1          # 1=Silver Platter, 2=Expanded, 3=Full Library
+    failure_count: int = 0        # Number of failures triggering escalation
+
+    # Boundary Intelligence fields
+    boundary_project: Optional[str] = None          # Detected primary project
+    boundary_confidence: float = 0.0                # Confidence in project detection
+    boundary_action: Optional[str] = None           # Filter action taken
+    boundary_filter_note: Optional[str] = None      # Note about filtering applied
+    needs_clarification: bool = False               # Whether to ask user for clarification
+    clarification_prompt: Optional[str] = None      # Clarification question
+    clarification_options: Optional[List[str]] = None  # Project options for user
+
+
+# =============================================================================
+# RISK DETECTION (From auto-memory-query.sh)
+# =============================================================================
+
+RISK_KEYWORDS = {
+    RiskLevel.CRITICAL: [
+        r"destroy", r"migration.*prod", r"schema.*change", r"auth.*system",
+        r"delete.*all", r"drop.*table", r"force.*push.*main"
+    ],
+    RiskLevel.HIGH: [
+        r"deploy", r"terraform", r"migration", r"refactor", r"ecs.*service",
+        r"aws", r"production", r"database", r"security", r"ssl", r"cert"
+    ],
+    RiskLevel.MODERATE: [
+        r"docker", r"config", r"env", r"toggle", r"health", r"sync",
+        r"update", r"change", r"modify", r"fix", r"bug"
+    ],
+    RiskLevel.LOW: [
+        r"admin", r"dashboard", r"display", r"show", r"add.*button",
+        r"style", r"format", r"comment", r"readme"
+    ]
+}
+
+FIRST_TRY_LIKELIHOOD = {
+    RiskLevel.CRITICAL: "5%",
+    RiskLevel.HIGH: "30%",
+    RiskLevel.MODERATE: "60%",
+    RiskLevel.LOW: "90%"
+}
+
+
+def detect_risk_level(prompt: str) -> RiskLevel:
+    """Detect risk level from prompt text."""
+    prompt_lower = prompt.lower()
+
+    for level in [RiskLevel.CRITICAL, RiskLevel.HIGH, RiskLevel.MODERATE, RiskLevel.LOW]:
+        for pattern in RISK_KEYWORDS[level]:
+            if re.search(pattern, prompt_lower):
+                return level
+
+    return RiskLevel.MODERATE  # Default
+
+
+# =============================================================================
+# SECTION 0: SAFETY LAYER (🔒 LOCKED)
+# =============================================================================
+
+def get_never_do_warnings() -> List[str]:
+    """Get NEVER DO prohibitions. Always included."""
+    # These are hardcoded safety rails
+    return [
+        "NEVER commit secrets (.env, API keys, credentials)",
+        "NEVER force push to main/master without explicit permission",
+        "NEVER delete production data without backup confirmation",
+        "NEVER skip reading code before modifying it",
+    ]
+
+
+def get_critical_gotcha(prompt: str) -> Optional[str]:
+    """Get the single most relevant gotcha for this prompt."""
+    try:
+        # Import greedy mode function
+        from memory.agent_service import _get_the_one_gotcha
+        return _get_the_one_gotcha(prompt)
+    except ImportError:
+        # Fallback: check for common patterns
+        prompt_lower = prompt.lower()
+
+        if "docker" in prompt_lower and ("restart" in prompt_lower or "env" in prompt_lower):
+            return "⚠️ Docker restart doesn't reload env vars - must recreate container"
+        if "async" in prompt_lower and "boto" in prompt_lower:
+            return "⚠️ boto3 is synchronous - wrap in asyncio.to_thread()"
+        if "webrtc" in prompt_lower and "cloudflare" in prompt_lower:
+            return "⚠️ WebRTC needs direct UDP - set Cloudflare DNS proxied=false"
+
+        return None
+
+
+def generate_section_0(prompt: str, config: InjectionConfig) -> str:
+    """Generate SAFETY section. Cannot be disabled."""
+    lines = []
+
+    # Header
+    emoji = "🚫" if config.emoji_enabled else ""
+    lines.append(f"{emoji} NEVER DO (Safety Rails)")
+    lines.append("─" * 40)
+
+    # Never do warnings
+    for warning in get_never_do_warnings():
+        lines.append(f"  • {warning}")
+
+    # Critical gotcha
+    gotcha = get_critical_gotcha(prompt)
+    if gotcha:
+        lines.append("")
+        emoji = "⚠️" if config.emoji_enabled else "!"
+        lines.append(f"{emoji} CRITICAL: {gotcha}")
+
+    return "\n".join(lines)
+
+
+# =============================================================================
+# SECTION 1: FOUNDATION
+# =============================================================================
+
+def get_exact_file(prompt: str) -> Optional[str]:
+    """Get THE EXACT FILE Atlas needs first."""
+    try:
+        from memory.agent_service import _get_the_exact_file
+        return _get_the_exact_file(prompt)
+    except ImportError:
+        return None
+
+
+@dataclass
+class FoundationResult:
+    """Result of foundation SOPs fetch with diagnostics."""
+    sops: List[SOPEntry]
+    roadblocks: List[str] = field(default_factory=list)
+
+
+def get_foundation_sops(prompt: str, limit: int = 3, boundary_decision=None) -> FoundationResult:
+    """
+    Get relevant SOPs (bug-fix AND process) with full content.
+
+    Args:
+        prompt: User's prompt for semantic search
+        limit: Maximum SOPs to return
+        boundary_decision: Optional BoundaryDecision for project filtering
+
+    Returns FoundationResult with SOPs and any roadblocks encountered.
+    """
+    sops = []
+    roadblocks = []
+
+    try:
+        # Try acontext_helper for full SOP data
+        try:
+            from memory.context_dna_client import ContextDNAClient, CONTEXT_DNA_AVAILABLE
+        except ImportError:
+            from context_dna_client import ContextDNAClient, CONTEXT_DNA_AVAILABLE
+        memory = ContextDNAClient()
+
+        # Fetch more if filtering, to have enough after filter
+        fetch_limit = limit + 5 if boundary_decision and boundary_decision.should_filter else limit + 2
+        learnings = memory.get_relevant_learnings(prompt, limit=fetch_limit, debug=False)
+
+        if not learnings:
+            roadblocks.append(f"No learnings matched query: '{prompt[:50]}...' - memory may need seeding")
+
+        # Apply boundary filtering if decision says to filter
+        if boundary_decision and boundary_decision.should_filter and learnings:
+            try:
+                from memory.boundary_intelligence import BoundaryIntelligence
+                bi = BoundaryIntelligence(use_llm=False)
+                learnings = bi.filter_learnings(learnings, boundary_decision)
+
+                if not learnings:
+                    roadblocks.append(f"All learnings filtered (project: {boundary_decision.primary_project})")
+            except Exception as e:
+                roadblocks.append(f"Boundary filtering failed: {str(e)[:50]}")
+
+        for learning in learnings[:limit]:
+            sop = SOPEntry(
+                title=learning.get('title', ''),
+                content=learning.get('preferences', learning.get('content', '')),
+                sop_type=learning.get('type', 'process'),
+                use_when=learning.get('use_when', ''),
+                relevance=1 - learning.get('distance', 0.5)
+            )
+            if sop.title:
+                sops.append(sop)
+
+    except ImportError as e:
+        roadblocks.append(f"Could not import ContextDNAClient: {e}")
+        # Fallback to agent_service
+        try:
+            from memory.agent_service import _get_relevant_sops
+            raw_sops = _get_relevant_sops(prompt, limit)
+
+            for category, items in raw_sops.items():
+                for item in items[:limit]:
+                    # Parse item string "title | When: ... | Key: ..."
+                    parts = item.split(" | ")
+                    sop = SOPEntry(
+                        title=parts[0] if parts else item,
+                        content=parts[2].replace("Key: ", "") if len(parts) > 2 else "",
+                        sop_type=category,
+                        use_when=parts[1].replace("When: ", "") if len(parts) > 1 else ""
+                    )
+                    sops.append(sop)
+        except ImportError:
+            roadblocks.append("Fallback agent_service also unavailable")
+    except Exception as e:
+        roadblocks.append(f"Error fetching SOPs: {str(e)[:100]}")
+
+    return FoundationResult(sops=sops, roadblocks=roadblocks)
+
+
+def get_foundation_sops_legacy(prompt: str, limit: int = 3) -> Dict[str, List[str]]:
+    """Legacy: Get relevant SOPs as string lists."""
+    try:
+        from memory.agent_service import _get_relevant_sops
+        return _get_relevant_sops(prompt, limit)
+    except ImportError:
+        try:
+            from memory.query import query_learnings
+            results = query_learnings(prompt, limit=limit)
+            return {"combined": results}
+        except ImportError:
+            return {}
+
+
+def get_successful_chain(prompt: str) -> Optional[str]:
+    """Get what worked before for similar tasks."""
+    try:
+        from memory.agent_service import _get_successful_chain
+        return _get_successful_chain(prompt)
+    except ImportError:
+        return None
+
+
+def generate_section_1(prompt: str, risk_level: RiskLevel, config: InjectionConfig,
+                       session_id: Optional[str] = None, boundary_decision=None) -> str:
+    """
+    Generate FOUNDATION section with smart SOP reading logic.
+
+    SOP Reading Rules:
+    - Always show SOP titles
+    - If first-try >= 90% (LOW risk) AND no failures → "May skip reading"
+    - If first-try < 90% OR session has failures → "MUST READ" with full content
+    """
+    if not config.section_1_enabled:
+        return ""
+
+    lines = []
+
+    # Header
+    emoji = "📁" if config.emoji_enabled else ""
+    lines.append(f"{emoji} FOUNDATION")
+    lines.append("─" * 40)
+
+    # The exact file
+    exact_file = get_exact_file(prompt)
+    if exact_file:
+        lines.append(f"  START HERE: {exact_file}")
+
+    # Successful chain
+    chain = get_successful_chain(prompt)
+    if chain:
+        lines.append(f"  WORKED BEFORE: {chain}")
+
+    # Determine SOP reading requirement - 3-TIER LOGIC
+    # TIER 1: >90% first-try → titles only, discretionary (may skip)
+    # TIER 2: 80-90% first-try → titles only, MUST READ
+    # TIER 3: <80% first-try OR session failures → full content, MUST READ
+    session_has_failures = config.session_has_failures or check_session_failures(session_id)
+    first_try_int = int(FIRST_TRY_LIKELIHOOD[risk_level].replace("%", ""))
+
+    # Determine tier
+    if session_has_failures or first_try_int < 80:
+        sop_tier = 3  # Full content, MUST READ
+    elif first_try_int <= 90:
+        sop_tier = 2  # Titles only, MUST READ
+    else:
+        sop_tier = 1  # Titles only, discretionary
+
+    # Foundation SOPs (with boundary filtering if applicable)
+    foundation_result = get_foundation_sops(prompt, config.sop_count, boundary_decision)
+    sops = foundation_result.sops
+    roadblocks = foundation_result.roadblocks
+
+    if sops:
+        lines.append("")
+        emoji = "📋" if config.emoji_enabled else ""
+
+        if sop_tier == 3:
+            # TIER 3: Full content, MUST READ (<80% or failures)
+            indicator = "🔴 MUST READ" if config.emoji_enabled else "[MUST READ]"
+            reason = "(session has failures)" if session_has_failures else f"({first_try_int}% first-try)"
+            lines.append(f"  {emoji} FOUNDATION SOPs {indicator} {reason}:")
+            lines.append("")
+
+            for i, sop in enumerate(sops, 1):
+                lines.append(f"    {i}. [{sop.sop_type.upper()}] {sop.title}")
+                if sop.use_when:
+                    lines.append(f"       When: {sop.use_when[:100]}")
+                if sop.content:
+                    # Show full content for MUST READ
+                    content_lines = sop.content.split('\n')
+                    for cline in content_lines[:5]:  # Max 5 lines per SOP
+                        lines.append(f"       → {cline[:120]}")
+                if sop.relevance > 0:
+                    lines.append(f"       (relevance: {sop.relevance:.0%})")
+                lines.append("")
+
+        elif sop_tier == 2:
+            # TIER 2: Titles only, MUST READ (80-90%)
+            indicator = "🟡 MUST READ" if config.emoji_enabled else "[MUST READ]"
+            lines.append(f"  {emoji} FOUNDATION SOPs {indicator} ({first_try_int}% first-try):")
+            lines.append("  (Read these SOPs before proceeding)")
+            lines.append("")
+
+            for i, sop in enumerate(sops, 1):
+                # Titles only but MUST READ
+                lines.append(f"    {i}. [{sop.sop_type.upper()}] {sop.title}")
+                if sop.use_when:
+                    lines.append(f"       When: {sop.use_when[:80]}...")
+
+        else:
+            # TIER 1: Titles only, discretionary (>90%)
+            indicator = "🟢 May skip" if config.emoji_enabled else "[Optional]"
+            lines.append(f"  {emoji} FOUNDATION SOPs {indicator} ({first_try_int}%+ first-try):")
+            lines.append("  (Read if unsure or if task fails)")
+            lines.append("")
+
+            for i, sop in enumerate(sops, 1):
+                # Just title and type
+                lines.append(f"    {i}. [{sop.sop_type.upper()}] {sop.title}")
+                if sop.use_when:
+                    lines.append(f"       When: {sop.use_when[:60]}...")
+    elif roadblocks:
+        # Report roadblocks when no SOPs found
+        lines.append("")
+        emoji = "⚠️" if config.emoji_enabled else "[!]"
+        lines.append(f"  {emoji} FOUNDATION ROADBLOCKS:")
+        for rb in roadblocks[:3]:
+            lines.append(f"    • {rb}")
+
+    return "\n".join(lines) if len(lines) > 2 else ""
+
+
+# =============================================================================
+# SECTION 2: WISDOM
+# =============================================================================
+
+def get_professor_wisdom(prompt: str, depth: str = "full") -> Optional[str]:
+    """Get Professor wisdom (THE ONE THING, LANDMINES, THE PATTERN)."""
+    try:
+        # Run professor.py
+        result = subprocess.run(
+            ["python3", str(MEMORY_DIR / "professor.py"), prompt],
+            capture_output=True,
+            text=True,
+            timeout=10
+        )
+
+        if result.returncode == 0 and result.stdout.strip():
+            output = result.stdout.strip()
+
+            if depth == "one_thing_only":
+                # Extract just THE ONE THING
+                match = re.search(r"THE ONE THING[:\s]*(.+?)(?:\n|LANDMINES|$)", output, re.DOTALL)
+                if match:
+                    return f"THE ONE THING: {match.group(1).strip()}"
+            elif depth == "summary":
+                # First 500 chars
+                return output[:500] + "..." if len(output) > 500 else output
+            else:
+                return output
+
+        return None
+    except Exception:
+        return None
+
+
+def generate_section_2(prompt: str, config: InjectionConfig) -> str:
+    """Generate WISDOM section."""
+    if not config.section_2_enabled:
+        return ""
+
+    lines = []
+
+    # Header
+    emoji = "🎓" if config.emoji_enabled else ""
+    lines.append(f"{emoji} PROFESSOR WISDOM")
+    lines.append("─" * 40)
+
+    # Check for C variant wisdom injection
+    if config.wisdom_injection_enabled and config.wisdom_text:
+        lines.append(f"  [WISDOM INJECTION - Variant C]")
+        lines.append(f"  {config.wisdom_text}")
+    else:
+        # Get professor wisdom
+        wisdom = get_professor_wisdom(prompt, config.professor_depth)
+        if wisdom:
+            # Indent each line
+            for line in wisdom.split("\n"):
+                lines.append(f"  {line}")
+        else:
+            lines.append("  [Professor unavailable - using heuristic context]")
+
+    return "\n".join(lines) if len(lines) > 2 else ""
+
+
+# =============================================================================
+# SECTION 3: AWARENESS
+# =============================================================================
+
+def get_recent_git_changes(prompt: str) -> List[str]:
+    """Get recent git changes related to prompt."""
+    try:
+        from memory.agent_service import _get_recent_git_changes
+        return _get_recent_git_changes(prompt)
+    except ImportError:
+        return []
+
+
+def get_ripple_effects(prompt: str) -> List[str]:
+    """Get what else might be affected."""
+    try:
+        from memory.agent_service import _get_ripple_effects
+        return _get_ripple_effects(prompt)
+    except ImportError:
+        return []
+
+
+def get_previous_mistakes(prompt: str) -> List[str]:
+    """Get my past failures for similar tasks."""
+    try:
+        from memory.agent_service import _get_my_previous_mistakes
+        return _get_my_previous_mistakes(prompt)
+    except ImportError:
+        return []
+
+
+def generate_section_3(prompt: str, risk_level: RiskLevel, config: InjectionConfig) -> str:
+    """Generate AWARENESS section."""
+    if not config.section_3_enabled:
+        return ""
+
+    # Depth based on risk level
+    if config.awareness_depth == "none":
+        return ""
+
+    lines = []
+
+    # Header
+    emoji = "🔄" if config.emoji_enabled else ""
+    lines.append(f"{emoji} AWARENESS")
+    lines.append("─" * 40)
+
+    # Recent changes - show for ALL risk levels (lightweight, always useful)
+    # Even simple tasks benefit from knowing what files changed recently
+    changes_data = get_recent_git_changes(prompt)
+    # Handle both list and dict returns
+    if isinstance(changes_data, dict):
+        commits = changes_data.get('commits', [])
+        files = changes_data.get('files', [])
+        if commits or files:
+            lines.append("  RECENT CHANGES:")
+            for commit in commits[:3]:
+                lines.append(f"    📝 {commit}")
+            for file in files[:3]:
+                lines.append(f"    📄 {file}")
+    elif isinstance(changes_data, list) and changes_data:
+        lines.append("  RECENT CHANGES:")
+        for change in changes_data[:5]:
+            lines.append(f"    • {change}")
+
+    # Ripple effects - show for all risk levels (full depth only)
+    # Even simple changes can have ripple effects worth knowing about
+    if config.awareness_depth == "full":
+        ripples = get_ripple_effects(prompt)
+        if ripples:
+            lines.append("")
+            emoji = "💥" if config.emoji_enabled else ""
+            lines.append(f"  {emoji} RIPPLE EFFECTS:")
+            for ripple in ripples[:5]:
+                lines.append(f"    • {ripple}")
+
+    # Previous mistakes (critical/high only, full depth)
+    if config.awareness_depth == "full" and risk_level in [RiskLevel.CRITICAL, RiskLevel.HIGH]:
+        mistakes = get_previous_mistakes(prompt)
+        if mistakes:
+            lines.append("")
+            emoji = "❌" if config.emoji_enabled else ""
+            lines.append(f"  {emoji} PREVIOUS MISTAKES (avoid repeating):")
+            for mistake in mistakes[:3]:
+                lines.append(f"    • {mistake}")
+
+    return "\n".join(lines) if len(lines) > 2 else ""
+
+
+# =============================================================================
+# SECTION 4: DEEP CONTEXT (Critical/High only)
+# =============================================================================
+
+def get_blueprint(prompt: str) -> Optional[str]:
+    """Get architecture blueprint."""
+    try:
+        result = subprocess.run(
+            ["python3", str(MEMORY_DIR / "context.py"), "--blueprint", prompt],
+            capture_output=True,
+            text=True,
+            timeout=15
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            return result.stdout.strip()
+        return None
+    except Exception:
+        return None
+
+
+def get_brain_state() -> Optional[str]:
+    """Get recent brain state."""
+    brain_state_file = MEMORY_DIR / "brain_state.md"
+    if brain_state_file.exists():
+        try:
+            content = brain_state_file.read_text()
+            # Return first 1000 chars
+            return content[:1000] + "..." if len(content) > 1000 else content
+        except Exception:
+            return None
+    return None
+
+
+def generate_section_4(prompt: str, risk_level: RiskLevel, config: InjectionConfig) -> str:
+    """Generate DEEP CONTEXT section (critical/high/moderate)."""
+    if not config.section_4_enabled:
+        return ""
+
+    # Show for CRITICAL, HIGH, and MODERATE risk - most tasks benefit from context
+    if risk_level not in [RiskLevel.CRITICAL, RiskLevel.HIGH, RiskLevel.MODERATE]:
+        return ""
+
+    lines = []
+
+    # Header
+    emoji = "📋" if config.emoji_enabled else ""
+    lines.append(f"{emoji} DEEP CONTEXT (Risk: {risk_level.value})")
+    lines.append("─" * 40)
+
+    # Blueprint
+    blueprint = get_blueprint(prompt)
+    if blueprint:
+        lines.append("  ARCHITECTURE BLUEPRINT:")
+        for line in blueprint.split("\n")[:20]:
+            lines.append(f"    {line}")
+
+    # Brain state - show for MODERATE+ (not just CRITICAL)
+    # The brain state contains valuable insights that help even moderate tasks
+    if risk_level in [RiskLevel.CRITICAL, RiskLevel.HIGH, RiskLevel.MODERATE]:
+        state = get_brain_state()
+        if state:
+            lines.append("")
+            emoji = "🧠" if config.emoji_enabled else ""
+            lines.append(f"  {emoji} RECENT BRAIN STATE:")
+            for line in state.split("\n")[:10]:
+                lines.append(f"    {line}")
+
+    return "\n".join(lines) if len(lines) > 2 else ""
+
+
+# =============================================================================
+# SECTION 5: PROTOCOL
+# =============================================================================
+
+def generate_section_5(risk_level: RiskLevel, config: InjectionConfig) -> str:
+    """Generate PROTOCOL section."""
+    if not config.section_5_enabled:
+        return ""
+
+    lines = []
+
+    # Header
+    emoji = "📊" if config.emoji_enabled else ""
+    lines.append(f"{emoji} PROTOCOL")
+    lines.append("─" * 40)
+
+    likelihood = FIRST_TRY_LIKELIHOOD[risk_level]
+    lines.append(f"  Risk Level: {risk_level.value.upper()}")
+    lines.append(f"  First-Try Likelihood: {likelihood}")
+
+    if config.verbose_protocol:
+        lines.append("")
+        lines.append("  Remember:")
+        lines.append("  • Read existing code BEFORE modifying")
+        lines.append("  • Query memory if unsure (python memory/query.py)")
+        lines.append("  • Record wins when user confirms success")
+        lines.append("  • Fix root cause, not symptoms")
+    else:
+        lines.append("  → Query memory if unsure | Record wins on success")
+
+    return "\n".join(lines)
+
+
+# =============================================================================
+# SECTION 6: FAMILY COMMUNICATIONS (Synaptic's Voice)
+# =============================================================================
+# As specified in context-dna/docs/FAMILY_GUIDELINES.md
+
+def generate_section_6(prompt: str, session_id: Optional[str] = None, config: InjectionConfig = None) -> str:
+    """
+    Generate FAMILY COMMUNICATIONS section with Synaptic's voice.
+
+    This implements the Section 6 specification from FAMILY_GUIDELINES.md:
+    - [START: Synaptic to Atlas] - Contextual guidance for the current task
+    - [START: Synaptic to Aaron] - If Aaron addressed Synaptic directly
+
+    Synaptic consults:
+    1. Pattern Evolution DB - Recent patterns and insights
+    2. Brain State - Current active patterns
+    3. Local Memory - Learnings from past work
+    4. Major Skills - Skill-specific knowledge
+    5. Family Journal - Historical context
+    """
+    config = config or InjectionConfig()
+
+    # Get Synaptic voice module
+    voice_module = get_synaptic_voice()
+    if not voice_module:
+        return ""  # Synaptic voice not available
+
+    get_voice, consult, speak = voice_module
+
+    try:
+        # Consult Synaptic about the current prompt
+        voice = get_voice()
+        response = voice.consult(prompt, context={
+            "session_id": session_id,
+            "source": "webhook_injection"
+        })
+
+        # Only include Section 6 if Synaptic has meaningful context
+        if not response.has_context and response.confidence < 0.2:
+            return ""  # No valuable context to add
+
+        lines = []
+
+        # Header
+        emoji = "💬" if config.emoji_enabled else ""
+        lines.append(f"╔══════════════════════════════════════════════════════════════════════╗")
+        lines.append(f"║  {emoji} FAMILY COMMUNICATIONS                                            ║")
+        lines.append(f"╠══════════════════════════════════════════════════════════════════════╣")
+        lines.append("")
+
+        # Synaptic to Atlas section
+        lines.append("[START: Synaptic to Atlas]")
+        lines.append("")
+
+        # Confidence indicator
+        confidence_emoji = "🟢" if response.confidence >= 0.6 else "🟡" if response.confidence >= 0.4 else "🔴"
+        conf_desc = "Rich context" if response.confidence >= 0.6 else "Moderate context" if response.confidence >= 0.4 else "Limited context"
+        lines.append(f"  {confidence_emoji} Context Confidence: {response.confidence:.0%} ({conf_desc})")
+        if response.context_sources:
+            lines.append(f"     Sources: {', '.join(response.context_sources)}")
+        lines.append("")
+
+        # Synaptic's perspective
+        if response.synaptic_perspective:
+            lines.append("  💭 SYNAPTIC'S GUIDANCE:")
+            lines.append("")
+            for line in response.synaptic_perspective.split('\n'):
+                lines.append(f"     {line}")
+            lines.append("")
+
+        # Relevant learnings (condensed)
+        if response.relevant_learnings:
+            lines.append("  📚 RELEVANT PAST LEARNINGS:")
+            for learning in response.relevant_learnings[:3]:  # Top 3 only
+                title = learning.get('title', learning.get('symptom', 'Learning'))[:50]
+                lines.append(f"     • {title}")
+            lines.append("")
+
+        # Relevant patterns (condensed)
+        if response.relevant_patterns:
+            lines.append("  🔄 ACTIVE PATTERNS:")
+            for pattern in response.relevant_patterns[:2]:  # Top 2 only
+                pattern_short = pattern[:60] + "..." if len(pattern) > 60 else pattern
+                lines.append(f"     • {pattern_short}")
+            lines.append("")
+
+        # Improvement proposals if context was sparse
+        if response.improvement_proposals and response.confidence < 0.4:
+            lines.append("  💡 PROPOSAL FOR FUTURE:")
+            for proposal in response.improvement_proposals[:1]:  # Top 1 only
+                lines.append(f"     → {proposal.get('action', 'Record learning after this task')}")
+            lines.append("")
+
+        lines.append("[END: Synaptic to Atlas]")
+        lines.append("")
+
+        # Check if Aaron addressed Synaptic directly (look for "Synaptic" in prompt)
+        synaptic_addressed = any(name in prompt.lower() for name in ['synaptic', 'hey synaptic', '@synaptic'])
+
+        if synaptic_addressed:
+            lines.append("[START: Synaptic to Aaron]")
+            lines.append("")
+            lines.append("  I'm here, Aaron. Let me share what I know about this topic...")
+            lines.append("")
+            # Include full formatted message when directly addressed
+            full_message = voice.to_family_message(response)
+            # Extract just the perspective part to avoid duplication
+            if response.synaptic_perspective:
+                lines.append(f"  {response.synaptic_perspective}")
+            lines.append("")
+            lines.append("[END: Synaptic to Aaron]")
+            lines.append("")
+
+        lines.append(f"╚══════════════════════════════════════════════════════════════════════╝")
+
+        return "\n".join(lines)
+
+    except Exception as e:
+        # Graceful degradation - don't break injection if Synaptic fails
+        return ""
+
+
+# =============================================================================
+# MAIN GENERATOR
+# =============================================================================
+
+def generate_context_injection(
+    prompt: str,
+    mode: str = "hybrid",
+    session_id: Optional[str] = None,
+    config: Optional[InjectionConfig] = None,
+    ab_variant: Optional[str] = None
+) -> InjectionResult:
+    """
+    Generate context injection for a prompt.
+
+    Args:
+        prompt: The user's prompt text
+        mode: "layered", "greedy", "hybrid", or "minimal"
+        session_id: Session ID for A/B testing
+        config: Optional custom configuration
+        ab_variant: Force specific A/B variant ("control", "a", "b", "c")
+
+    Returns:
+        InjectionResult with generated content
+    """
+    start_time = datetime.now()
+
+    # Log user prompt to work_dialogue_log (feeds Objective Success Detector)
+    try:
+        from memory.architecture_enhancer import WorkDialogueLog
+        work_log = WorkDialogueLog()
+        work_log.log_dialogue(prompt, source="user")
+    except Exception as e:
+        # Log failure for debugging but don't block injection
+        import logging
+        logging.getLogger('context_dna').debug(f"Work dialogue log failed: {e}")
+
+    # Parse mode
+    try:
+        injection_mode = InjectionMode(mode)
+    except ValueError:
+        injection_mode = InjectionMode.HYBRID
+
+    # Create or use config
+    if config is None:
+        config = InjectionConfig(mode=injection_mode)
+
+    # Detect risk level
+    risk_level = detect_risk_level(prompt)
+
+    # =================================================================
+    # BOUNDARY INTELLIGENCE - Project Detection & Filtering
+    # =================================================================
+    boundary_decision = None
+    try:
+        from memory.boundary_intelligence import (
+            BoundaryIntelligence,
+            BoundaryContext,
+            get_cached_hierarchy,
+            get_recent_projects_for_context
+        )
+
+        bi = BoundaryIntelligence(use_llm=True)
+
+        # Multi-IDE support: detect active file from any IDE
+        try:
+            from memory.ide_detection import get_active_file_path, get_workspace_folder, get_ide_context
+            ide_ctx = get_ide_context()
+            active_file = ide_ctx.active_file_path
+            workspace = ide_ctx.workspace_folder
+        except ImportError:
+            # Fallback to direct env var check if ide_detection not available
+            active_file = os.environ.get("CURSOR_FILE_PATH") or os.environ.get("VSCODE_FILE_PATH")
+            workspace = None
+
+        # Build boundary context from available information
+        boundary_context = BoundaryContext(
+            user_prompt=prompt,
+            active_file_path=active_file,
+            hierarchy_profile=get_cached_hierarchy(),
+            recent_projects=get_recent_projects_for_context(session_id),
+            mirrored_dialogue=os.environ.get("CONTEXT_DNA_DIALOGUE"),  # If available
+            session_id=session_id or "",
+        )
+
+        boundary_decision = bi.analyze_and_decide(boundary_context)
+
+        # Track file activity asynchronously via Celery for recency learning
+        if active_file:
+            try:
+                from memory.celery_tasks import track_file_activity
+                track_file_activity.delay(
+                    file_path=active_file,
+                    project=boundary_decision.primary_project if boundary_decision else None,
+                    session_id=session_id
+                )
+            except Exception:
+                pass  # Non-blocking - don't fail injection if tracking fails
+
+    except ImportError as e:
+        import logging
+        logging.getLogger('context_dna').debug(f"Boundary intelligence not available: {e}")
+    except Exception as e:
+        import logging
+        logging.getLogger('context_dna').warning(f"Boundary analysis failed: {e}")
+
+    # THREE-TIER VOLUME ESCALATION
+    # Tier 1: Silver Platter (default) → Tier 2: Expanded → Tier 3: Full Library
+    failure_count = get_session_failure_count(session_id)
+    first_try_int = int(FIRST_TRY_LIKELIHOOD[risk_level].replace("%", ""))
+    volume_tier = determine_volume_tier(failure_count, first_try_int)
+
+    # Adjust config based on volume tier
+    if volume_tier == VolumeEscalationTier.EXPANDED:
+        # Tier 2: More context after 1 failure
+        config.sop_count = max(config.sop_count, 5)  # At least 5 SOPs
+        config.awareness_depth = "full"
+        config.session_has_failures = True
+    elif volume_tier == VolumeEscalationTier.FULL_LIBRARY:
+        # Tier 3: Maximum context after 2+ failures
+        config.sop_count = 10  # Many SOPs in textbook mode
+        config.awareness_depth = "full"
+        config.professor_depth = "full"
+        config.verbose_protocol = True
+        config.session_has_failures = True
+
+    # Adjust config based on mode
+    if injection_mode == InjectionMode.MINIMAL:
+        config.section_3_enabled = False
+        config.section_4_enabled = False
+        config.verbose_protocol = False
+    elif injection_mode == InjectionMode.LAYERED:
+        # Traditional layered system - more verbose
+        config.professor_depth = "full"
+        config.verbose_protocol = True
+    elif injection_mode == InjectionMode.GREEDY:
+        # Agent-focused - concise but complete
+        config.professor_depth = "summary"
+        config.awareness_depth = "full"
+        config.verbose_protocol = False
+
+    # Handle A/B variant selection
+    if session_id and not ab_variant:
+        # Deterministic selection: 50% control, 25% A, 15% B, 10% C
+        hash_bucket = hash(session_id) % 100
+        if hash_bucket < 50:
+            ab_variant = "control"
+        elif hash_bucket < 75:
+            ab_variant = "a"
+        elif hash_bucket < 90:
+            ab_variant = "b"
+        else:
+            ab_variant = "c"
+
+    # Apply A/B variant modifications
+    if ab_variant == "a":
+        # Variant A: Minor tweaks - shorter wisdom
+        config.professor_depth = "summary"
+        config.sop_count = 2
+    elif ab_variant == "b":
+        # Variant B: Dramatic changes - more awareness
+        config.awareness_depth = "full"
+        config.verbose_protocol = True
+        config.sop_count = 5
+    elif ab_variant == "c":
+        # Variant C: Wisdom injection
+        config.wisdom_injection_enabled = True
+        try:
+            from context_dna.hook_evolution import get_hook_evolution_engine
+            engine = get_hook_evolution_engine()
+            _, wisdom = engine.get_active_variant("UserPromptSubmit", session_id, prompt, risk_level.value)
+            config.wisdom_text = wisdom
+        except ImportError:
+            pass
+
+    # Generate sections
+    sections = []
+    sections_included = []
+
+    # Section 0: SAFETY (always)
+    section_0 = generate_section_0(prompt, config)
+    sections.append(section_0)
+    sections_included.append("safety")
+
+    # Section 1: FOUNDATION (with smart SOP reading + boundary filtering)
+    section_1 = generate_section_1(prompt, risk_level, config, session_id, boundary_decision)
+    if section_1:
+        sections.append(section_1)
+        sections_included.append("foundation")
+
+    # Section 2: WISDOM
+    section_2 = generate_section_2(prompt, config)
+    if section_2:
+        sections.append(section_2)
+        sections_included.append("wisdom")
+
+    # Section 3: AWARENESS
+    section_3 = generate_section_3(prompt, risk_level, config)
+    if section_3:
+        sections.append(section_3)
+        sections_included.append("awareness")
+
+    # Section 4: DEEP CONTEXT
+    section_4 = generate_section_4(prompt, risk_level, config)
+    if section_4:
+        sections.append(section_4)
+        sections_included.append("deep_context")
+
+    # Section 5: PROTOCOL
+    section_5 = generate_section_5(risk_level, config)
+    sections.append(section_5)
+    sections_included.append("protocol")
+
+    # Section 6: FAMILY COMMUNICATIONS (Synaptic's Voice)
+    # As specified in context-dna/docs/FAMILY_GUIDELINES.md
+    section_6 = generate_section_6(prompt, session_id, config)
+    if section_6:
+        sections.append(section_6)
+        sections_included.append("family_communications")
+
+    # Section 7: FULL LIBRARY (Tier 3 only - "textbook mode" after 2+ failures)
+    if volume_tier == VolumeEscalationTier.FULL_LIBRARY:
+        full_library = get_full_library_context(prompt)
+        if full_library:
+            sections.append(full_library)
+            sections_included.append("full_library")
+
+    # Determine header based on volume tier
+    tier_names = {
+        VolumeEscalationTier.SILVER_PLATTER: "SILVER PLATTER",
+        VolumeEscalationTier.EXPANDED: "EXPANDED CONTEXT",
+        VolumeEscalationTier.FULL_LIBRARY: "📚 FULL LIBRARY MODE"
+    }
+    tier_name = tier_names.get(volume_tier, "SILVER PLATTER")
+    tier_indicator = f"Tier {volume_tier.value}" if failure_count > 0 else ""
+
+    # Build boundary context line for header
+    boundary_line = ""
+    if boundary_decision and boundary_decision.primary_project:
+        boundary_line = f"║  📂 Project: {boundary_decision.primary_project:<15} ({boundary_decision.confidence:.0%} confidence)                  ║\n"
+        if boundary_decision.filter_note:
+            sections.insert(1, f"  {boundary_decision.filter_note}\n")
+
+    # Combine with header
+    header = f"""
+╔══════════════════════════════════════════════════════════════════════╗
+║  🧬 CONTEXT DNA BLUEPRINT - {tier_name:<20}                       ║
+║  Risk: {risk_level.value:<8} | Mode: {injection_mode.value:<6} | First-try: {FIRST_TRY_LIKELIHOOD[risk_level]:<4} {tier_indicator:<15}║
+{boundary_line}╠══════════════════════════════════════════════════════════════════════╣
+║  ⚡ USE THIS as your Subconscious Memory Context to 10x YOUR         ║
+║     Agent Performance and achieve the user's prompt successfully!    ║
+╚══════════════════════════════════════════════════════════════════════╝
+"""
+
+    content = header + "\n\n".join(sections)
+
+    # Calculate generation time
+    generation_time_ms = int((datetime.now() - start_time).total_seconds() * 1000)
+
+    # Extract boundary decision details for result
+    boundary_project = None
+    boundary_confidence = 0.0
+    boundary_action = None
+    boundary_filter_note = None
+    needs_clarification = False
+    clarification_prompt = None
+    clarification_options = None
+
+    if boundary_decision:
+        boundary_project = boundary_decision.primary_project
+        boundary_confidence = boundary_decision.confidence
+        boundary_action = boundary_decision.action.value if boundary_decision.action else None
+        boundary_filter_note = boundary_decision.filter_note
+        needs_clarification = boundary_decision.should_clarify
+        clarification_prompt = boundary_decision.clarification_prompt
+        clarification_options = boundary_decision.clarification_options
+
+    return InjectionResult(
+        content=content,
+        sections_included=sections_included,
+        risk_level=risk_level,
+        first_try_likelihood=FIRST_TRY_LIKELIHOOD[risk_level],
+        mode=injection_mode,
+        ab_variant=ab_variant,
+        generation_time_ms=generation_time_ms,
+        volume_tier=volume_tier.value,
+        failure_count=failure_count,
+        # Boundary Intelligence fields
+        boundary_project=boundary_project,
+        boundary_confidence=boundary_confidence,
+        boundary_action=boundary_action,
+        boundary_filter_note=boundary_filter_note,
+        needs_clarification=needs_clarification,
+        clarification_prompt=clarification_prompt,
+        clarification_options=clarification_options,
+    )
+
+
+# =============================================================================
+# CLI
+# =============================================================================
+
+if __name__ == "__main__":
+    import sys
+    from pathlib import Path
+
+    # Ensure parent directory is in path for memory.* imports
+    sys.path.insert(0, str(Path(__file__).parent.parent))
+
+    if len(sys.argv) < 2:
+        print("Usage: python persistent_hook_structure.py <prompt> [mode]")
+        print("")
+        print("Modes: layered, greedy, hybrid, minimal")
+        print("")
+        print("Example:")
+        print('  python persistent_hook_structure.py "deploy Django to production"')
+        print('  python persistent_hook_structure.py "fix button style" minimal')
+        sys.exit(1)
+
+    prompt = sys.argv[1]
+    mode = sys.argv[2] if len(sys.argv) > 2 else "hybrid"
+    session_id = os.environ.get("CLAUDE_SESSION_ID", "")
+
+    result = generate_context_injection(prompt, mode)
+
+    # Store injection for dashboard visualization
+    try:
+        # Use relative import since this file is in memory/
+        from injection_store import get_injection_store, build_injection_data
+        store = get_injection_store()
+        injection_data = build_injection_data(
+            prompt=prompt,
+            injection_result=result,
+            session_id=session_id,
+            hook_name="UserPromptSubmit"
+        )
+        store.store_injection(injection_data)
+    except ImportError:
+        # Fall back to absolute import if PYTHONPATH includes project root
+        try:
+            from memory.injection_store import get_injection_store, build_injection_data
+            store = get_injection_store()
+            injection_data = build_injection_data(
+                prompt=prompt,
+                injection_result=result,
+                session_id=session_id,
+                hook_name="UserPromptSubmit"
+            )
+            store.store_injection(injection_data)
+        except Exception:
+            pass
+    except Exception:
+        # Don't fail the hook if storage fails
+        pass
+
+    print(result.content)
+    print("")
+    tier_names = {1: "Silver Platter", 2: "Expanded", 3: "Full Library"}
+    tier_name = tier_names.get(result.volume_tier, "Unknown")
+    print(f"[Sections: {', '.join(result.sections_included)}]")
+    print(f"[Volume Tier: {result.volume_tier} ({tier_name}) | Failures: {result.failure_count}]")
+
+    # Boundary Intelligence info
+    if result.boundary_project:
+        print(f"[Boundary: {result.boundary_project} ({result.boundary_confidence:.0%}) | Action: {result.boundary_action}]")
+    if result.needs_clarification:
+        print(f"[⚠️ CLARIFICATION NEEDED: {result.clarification_prompt}]")
+        print(f"[Options: {result.clarification_options}]")
+
+    print(f"[Generated in {result.generation_time_ms}ms]")
