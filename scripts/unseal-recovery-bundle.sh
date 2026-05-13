@@ -55,11 +55,26 @@ _step "Step 1/3  Decrypt"
 STAGE="$(mktemp -d -t ctxdna-unseal.XXXXXX)" || _fail "mktemp failed"
 trap 'rm -rf "$STAGE"' EXIT
 
-# age --decrypt with passphrase prompts for the passphrase interactively
 TAR_FILE="$STAGE/bundle.tar.gz"
-echo "  ${BOLD}Enter passphrase below.${RESET}"
-age --decrypt -o "$TAR_FILE" "$BUNDLE" || _fail "decrypt failed (wrong passphrase or corrupted bundle)"
-_ok "decryption succeeded"
+# Detect format: .age uses age, .enc uses openssl AES-256-CBC.
+# Magic bytes: age files start with "age-encryption.org/v1\n"; openssl files start with "Salted__".
+HEAD="$(head -c 24 "$BUNDLE" 2>/dev/null)"
+if [[ "$HEAD" == *"age-encryption.org"* ]]; then
+    command -v age >/dev/null || _fail "age not found (brew install age)"
+    echo "  ${BOLD}Enter passphrase below (age format).${RESET}"
+    age --decrypt -o "$TAR_FILE" "$BUNDLE" || _fail "age decrypt failed (wrong passphrase or corrupted bundle)"
+    _ok "age decryption succeeded"
+elif [[ "$HEAD" == "Salted__"* ]]; then
+    command -v openssl >/dev/null || _fail "openssl not found"
+    echo "  ${BOLD}Enter passphrase below (openssl AES-256-CBC + PBKDF2).${RESET}"
+    # openssl reads passphrase from /dev/tty if available, else stdin
+    openssl enc -d -aes-256-cbc -pbkdf2 -iter 250000 -salt \
+        -in "$BUNDLE" -out "$TAR_FILE" \
+        || _fail "openssl decrypt failed (wrong passphrase or corrupted bundle)"
+    _ok "openssl decryption succeeded"
+else
+    _fail "bundle format not recognised (expected age or openssl AES-256-CBC)"
+fi
 
 EXTRACT_DIR="$STAGE/extracted"
 mkdir -p "$EXTRACT_DIR"

@@ -459,21 +459,34 @@ case "$PASSPHRASE_SOURCE" in
         { command -v rage >/dev/null && rage --passphrase -o "$OUTPUT_PATH" "$TAR_FILE"; } || age --passphrase -o "$OUTPUT_PATH" "$TAR_FILE" || _fail "age encrypt failed"
         ;;
     stdin)
-        _info "reading passphrase from stdin (pipe it in)"
-        { command -v rage >/dev/null && rage --passphrase -o "$OUTPUT_PATH" "$TAR_FILE"; } || age --passphrase -o "$OUTPUT_PATH" "$TAR_FILE" || _fail "age encrypt failed"
+        command -v openssl >/dev/null || _fail "openssl not found"
+        _info "encrypting with openssl AES-256-CBC + PBKDF2 (passphrase from stdin)"
+        OUTPUT_PATH="${OUTPUT_PATH%.age}.enc"
+        openssl enc -aes-256-cbc -pbkdf2 -iter 250000 -salt \
+            -pass stdin -in "$TAR_FILE" -out "$OUTPUT_PATH" 2>&1 | tail -5 \
+            || _fail "openssl encrypt failed"
         ;;
     clipboard)
         command -v pbpaste >/dev/null || _fail "--passphrase-clipboard requires pbpaste (macOS)"
-        command -v rage >/dev/null    || _fail "--passphrase-clipboard requires rage (brew install rage); upstream age refuses non-tty passphrase"
-        _info "reading passphrase from macOS clipboard via pbpaste → rage"
-        pbpaste | rage --passphrase -o "$OUTPUT_PATH" "$TAR_FILE" || _fail "rage encrypt failed"
+        command -v openssl >/dev/null || _fail "openssl not found"
+        _info "encrypting with openssl AES-256-CBC + PBKDF2 (passphrase from pbpaste)"
+        # openssl reads passphrase from stdin via '-pass stdin' — works in any environment.
+        # Output extension switched to .enc to signal openssl format (not age).
+        OUTPUT_PATH="${OUTPUT_PATH%.age}.enc"
+        pbpaste | openssl enc -aes-256-cbc -pbkdf2 -iter 250000 -salt \
+            -pass stdin -in "$TAR_FILE" -out "$OUTPUT_PATH" 2>&1 | tail -5 \
+            || _fail "openssl encrypt failed"
         ;;
     env:*)
-        local varname="${PASSPHRASE_SOURCE#env:}"
-        local passval="${!varname:-}"
+        varname="${PASSPHRASE_SOURCE#env:}"
+        passval="${!varname:-}"
         [ -n "$passval" ] || _fail "env var $varname is empty"
-        _info "reading passphrase from env var $varname"
-        printf '%s' "$passval" | { command -v rage >/dev/null && rage --passphrase -o "$OUTPUT_PATH" "$TAR_FILE"; } || age --passphrase -o "$OUTPUT_PATH" "$TAR_FILE" || _fail "age encrypt failed"
+        command -v openssl >/dev/null || _fail "openssl not found"
+        _info "encrypting with openssl AES-256-CBC + PBKDF2 (passphrase from env $varname)"
+        OUTPUT_PATH="${OUTPUT_PATH%.age}.enc"
+        printf '%s' "$passval" | openssl enc -aes-256-cbc -pbkdf2 -iter 250000 -salt \
+            -pass stdin -in "$TAR_FILE" -out "$OUTPUT_PATH" 2>&1 | tail -5 \
+            || _fail "openssl encrypt failed"
         unset passval
         ;;
 esac
