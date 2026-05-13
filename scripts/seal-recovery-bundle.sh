@@ -279,11 +279,23 @@ if [ -d "$BUNDLE_DIR/ssh" ] && ls "$BUNDLE_DIR/ssh"/* >/dev/null 2>&1; then
     done
 fi
 
-# 6. Run setup-mothership.sh in --non-interactive --check mode to verify
-_step "Verifying setup"
-if bash "$REPO_DIR/scripts/setup-mothership.sh" --check 2>&1 | tail -20; then
-    _ok "setup check complete"
+# 6. Probe + reconfigure services (this is the big one — handles rotated
+#    API keys, different LLM providers, IP changes, missing optional services)
+_step "Probing services + reconfiguring anything that's changed"
+if [ -x "$REPO_DIR/scripts/configure-services.sh" ]; then
+    # Probe first to see what works as-is
+    bash "$REPO_DIR/scripts/configure-services.sh" --probe 2>&1 | tail -30
+    echo ""
+    read -r -p "  Run full interactive configurator now (recommended)? [Y/n]: " ans
+    if [[ ! "$ans" =~ ^[Nn] ]]; then
+        bash "$REPO_DIR/scripts/configure-services.sh" || _warn "configure-services had issues — re-run manually"
+    fi
 fi
+
+# 6b. Run setup-mothership.sh --check to verify backup config
+_step "Verifying setup"
+bash "$REPO_DIR/scripts/setup-mothership.sh" --check 2>&1 | tail -20 || true
+_ok "setup check complete"
 
 # 7. Pull latest backup from S3 (if AWS creds + age key both present)
 if [ -f "$HOME/.aws/credentials" ] && [ -f "${AGE_KEY_DEST:-$HOME/.ssh/contextdna-backup.age.key}" ]; then

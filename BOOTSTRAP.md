@@ -29,6 +29,29 @@ The installer is **idempotent** — safe to re-run anytime. To audit your setup 
 bash scripts/setup-mothership.sh --check
 ```
 
+### Wire up LLM providers + local LLM + optional services
+
+After (or before) the bootstrap installer, run the service configurator. It **probes every service**, **prompts only for what's missing or broken**, and lets you **swap providers freely**:
+
+```bash
+bash scripts/configure-services.sh
+```
+
+Specifically it handles:
+
+- **LLM providers** — OpenAI, Anthropic, DeepSeek, Groq, xAI, Mistral, Cohere, Perplexity, Together. Probes each saved key live; if it works, keeps it. If it doesn't, prompts you with the signup URL and accepts a new key.
+- **Local LLM** — auto-detects MLX (port 5044), Ollama (11434), LM Studio (1234), or vLLM (8000). If none are running, offers a backend menu (MLX recommended on Apple Silicon, Ollama for cross-platform) and a model picker (Qwen3-4B / Qwen3-8B / Llama-3.3 / custom). Installs a launchd plist so it auto-loads at login.
+- **NATS** — probes localhost:4222, offers to install + run via launchd if missing.
+- **Docker stack** — checks Docker is running, offers to bring up the lite profile.
+- **Network detection** — finds stale `192.168.x.x` / `10.0.x.x` IPs in your `.env` (common when switching networks or moving to a new machine) and offers to update them.
+- **Optional services** — ElevenLabs, LiveKit, Stripe, Supabase, Firebase, SendGrid, Sentry, Cloudflare, Google OAuth. Each is opt-in with the signup URL shown.
+
+Probe mode just reports — useful as a quarterly drill or after any environment change:
+
+```bash
+bash scripts/configure-services.sh --probe
+```
+
 ### Single-file recovery for disaster scenarios
 
 After running the installer, seal every secret into one passphrase-encrypted `.age` file you can save to a thumb drive:
