@@ -137,6 +137,16 @@ COUNTERS: Dict[str, int] = {
     "shadow_seed_attempts_total": 0,
     "shadow_seed_failures_total": 0,
     "shadow_seed_rows_total": 0,
+    # Temporal-stratified sampling (Round 5: 3-surgeon cross-exam ruling) —
+    # observable per-strata lifecycle so a /health caller can verify the
+    # right phase was active during a transition window without trusting
+    # logs. Flat keys mirror the prom-style label convention
+    # ``shadow_sample_strata_total{strata="..."}``.
+    "shadow_sample_taken_total": 0,
+    "shadow_sample_skipped_total": 0,
+    "shadow_sample_strata_total::stable": 0,
+    "shadow_sample_strata_total::lock_upgrade": 0,
+    "shadow_sample_strata_total::hot_path": 0,
 }
 
 _COUNTER_LOCK = threading.Lock()
@@ -240,6 +250,154 @@ def _should_sample(method: str) -> bool:
     if rate >= 1.0:
         return True
     return random.random() < rate
+
+
+# --------------------------------------------------------------------------- #
+# Temporal-stratified sampling (Round 5)                                       #
+# --------------------------------------------------------------------------- #
+#
+# Round 5 3-surgeon cross-exam (2026-05-13) refused to sign off on uniform 10%
+# sampling for production-critical, high-concurrency workloads. The verdict:
+#
+#   "10% shadow-mode sampling is insufficient for high-concurrency,
+#    production-critical workloads."
+#   "Implement temporal-stratified sampling during known transition
+#    windows (lock upgrade phases) rather than uniform 100% sampling."
+#
+# The strata:
+#   STABLE             — 10% sampling (default). Same coverage we had before;
+#                        cheap continuous floor that still catches background
+#                        drift between transition windows.
+#   WINDOW_LOCK_UPGRADE — 100% sampling. Lock-level transitions are the highest
+#                        race-risk window in the LearningStore. We want full
+#                        coverage there, because *that* is when invariants
+#                        slip and the shadow is most valuable.
+#   WINDOW_HOT_PATH    — 50% sampling. Hot-path = high-frequency operations
+#                        (e.g. recent.fail.huge bucket spiking). We don't go
+#                        to 100% there because the cost is real and the race
+#                        risk is lower than a lock transition; 50% is enough
+#                        to surface a divergence within a handful of seconds
+#                        of activity.
+#
+# Phase is *caller-set* — the caller is the only thing that knows when a
+# lock upgrade has started or finished. ``SamplingStrategy`` is intentionally
+# dumb about how phases are detected; it just trusts whatever phase the
+# caller most recently set. This keeps the policy testable without coupling
+# to LearningStore internals.
+
+
+PHASE_STABLE = "stable"
+PHASE_WINDOW_LOCK_UPGRADE = "lock_upgrade"
+PHASE_WINDOW_HOT_PATH = "hot_path"
+
+_STRATA_RATES: Dict[str, float] = {
+    PHASE_STABLE: 0.1,
+    PHASE_WINDOW_LOCK_UPGRADE: 1.0,
+    PHASE_WINDOW_HOT_PATH: 0.5,
+}
+
+
+class SamplingStrategy:
+    """Temporal-stratified shadow sampling policy.
+
+    Default phase is :data:`PHASE_STABLE` (10%). Callers move the strategy
+    into a higher-coverage window by calling :meth:`set_phase` — typically
+    bracketing a lock upgrade or hot-path operation. The strategy is process-
+    global on purpose: the shadow is a singleton, and the strategy that
+    governs it must be observable from /health without threading the
+    instance through every callsite.
+
+    Per-method environment overrides (``SHADOW_SAMPLE_<method>``) still take
+    precedence over the phase rate — operators must be able to force 100%
+    or 0% sampling for a specific method without changing code. The strata
+    rate is consulted only when no per-method override is set.
+    """
+
+    _lock = threading.Lock()
+    _phase: str = PHASE_STABLE
+
+    @classmethod
+    def set_phase(cls, phase: str) -> None:
+        """Set the current sampling phase.
+
+        Unknown phases fall back to :data:`PHASE_STABLE` rather than raise —
+        the shadow must never perturb production, even via a misconfigured
+        phase. The fallback is also counted via the
+        ``shadow_sample_strata_total::stable`` bucket so misuse is visible.
+        """
+        with cls._lock:
+            cls._phase = phase if phase in _STRATA_RATES else PHASE_STABLE
+
+    @classmethod
+    def get_phase(cls) -> str:
+        with cls._lock:
+            return cls._phase
+
+    @classmethod
+    def reset(cls) -> None:
+        """Test helper — restore the default phase."""
+        with cls._lock:
+            cls._phase = PHASE_STABLE
+
+    @classmethod
+    def _resolve_rate(cls, operation_type: str, current_phase: str) -> float:
+        """Resolve the effective sample rate.
+
+        Precedence:
+          1. Per-method env override (``SHADOW_SAMPLE_<method>``)
+          2. Strata rate for ``current_phase``
+          3. ``DEFAULT_SAMPLE_RATE``
+        """
+        override = os.environ.get(f"SHADOW_SAMPLE_{operation_type}")
+        if override is not None:
+            try:
+                v = float(override)
+            except ValueError:
+                v = float("nan")
+            if v == v and 0.0 <= v <= 1.0:
+                return v
+        # Global env override (``SHADOW_SAMPLE_RATE``) is treated as a
+        # hard knob too — preserves the existing operator contract.
+        raw = os.environ.get("SHADOW_SAMPLE_RATE")
+        if raw is not None:
+            try:
+                v = float(raw)
+                if 0.0 <= v <= 1.0:
+                    return v
+            except ValueError:
+                pass
+        return _STRATA_RATES.get(current_phase, DEFAULT_SAMPLE_RATE)
+
+    @classmethod
+    def should_sample(
+        cls,
+        operation_type: str,
+        current_phase: Optional[str] = None,
+    ) -> bool:
+        """Return True if this call should be shadowed.
+
+        ``current_phase`` is normally omitted; the class-level phase set via
+        :meth:`set_phase` is used. Tests pass an explicit phase to assert
+        the rate per strata without touching shared state.
+        """
+        phase = current_phase if current_phase is not None else cls.get_phase()
+        # Always count the strata bucket so /health proves which strata was
+        # in effect, even when the per-method override forces 0/1. The
+        # bucket key uses the actual phase even if it's unknown, normalized
+        # to ``stable`` to keep the counter contract closed.
+        bucket = phase if phase in _STRATA_RATES else PHASE_STABLE
+        _bump(f"shadow_sample_strata_total::{bucket}")
+
+        rate = cls._resolve_rate(operation_type, phase)
+        if rate <= 0.0:
+            _bump("shadow_sample_skipped_total")
+            return False
+        if rate >= 1.0:
+            _bump("shadow_sample_taken_total")
+            return True
+        taken = random.random() < rate
+        _bump("shadow_sample_taken_total" if taken else "shadow_sample_skipped_total")
+        return taken
 
 
 # --------------------------------------------------------------------------- #
@@ -628,7 +786,7 @@ class ShadowComparator:
         """
         _bump("shadow_calls_total")
 
-        if method not in self.methods or not _should_sample(method):
+        if method not in self.methods or not SamplingStrategy.should_sample(method):
             _bump("shadow_calls_skipped_sampling_total")
             return prod_fn(*args, **kwargs)
 

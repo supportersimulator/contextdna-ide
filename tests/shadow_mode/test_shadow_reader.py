@@ -23,6 +23,10 @@ if str(_MIGRATE5) not in sys.path:
     sys.path.insert(0, str(_MIGRATE5))
 
 from services.shadow_mode.shadow_reader import (  # noqa: E402
+    PHASE_STABLE,
+    PHASE_WINDOW_HOT_PATH,
+    PHASE_WINDOW_LOCK_UPGRADE,
+    SamplingStrategy,
     ShadowComparator,
     ShadowStorage,
     get_counters,
@@ -255,6 +259,156 @@ class ShadowReaderTests(unittest.TestCase):
             self.assertEqual(len(cmp.shadow), 7)
         finally:
             cmp.close()
+
+
+# --------------------------------------------------------------------------- #
+# Round 5 — Temporal-stratified sampling                                       #
+# --------------------------------------------------------------------------- #
+#
+# These tests guard the SamplingStrategy contract directly. They avoid the
+# wrapper plumbing so the strata math is asserted on its own — that way a
+# regression in the comparator can't mask a regression in the sampler.
+
+
+class SamplingStrategyTests(unittest.TestCase):
+    """Verify the temporal-stratified sampling policy."""
+
+    N = 10_000
+
+    def setUp(self) -> None:
+        reset_counters()
+        SamplingStrategy.reset()
+        # Per-method env overrides must NOT leak into these tests; they
+        # would short-circuit the strata rate.
+        os.environ.pop("SHADOW_SAMPLE_RATE", None)
+        for method in ("store_learning", "get_recent", "get_by_id", "promote", "retire"):
+            os.environ.pop(f"SHADOW_SAMPLE_{method}", None)
+
+    def tearDown(self) -> None:
+        SamplingStrategy.reset()
+
+    # -- strata: STABLE — ~10% ----------------------------------------- #
+
+    def test_stable_strata_samples_around_10pct(self) -> None:
+        SamplingStrategy.set_phase(PHASE_STABLE)
+        hits = sum(
+            1 for _ in range(self.N)
+            if SamplingStrategy.should_sample("get_recent")
+        )
+        ratio = hits / self.N
+        self.assertGreater(
+            ratio, 0.05,
+            f"STABLE strata sampled {ratio:.3%} ({hits}/{self.N}); expected > 5%",
+        )
+        self.assertLess(
+            ratio, 0.15,
+            f"STABLE strata sampled {ratio:.3%} ({hits}/{self.N}); expected < 15%",
+        )
+        # Strata counter must reflect every decision, sampled or not.
+        counters = get_counters()
+        self.assertEqual(
+            counters["shadow_sample_strata_total::stable"], self.N
+        )
+        self.assertEqual(
+            counters["shadow_sample_taken_total"]
+            + counters["shadow_sample_skipped_total"],
+            self.N,
+        )
+
+    # -- strata: WINDOW_LOCK_UPGRADE — deterministic 100% --------------- #
+
+    def test_lock_upgrade_strata_samples_100pct(self) -> None:
+        SamplingStrategy.set_phase(PHASE_WINDOW_LOCK_UPGRADE)
+        for _ in range(1_000):
+            self.assertTrue(
+                SamplingStrategy.should_sample("store_learning"),
+                "LOCK_UPGRADE strata must sample every call",
+            )
+        counters = get_counters()
+        self.assertEqual(
+            counters["shadow_sample_strata_total::lock_upgrade"], 1_000
+        )
+        self.assertEqual(counters["shadow_sample_taken_total"], 1_000)
+        self.assertEqual(counters["shadow_sample_skipped_total"], 0)
+
+    # -- strata: WINDOW_HOT_PATH — ~50% --------------------------------- #
+
+    def test_hot_path_strata_samples_around_50pct(self) -> None:
+        SamplingStrategy.set_phase(PHASE_WINDOW_HOT_PATH)
+        hits = sum(
+            1 for _ in range(self.N)
+            if SamplingStrategy.should_sample("get_recent")
+        )
+        ratio = hits / self.N
+        self.assertGreater(
+            ratio, 0.40,
+            f"HOT_PATH strata sampled {ratio:.3%} ({hits}/{self.N}); expected > 40%",
+        )
+        self.assertLess(
+            ratio, 0.60,
+            f"HOT_PATH strata sampled {ratio:.3%} ({hits}/{self.N}); expected < 60%",
+        )
+        counters = get_counters()
+        self.assertEqual(
+            counters["shadow_sample_strata_total::hot_path"], self.N
+        )
+
+    # -- contract: unknown phase falls back to STABLE ------------------- #
+
+    def test_unknown_phase_falls_back_to_stable(self) -> None:
+        SamplingStrategy.set_phase("nonsense")
+        self.assertEqual(SamplingStrategy.get_phase(), PHASE_STABLE)
+        # Counter should land in the stable bucket.
+        for _ in range(100):
+            SamplingStrategy.should_sample("get_recent")
+        counters = get_counters()
+        self.assertEqual(
+            counters["shadow_sample_strata_total::stable"], 100
+        )
+
+    # -- contract: explicit current_phase overrides class state --------- #
+
+    def test_explicit_phase_argument_overrides_class_state(self) -> None:
+        SamplingStrategy.set_phase(PHASE_STABLE)
+        # Even though class state is STABLE, an explicit lock_upgrade phase
+        # passed in should drive 100% sampling.
+        results = [
+            SamplingStrategy.should_sample("get_recent", PHASE_WINDOW_LOCK_UPGRADE)
+            for _ in range(500)
+        ]
+        self.assertTrue(all(results))
+        counters = get_counters()
+        self.assertEqual(
+            counters["shadow_sample_strata_total::lock_upgrade"], 500
+        )
+        self.assertEqual(
+            counters["shadow_sample_strata_total::stable"], 0
+        )
+
+    # -- contract: per-method env override beats the strata rate -------- #
+
+    def test_per_method_override_beats_strata_rate(self) -> None:
+        # In LOCK_UPGRADE we'd normally sample 100%, but a per-method
+        # override of 0.0 must still be honored — operators need an off
+        # switch even mid-transition.
+        SamplingStrategy.set_phase(PHASE_WINDOW_LOCK_UPGRADE)
+        os.environ["SHADOW_SAMPLE_get_recent"] = "0.0"
+        try:
+            results = [
+                SamplingStrategy.should_sample("get_recent")
+                for _ in range(200)
+            ]
+        finally:
+            os.environ.pop("SHADOW_SAMPLE_get_recent", None)
+        self.assertFalse(any(results))
+        counters = get_counters()
+        # Strata bucket still increments — it records *which window we're in*,
+        # not whether the call was taken.
+        self.assertEqual(
+            counters["shadow_sample_strata_total::lock_upgrade"], 200
+        )
+        self.assertEqual(counters["shadow_sample_taken_total"], 0)
+        self.assertEqual(counters["shadow_sample_skipped_total"], 200)
 
 
 if __name__ == "__main__":
